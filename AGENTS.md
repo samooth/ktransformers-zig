@@ -92,7 +92,9 @@ export fn kt_moe_forward(moe_ptr: *KT_MOE, ...) void {
 
 ## Current Status
 
-**Build: BROKEN** - 25+ compile errors. See `TODO.md` for full list.
+**Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
+
+See `TODO.md` for remaining work and `LESSONS_ZIG.md` for Zig 0.16 syntax gotchas.
 
 ### Immediate Fixes Needed
 1. Module imports: `@import("arch/amx.zig")` fails - need `src/root.zig` re-exports
@@ -141,5 +143,29 @@ Add to `build.zig.zon` when needed.
 - `README.md` - Project overview
 - `TODO.md` - Task tracking with priorities
 - `PLAN.md` - Full porting plan (20 weeks)
-- `LESSONS_ZIG.md` - Zig 0.16 lessons learned
+- `LESSONS_ZIG.md` - Zig 0.16 lessons learned (READ THIS FIRST for Zig syntax/idioms)
 - `LESSONS_KTRANSFORMERS.md` - ktransformers architecture notes
+
+## Critical: Zig 0.16 Gotchas (from LESSONS_ZIG.md)
+
+**READ `LESSONS_ZIG.md` BEFORE WRITING ANY ZIG CODE** - the syntax differs significantly from older versions:
+
+1. **Module imports**: Use `src/root.zig` as root, re-export submodules with `pub const x = @import("...");`. Do NOT use `addIncludePath()` for Zig modules.
+
+2. **Unused parameters**: Prefix with `_` AND add explicit `_ = param;` if still flagged.
+
+3. **`&&` is ambiguous** - use `and` instead.
+
+4. **String comparison**: Use `std.mem.eql(u8, a, b)` not `==`.
+
+5. **Struct declarations at top level**: Use `pub const X = struct { ... };` not `pub struct X { ... };`.
+
+6. **Single-line if/else**: Wrap in braces: `if (cond) { ... } else { ... }`.
+
+7. **Alignment** is a reserved keyword - use `alignment`.
+
+8. **AMX inline asm syntax**: Use `asm (...)` not `asm volatile (...)` in Zig 0.16.
+
+9. **`std.StringArray`** doesn't exist - use `std.ArrayList([]const u8)`.
+
+10. **`@intToFloat`/`@intToInt`** don't exist - use `@as(T, @intCast(val))`.
