@@ -1,8 +1,10 @@
 # ktransformers-zig TODO
 
-## Status: Pre-Alpha (Build Broken)
+## Status: Alpha (Build Working)
 
-Last updated: 2026-08-28
+Last updated: 2026-08-29
+
+**Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
 
 ---
 

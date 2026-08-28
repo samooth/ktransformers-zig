@@ -2,6 +2,10 @@
 
 High-performance CPU inference kernels for Mixture-of-Experts (MoE) models, ported from [ktransformers](https://github.com/kvcache-ai/ktransformers) to Zig.
 
+## Status
+
+**Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
+
 ## Overview
 
 This project ports the core CPU kernels from ktransformers (C++/AMX/AVX2/AVX512) to Zig, maintaining API compatibility with the Python `kt_kernel` package while leveraging Zig's comptime metaprogramming, SIMD intrinsics, and memory safety.

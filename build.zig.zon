@@ -1,0 +1,14 @@
+.{
+    .name = .ktransformers_zig,
+    .version = "0.6.1",
+    .fingerprint = 0x9ddf13f0612cecb9,
+    .targets = .{},
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "include",
+        "tests",
+    },
+}
