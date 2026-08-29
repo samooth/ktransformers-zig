@@ -11,6 +11,7 @@ const buffers = root.buffers;
 const gemm_bf16 = root.gemm_bf16;
 const gemm_int8 = root.gemm_int8;
 const gemm_int4 = root.gemm_int4;
+const gemm_fp8 = root.gemm_fp8;
 const cpu_detect = root.cpu_detect;
 const worker_pool = root.worker_pool;
 const memory = root.memory;
@@ -342,6 +343,66 @@ test "INT4 GEMM 16x16x32 with simple constant B" {
     for (0..M) |i| {
         for (0..N) |j| {
             const expected: f32 = if (i == 0) -160.0 else 0.0;
+            const actual = c[i * N + j];
+            const diff = if (actual > expected) actual - expected else expected - actual;
+            try testing.expect(diff < tolerance);
+        }
+    }
+}
+test "FP8 E4M3 GEMM 16x16x32 with constant B" {
+    // On non-AMX hardware, the kernel falls back to scalar (correct but slow).
+    if (!amx.AmxFeatures.available) return;
+
+    // M=16, N=16, K=32 (one K_STEP=32 step).
+    // A: row 0 all 1.0 (BF16), other rows all 0.0.
+    // B: every entry = FP8 0x38 (= BF16 1.0 in E4M3: sign=0, exp=7, mant=0).
+    // Per-row scale = 1.0 for all rows.
+    // Expected: c[0, j] = sum_{k=0..32} A[0, k] * B[j, k] * scale[j] = 32 * 1.0 * 1.0 * 1.0 = 32.
+    //            c[i, j] = 0 for i > 0.
+    const M: usize = 16;
+    const N: usize = 16;
+    const K: usize = 32;
+
+    var a: [M * K]amx.bf16 align(64) = undefined;
+    var b: [N * K]u8 align(64) = undefined; // fp8_e4m3 is u8
+    var b_scales: [N]f32 align(64) = undefined;
+    var c: [M * N]f32 align(64) = undefined;
+
+    // A: row 0 all 1.0 in BF16, rest all 0.0.
+    for (0..M) |i| {
+        for (0..K) |j| {
+            a[i * K + j] = if (i == 0) amx.f32_to_bf16(1.0) else amx.f32_to_bf16(0.0);
+        }
+    }
+
+    // B: every entry = 0x38 (FP8 1.0).
+    for (0..b.len) |i| {
+        b[i] = 0x38;
+    }
+
+    // B scales: all 1.0.
+    for (0..N) |i| {
+        b_scales[i] = 1.0;
+    }
+
+    // C: zero.
+    for (0..c.len) |i| {
+        c[i] = 0.0;
+    }
+
+    gemm_fp8.GemmKernel224FP8.gemmFullTile(
+        &a, K, // lda in elements
+        &b, &b_scales, K, // ldb in elements (1 byte each)
+        &c, N, // ldc in elements
+        M, N, K,
+    );
+
+    // Verify: c[0, j] ≈ 32, c[i, j] ≈ 0 for i > 0.
+    // FP8 E4M3 has ~3 mantissa bits, so expect some rounding error.
+    const tolerance: f32 = 0.5;
+    for (0..M) |i| {
+        for (0..N) |j| {
+            const expected: f32 = if (i == 0) 32.0 else 0.0;
             const actual = c[i * N + j];
             const diff = if (actual > expected) actual - expected else expected - actual;
             try testing.expect(diff < tolerance);

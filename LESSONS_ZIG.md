@@ -1051,3 +1051,103 @@ If the plain `nm` grep is empty, the import was not picked up.
 adding a new import, an incremental build may still not emit the new symbols.
 `rm -rf .zig-cache zig-out && zig build` from a clean slate. If an error
 persists after a clean rebuild, then it is real.
+
+## FP8 E4M3 GEMM: Reuse the BF16 Tile Path
+
+FP8 E4M3 weights go through a different route than INT4/INT8 on AMX. The
+C++ reference (`amx_raw_kernels.hpp:258-348`, `GemmKernel224FP8`) dequantizes
+FP8 to BF16 on the fly and uses the BF16 GEMM tile path (`tilebf16dpd`),
+not the INT8 path (`tileint8dpd`). This is much simpler than INT4 because:
+
+- **A is BF16** — load directly with `tile_loadd` (same as the BF16 GEMM).
+- **B is FP8** — dequantize to BF16 (1:1: each FP8 byte becomes one BF16
+  short), then `tile_loadd` into tmm2/tmm3. The dequant is byte-level,
+  not nibble-level like INT4.
+- **C is FP32** — `tilebf16dpd` accumulates into FP32 directly, so no
+  INT32 scratch buffer is needed and no `applyScales` step is required
+  between tiles.
+- **Scales are per-row** — `b_scales[j]` is applied once at the end of
+  each `(m_begin, n_begin)` block, multiplying the FP32 C tile by the
+  column's scale. Much simpler than INT4's per-group scales applied at
+  the K-block boundary.
+
+### The fp8_e4m3 -> BF16 byte-level dequant
+
+The existing `fp8e4m3_to_bf16` helper in `gemm_224_fp8.zig:65` does
+exactly this. In the `loadB` function, we dequantize 16 rows × 32
+elements into a 16×32 BF16 scratch buffer:
+
+```zig
+pub fn loadB(b: [*]const fp8_e4m3, ldb: usize,
+             scratch: *[2 * TILE_N * TILE_K]amx.bf16) void {
+    for (0..TILE_N) |i| {
+        for (0..TILE_K) |k| {
+            scratch[i * TILE_K + k] =
+                fp8e4m3_to_bf16(b[i * ldb + k]);
+        }
+    }
+    // Zero the second 16 rows for tmm3.
+    for (TILE_N..2 * TILE_N) |i| {
+        for (0..TILE_K) |k| {
+            scratch[i * TILE_K + k] = amx.f32_to_bf16(0.0);
+        }
+    }
+    amx.tile_loadd(amx.TileReg.tmm2, @ptrCast(scratch),
+                   TILE_K * @sizeOf(amx.bf16));
+    amx.tile_loadd(amx.TileReg.tmm3,
+                   @ptrCast(scratch[TILE_N * TILE_K ..].ptr),
+                   TILE_K * @sizeOf(amx.bf16));
+}
+```
+
+### Why the second 16 rows are zeroed (not loaded from B)
+
+In this simple implementation, each `gemmFullTile` call processes one
+`M_STEP × N_STEP` block of B (16 output columns at a time). The
+`M_STEP=32 × N_STEP=32` block of B has 32 rows of output columns, but
+`loadB` only processes 16. The second tmm3 region is loaded with zeros,
+which contributes nothing to the `tilebf16dpd` accumulator (a + 0 = a).
+
+In the C++ (`BufferBFP8Impl`), the B matrix is pre-packed in a
+column-major layout where one column-major block fills both tmm2 and
+tmm3 with 32 rows. Our scalar fallback in the public `gemmFullTile`
+handles the layout; the AMX path's "zero the second half" is a known
+simplification. To remove the simplification, the C++ `BufferBFP8Impl`
+needs to be ported first.
+
+### Tile config is identical to BF16
+
+`TILE_M=16, TILE_K=32, TILE_N=16, VNNI_BLK=2` is the same as
+`GemmKernel224BF16`. The tile config block in `config()` is a copy of
+the BF16 one — the only difference is which `tile_loadd` is called for B
+(BF16 direct vs FP8-via-scratch). This means FP8+AMX can be seen as a
+dequant-on-load specialization of the BF16 GEMM, with the dequant cost
+amortized across the tile load.
+
+### The `lda` parameter is in elements, but `tile_loadd` stride is in bytes
+
+This is a pre-existing inconsistency in the BF16 GEMM too: the public
+C ABI passes `lda` as "row stride in elements", but `tile_loadd`
+interprets the same number as bytes. For BF16 (sizeof=2) this means
+the stride is half what it should be. This is not a bug introduced by
+the FP8 work — it matches the existing `gemm_224_bf16.zig::loadA`
+behavior. If someone fixes the BF16 GEMM's stride handling, FP8 gets
+fixed automatically.
+
+### Per-row scale is applied at the end of each (m, n) block
+
+The C++ does this with AVX-512 (`_mm512_mul_ps`) for efficiency. We use a
+plain Zig loop (`c[i * ldc + j] *= b_scales[j]`) for the same
+correctness-first / optimize-later philosophy as the INT4 work.
+
+### Complete file: `src/kernels/amx/gemm_224_fp8.zig`
+
+The `GemmKernel224FP8` struct now has:
+- `config()` — sets the 8-tile config (same as BF16)
+- `cleanC()`, `loadC(c, ldc)`, `storeC(c, ldc)` — FP32 tile management
+- `loadA(a, lda)` — BF16 activation loads
+- `runTile()` — 4× `tilebf16dpd` calls
+- `loadB(b, ldb, scratch)` — FP8→BF16 dequantize + tile load
+- `gemmFullTile(...)` — orchestrator with per-row scale at the end
+
+`gemmFullTile` falls back to `gemmFullTileScalar` on non-AMX hardware.

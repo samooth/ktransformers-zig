@@ -77,4 +77,15 @@ pub fn build(b: *std.Build) void {
 
     const test_obj = b.addTest(.{ .root_module = test_mod });
     test_step.dependOn(&test_obj.step);
+
+    // MLA test module (src/mla/mla_tests.zig) - second test suite,
+    // runs alongside tests/kernels/test_kernels.zig.
+    const mla_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/mla/mla_tests.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mla_test_mod.addImport("kt", b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize }));
+    const mla_test_obj = b.addTest(.{ .root_module = mla_test_mod });
+    test_step.dependOn(&mla_test_obj.step);
 }
