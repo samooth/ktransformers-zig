@@ -453,19 +453,54 @@ pub const TpMoe = struct {
     }
 
     pub fn deinit(self: *TpMoe) void {
-        // Placeholder: cleanup resources
-        _ = self;
+        // Free the two slices allocated in init(). The 9 buffer structs inside
+        // each ExpertData (BufferA/BufferC/Int8BufferB) are non-owning POD
+        // views: they hold only a `ptr: [*]K` into externally-owned weight
+        // memory plus layout metadata, and expose no deinit(). Nothing else
+        // is owned by TpMoe, so freeing the outer slices is complete.
+        //
+        // NOTE: deinit has no allocator parameter, so it must use the same
+        // allocator init received. The only caller is the C API wrapper
+        // (kt_moe_free in main.zig), which passes std.heap.page_allocator to
+        // both create() and TpMoe.init() — therefore page_allocator here.
+        const allocator = std.heap.page_allocator;
+        allocator.free(self.experts);
+        allocator.free(self.tp_configs);
+        self.* = undefined;
     }
 
     pub fn warmUp(self: *TpMoe) void {
-        // Placeholder: warm up the model
+        // TODO(warm-up): pre-touch weight pages to avoid first-forward page
+        // faults. The intended body reads the first byte of each expert
+        // buffer (gate/up/down_bf16, gate/up/down_int8) once weights_loaded
+        // is true. Not shipped yet because loadWeights (see its BF16 branch,
+        // which only packs gate_proj) does not reliably populate those ptr
+        // fields — touching them now could dereference undefined pointers.
+        // Real version lands together with the loadWeights fix (follow-up
+        // plan; see "Per-expert decomposition of MoE forward" in
+        // LESSONS_ZIG.md).
         _ = self;
     }
 
     pub fn loadWeightsWithMap(self: *TpMoe, physical_to_logical_map: [*]u64) void {
-        // Placeholder: load weights with physical-to-logical mapping
-        _ = self;
-        _ = physical_to_logical_map;
+        // Load all experts in physical order first (double-load + remap
+        // approach: wasteful — every weight is loaded/packed once for the
+        // physical layout — but correct, and loadWeights is a one-time
+        // setup cost. Optimization is deliberately out of scope here).
+        self.loadWeights();
+
+        // Then remap: physical slot p holds the weights of logical expert
+        // physical_to_logical_map[p]; copy it into logical slot p.
+        // ExpertData is a POD view struct (no owned heap pointers), so a
+        // shallow struct copy is safe — no aliasing hazards because the
+        // packed buffers are never freed through ExpertData.
+        const physical_num: usize = @intCast(self.config.expert_num);
+        for (0..physical_num) |p| {
+            const logical = physical_to_logical_map[p];
+            if (logical >= physical_num) continue; // skip invalid map entries
+            self.experts[logical] = self.experts[p];
+        }
+        self.weights_loaded = true;
     }
 
     pub fn forwardGateUp(
@@ -476,13 +511,31 @@ pub const TpMoe = struct {
         gate_output: [*]amx.bf16,
         up_output: [*]amx.bf16
     ) void {
-        // Placeholder: forward pass for gate and up projections
         _ = self;
         _ = expert_idx;
         _ = qlen;
         _ = input;
         _ = gate_output;
         _ = up_output;
+        // TODO(gate-up): per-expert gate + up GEMMs (no SwiGLU, no down).
+        // Intended body — blocked on the loadWeights BF16 branch that never
+        // packs up_proj/down_proj (it only packs gate_proj), leaving
+        // experts[].up_bf16 with undefined ptrs. Nothing valid to call GEMM
+        // on until that is fixed (see follow-up plan). Real version:
+        //
+        //   const expert = &self.experts[expert_idx];
+        //   const cfg = self.config;
+        //   const m = qlen;
+        //   const k: usize = @intCast(cfg.hidden_size);
+        //   const n = @as(usize, @intCast(cfg.intermediate_size)) / self.tp_count;
+        //   const ldc: usize = @intCast(cfg.intermediate_size);
+        //   for (0..self.tp_count) |t| {
+        //       const out_off_t = t * m * n;
+        //       gemm_bf16.gemmExpert(input, expert.gate_bf16.ptr + t * n * k,
+        //           gate_output + out_off_t, m, n, k, k, n, ldc);
+        //       gemm_bf16.gemmExpert(input, expert.up_bf16.ptr + t * n * k,
+        //           up_output + out_off_t, m, n, k, k, n, ldc);
+        //   }
     }
 
     pub fn forwardDown(
@@ -492,11 +545,37 @@ pub const TpMoe = struct {
         input: [*]const amx.bf16,
         output: [*]amx.bf16
     ) void {
-        // Placeholder: forward pass for down projection
         _ = self;
         _ = expert_idx;
         _ = qlen;
         _ = input;
         _ = output;
+        // TODO(down): per-expert down projection + FP32->BF16 accumulate.
+        // Blocked on the same loadWeights bug as forwardGateUp —
+        // experts[].down_bf16 ptrs are undefined until it is fixed. Real
+        // version (accumulate additively, matching TpMoe.forward's FP32
+        // output accumulation):
+        //
+        //   const expert = &self.experts[expert_idx];
+        //   const cfg = self.config;
+        //   const m = qlen;
+        //   const k = @as(usize, @intCast(cfg.intermediate_size)) / self.tp_count;
+        //   const n: usize = @intCast(cfg.hidden_size);
+        //   const ldc = n;
+        //   var down_buf = std.heap.page_allocator.alloc(f32, m * n)
+        //       catch @panic("OOM");
+        //   defer std.heap.page_allocator.free(down_buf);
+        //   @memset(down_buf, 0);
+        //   for (0..self.tp_count) |t| {
+        //       gemm_bf16.gemmExpert(input + t * m * k,
+        //           expert.down_bf16.ptr + t * n * k,
+        //           @ptrCast(down_buf.ptr), m, n, k, k, n, n);
+        //   }
+        //   for (0..m) |i| {
+        //       for (0..n) |j| {
+        //           const prev = amx.bf16_to_f32(output[i * ldc + j]);
+        //           output[i * ldc + j] = amx.f32_to_bf16(prev + down_buf[i * n + j]);
+        //       }
+        //   }
     }
 };

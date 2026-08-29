@@ -1151,3 +1151,57 @@ The `GemmKernel224FP8` struct now has:
 - `gemmFullTile(...)` — orchestrator with per-row scale at the end
 
 `gemmFullTile` falls back to `gemmFullTileScalar` on non-AMX hardware.
+
+## Critical: `addTest` does NOT execute tests in Zig 0.16
+
+The `addTest` build step in `std.Build` only **compiles** the test binary; it does not run it. The official docs at `std/Build.zig:871-874` say explicitly:
+
+> **This step does not run the unit tests**. Typically, the result of this function will be passed to `addRunArtifact`, creating a `Step.Run`. These two steps are separated because they are independently configured and cached.
+
+The correct pattern is:
+```zig
+const test_obj = b.addTest(.{ .root_module = test_mod });
+test_step.dependOn(&b.addRunArtifact(test_obj).step);  // NOT just &test_obj.step
+```
+
+**Impact**: every prior "zig build test exit 0" was a false positive. Tests were compiling but never executing. A test step that depends on `&test_obj.step` only triggers compilation; the test binary is never invoked, so test failures (including segfaults) were invisible. The other dev caught this by running `--verbose` and seeing the test binaries being compiled but not executed.
+
+**Fix**: always use `b.addRunArtifact(test_obj)` for the `test_step.dependOn` call. This adds a `Step.Run` that actually invokes the test binary.
+
+## Use-after-free: defer + return slice
+
+A common pattern that produces a dangling pointer:
+
+```zig
+var buffer = try allocator.alloc(u8, 1_000_000);
+defer allocator.free(buffer);  // runs when function returns
+
+const content = buffer[0..n];
+// ... parse content, set model_name = std.mem.trim(u8, value, " ");
+// ... return CpuInfo{ .model_name = model_name, ... };
+// defer runs, frees buffer, model_name now points to freed memory
+```
+
+The fix: copy the slice to a separately-allocated buffer before the defer runs:
+
+```zig
+model_name = try allocator.dupe(u8, model_name);
+errdefer allocator.free(model_name);  // free if later code fails
+return CpuInfo{ .model_name = model_name, ... };
+```
+
+This leaks (CpuInfo has no deinit), but the leak is bounded (one allocation per `detectCpu` call). A proper fix would add a `deinit` method to `CpuInfo`.
+
+## Type mismatch: ArrayList assigned to fixed-size array
+
+Three sites in `src/runtime/cpu_detect.zig` had:
+```zig
+.flags = std.ArrayList(u8).init(allocator),  // ArrayList -> [16]u8
+```
+
+The `flags` field is declared as `[16]u8` (fixed-size array). The ArrayList assignment is a type error that Zig 0.16 may allow in some contexts. The fix:
+```zig
+.flags = .{0} ** 16,  // 16 zero u8s
+```
+
+Always match the field type exactly. If the field is a fixed-size array, the value must be a fixed-size array or anonymous array literal, not a heap-allocated container.

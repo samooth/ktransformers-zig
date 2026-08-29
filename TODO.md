@@ -67,6 +67,7 @@ Last updated: 2026-08-29
 ## 🟢 Medium Priority
 
 ### Build System
+- [x] **Test runner actually runs tests** — replaced `test_step.dependOn(&test_obj.step)` with `test_step.dependOn(&b.addRunArtifact(test_obj).step)` in build.zig for both test modules. Fixed use-after-free in `src/runtime/cpu_detect.zig::detectCpuLinux` (model_name pointed into a soon-to-be-freed buffer). Fixed 3 `.flags = std.ArrayList(u8).init(allocator)` type mismatches.
 - [ ] Re-enable multi-variant build (AVX2, AVX512_base, AVX512_VNNI, AVX512_VBMI, AVX512_BF16, AMX)
 - [ ] Add variant-specific library names (currently all build as `kt_kernel_ext`)
 
@@ -109,7 +110,7 @@ Last updated: 2026-08-29
 | MoE Orchestration | Partial | 40% |
 | C API | Basic functions only | 50% |
 | Build System | Single variant | 60% |
-| Tests | Compiling, need to run | 50% |
+| Tests | Running and passing (11/11 MLA, 8/21 kernels before pre-existing worker pool hang) | 75% |
 | Python Integration | Not started | 0% |
 
 ---

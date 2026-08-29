@@ -69,7 +69,7 @@ pub fn detectCpu(allocator: Allocator) !CpuInfo {
             .vendor = .unknown,
             .arch = @tagName(builtin.target.cpu.arch) orelse "unknown",
             .features = Features{},
-            .flags = std.ArrayList(u8).init(allocator),
+            .flags = .{0} ** 16,
             .model_name = "unknown",
             .cpu_family = 0,
             .model = 0,
@@ -149,7 +149,8 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
             if (parts.next()) |_| {
                 if (parts.next()) |value| {
                     const flag_str = std.mem.trim(u8, value, " \t");
-                    var iter = std.mem.splitScalar(u8, flag_str, 32); while (iter.next()) |flag| {
+                    var iter = std.mem.splitScalar(u8, flag_str, 32);
+                    while (iter.next()) |flag| {
                         if (flag.len > 0) {
                             if (flags_len < 16) { flags[flags_len] = flag[0]; flags_len += 1; }
                             try parseFlag(allocator, flag, @constCast(&features));
@@ -159,6 +160,12 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
             }
         }
     }
+
+    // Copy model_name to a separate allocation so it survives the
+    // `defer allocator.free(buffer)` below. Without this, the returned
+    // CpuInfo.model_name is a dangling pointer into the freed buffer.
+    model_name = try allocator.dupe(u8, model_name);
+    errdefer allocator.free(model_name);
 
     // Detect ARM from model name if vendor unknown
     if (vendor == .unknown) {
@@ -193,7 +200,7 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
     };
 }
 
-fn detectCpuDarwin(allocator: Allocator, _io: std.Io) !CpuInfo { _ = _io;
+fn detectCpuDarwin(_allocator: Allocator, _io: std.Io) !CpuInfo { _ = _io; _ = _allocator;
     const arch = switch (builtin.target.cpu.arch) {
         .aarch64 => "aarch64",
         .x86_64 => "x86_64",
@@ -213,7 +220,7 @@ fn detectCpuDarwin(allocator: Allocator, _io: std.Io) !CpuInfo { _ = _io;
         .vendor = vendor,
         .arch = arch,
         .features = features,
-        .flags = std.ArrayList(u8).init(allocator),
+        .flags = .{0} ** 16,
         .model_name = "Apple Silicon",
         .cpu_family = 0,
         .model = 0,
@@ -221,7 +228,7 @@ fn detectCpuDarwin(allocator: Allocator, _io: std.Io) !CpuInfo { _ = _io;
     };
 }
 
-fn detectCpuWindows(allocator: Allocator, _io: anytype) !CpuInfo { _ = _io; _ = _io;
+fn detectCpuWindows(_allocator: Allocator, _io: anytype) !CpuInfo { _ = _io; _ = _io; _ = _allocator;
     const arch = switch (builtin.target.cpu.arch) {
         .x86_64 => "x86_64",
         .aarch64 => "aarch64",
@@ -237,7 +244,7 @@ fn detectCpuWindows(allocator: Allocator, _io: anytype) !CpuInfo { _ = _io; _ = 
         .vendor = vendor,
         .arch = arch,
         .features = features,
-        .flags = std.ArrayList(u8).init(allocator),
+        .flags = .{0} ** 16,
         .model_name = "Windows CPU",
         .cpu_family = 0,
         .model = 0,

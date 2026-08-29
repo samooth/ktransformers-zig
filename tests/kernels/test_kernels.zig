@@ -409,3 +409,80 @@ test "FP8 E4M3 GEMM 16x16x32 with constant B" {
         }
     }
 }
+
+test "TpMoe placeholder methods end-to-end (zero inputs)" {
+    // Exercises deinit / warmUp / loadWeightsWithMap / forwardGateUp /
+    // forwardDown end-to-end with tiny dims and all-zero weights. The
+    // forward* methods are documented no-ops until the loadWeights BF16
+    // fix lands, so the contract under test is: no panic, no crash, clean
+    // teardown, and outputs left untouched (still zero).
+    const allocator = testing.allocator;
+
+    const hidden_size: usize = 16;
+    const intermediate_size: usize = 32;
+    const expert_num: usize = 2;
+
+    // WorkerPool spawns real threads; deinit joins them.
+    var pool = try worker_pool.WorkerPool.initSimple(allocator, 2);
+    defer pool.deinit();
+
+    // Weight storage: all zeros (expert_num * intermediate * hidden each).
+    const gate_w = try allocator.alloc(amx.bf16, expert_num * intermediate_size * hidden_size);
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(amx.bf16, expert_num * intermediate_size * hidden_size);
+    defer allocator.free(up_w);
+    const down_w = try allocator.alloc(amx.bf16, expert_num * hidden_size * intermediate_size);
+    defer allocator.free(down_w);
+    @memset(gate_w, 0);
+    @memset(up_w, 0);
+    @memset(down_w, 0);
+
+    // Identity physical->logical map: [0, 1].
+    const p2l = try allocator.alloc(u64, expert_num);
+    defer allocator.free(p2l);
+    for (p2l, 0..) |*v, i| v.* = @intCast(i);
+
+    var moe_inst = try moe.TpMoe.init(moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = 1,
+        .hidden_size = @intCast(hidden_size),
+        .intermediate_size = @intCast(intermediate_size),
+        .max_len = 4,
+        .pool = &pool,
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    }, std.heap.page_allocator); // deinit frees with page_allocator (C API convention)
+    // NOTE: intentionally NOT defer-deinit'ed here; deinit is exercised
+    // explicitly below.
+
+    // Exercise all 5 methods. zero weights => no panics, outputs untouched.
+    moe_inst.loadWeightsWithMap(p2l.ptr);
+    moe_inst.warmUp();
+
+    const qlen: usize = 4;
+    const input = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(input);
+    const gate_out = try allocator.alloc(amx.bf16, qlen * intermediate_size);
+    defer allocator.free(gate_out);
+    const up_out = try allocator.alloc(amx.bf16, qlen * intermediate_size);
+    defer allocator.free(up_out);
+    const down_out = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(down_out);
+    @memset(input, 0);
+    @memset(gate_out, 0);
+    @memset(up_out, 0);
+    @memset(down_out, 0);
+
+    moe_inst.forwardGateUp(0, qlen, input.ptr, gate_out.ptr, up_out.ptr);
+    moe_inst.forwardDown(0, qlen, input.ptr, down_out.ptr);
+
+    // No-op methods must leave the (zero) outputs untouched.
+    for (gate_out) |v| try testing.expect(v == 0);
+    for (up_out) |v| try testing.expect(v == 0);
+    for (down_out) |v| try testing.expect(v == 0);
+
+    // deinit: frees the two init-allocated slices; must not double-free or
+    // panic when called via the same allocator path as kt_moe_free.
+    moe_inst.deinit();
+}
