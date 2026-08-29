@@ -553,3 +553,501 @@ tile_config.setTile(
    @as(u16, @intCast(dimension))
    @as(usize, @intCast(usize_value))
    ```
+
+## Working AMX Inline Assembly (Zig 0.16)
+
+These patterns were validated against the AMX-TMUL specification in Intel SDM Volume 2 and successfully compile + link with `zig build` on x86_64 Linux.
+
+### Tile register as comptime immediate
+
+The tile register (tmm0..tmm7) must be an immediate in the instruction encoding — you cannot move it into a GPR first. The trick is to convert the `TileReg` enum to a `u8` and use the `"n"` constraint (numeric immediate), then splice it into the `%%tmm%[name]` template:
+
+```zig
+pub fn tile_zero(tile: TileReg) void {
+    if (!AmxFeatures.available) return;
+    const tmm: u8 = @intFromEnum(tile);
+    asm volatile (
+        "tilezero %%tmm%[tmm]"
+        :
+        : [tmm] "n" (tmm),
+        : "memory"
+    );
+}
+```
+
+- `"n"` is the GCC/Clang inline-asm "numeric immediate" constraint.
+- `%%` escapes the `%` prefix that Zig uses for operand references, so the assembler sees `%tmm0` literally.
+- The output is empty (no return value), inputs are listed, and `"memory"` is in the clobber list because the instruction writes a tile register (which is opaque to the register allocator).
+
+### Tile load/store with memory operand
+
+```zig
+pub fn tile_loadd(tile: TileReg, ptr: *const u8, stride: usize) void {
+    if (!AmxFeatures.available) return;
+    const tmm: u8 = @intFromEnum(tile);
+    asm volatile (
+        "tileloadd (%[base],%[stride],1), %%tmm%[tmm]"
+        :
+        : [base] "r" (ptr),
+          [stride] "r" (stride),
+          [tmm] "n" (tmm),
+        : "memory"
+    );
+}
+```
+
+The AT&T memory operand `(%[base],%[stride],1)` means `[base + stride * 1]` — i.e. the second operand is a byte-stride. Note the trailing `,1` is required by the AMX encoding (scale factor).
+
+### Tile config load (ldtilecfg)
+
+```zig
+pub fn tile_loadconfig(cfg: *const TileConfig) void {
+    if (!AmxFeatures.available) return;
+    ensureAmxEnabled();
+    asm volatile (
+        "ldtilecfg (%[cfg])"
+        :
+        : [cfg] "r" (cfg),
+        : "memory"
+    );
+}
+
+pub fn tile_release() void {
+    if (!AmxFeatures.available) return;
+    asm volatile ("tilerelease" ::: "memory");
+}
+```
+
+The config must be 64-byte aligned. The `extern struct` definition provides this for compile-time-allocated configs; for runtime-allocated ones, use a 64-byte-aligned allocator.
+
+### Matrix-multiply intrinsics (all three-operand, all immediates)
+
+```zig
+pub fn tile_dpbf16ps(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
+    if (!AmxFeatures.available) return;
+    const tmmA: u8 = @intFromEnum(src_a);
+    const tmmB: u8 = @intFromEnum(src_b);
+    const tmmC: u8 = @intFromEnum(dst);
+    asm volatile (
+        "tilebf16dpd %%tmm%[B], %%tmm%[A], %%tmm%[C]"
+        :
+        : [A] "n" (tmmA),
+          [B] "n" (tmmB),
+          [C] "n" (tmmC),
+        : "memory"
+    );
+}
+
+pub fn tile_dpbssd(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
+    if (!AmxFeatures.available) return;
+    // (same pattern with "tileint8dpd" mnemonic)
+}
+```
+
+Note the AT&T operand order: `tilebf16dpd B, A, C` means `C = C + A * B^T`. The destination is the last operand, the B matrix is the first. This matches Intel SDM notation.
+
+### XFEATURE_XTILEDATA permission request
+
+AMX tile instructions will #GP fault on Linux unless the kernel has enabled the `XFEATURE_XTILEDATA` XSAVE feature for the current thread. This is a one-time `arch_prctl(ARCH_REQ_XCOMP_PERM, 18)` per thread. Port the C++ logic from `operators/amx/la/amx_config.hpp:107-145`:
+
+```zig
+const linux = std.os.linux;
+const ARCH_GET_XCOMP_SUPP = 0x1022;
+const ARCH_GET_XCOMP_PERM = 0x1023;
+const ARCH_REQ_XCOMP_PERM = 0x1024;
+const XFEATURE_XTILEDATA = 18;
+const XFEATURE_MASK_XTILEDATA: usize = 1 << XFEATURE_XTILEDATA;
+const XFEATURE_MASK_XTILE: usize = 1 << 17;
+
+var amx_enable_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+// 0 = not attempted, 1 = enabled, 2 = unavailable
+
+pub fn requestAmxPermission() bool {
+    if (!AmxFeatures.available) return false;
+    if (comptime builtin.os.tag != .linux) return false;
+
+    const state = amx_enable_state.load(.acquire);
+    if (state == 1) return true;
+    if (state == 2) return false;
+
+    var features: usize = 0;
+    const rc = linux.syscall1(.arch_prctl, ARCH_GET_XCOMP_SUPP, @intFromPtr(&features));
+    // x86_64 syscall convention: negative return = -errno in range -4095..-1.
+    if (rc > 0xFFFFFFFFFFFFF000) {
+        amx_enable_state.store(2, .release);
+        return false;
+    }
+    if ((features & XFEATURE_MASK_XTILE) != XFEATURE_MASK_XTILE) {
+        amx_enable_state.store(2, .release);
+        return false;
+    }
+    // ... etc ...
+    amx_enable_state.store(1, .release);
+    return true;
+}
+```
+
+Key Zig 0.16 syscall gotchas:
+- `std.os.linux.syscallN` returns `u64` directly. **Do not** wrap it in `std.os.linux.E(...)` — that helper does not exist in 0.16.
+- For pointer arguments, use `@intFromPtr(&var)` to convert the Zig pointer to the `u64` the syscall expects.
+- Error detection on x86_64: a return value in the range `0xFFFFFFFFFFFFF001..0xFFFFFFFFFFFFFFFF` indicates `-errno`. The conventional check is `rc > 0xFFFFFFFFFFFFF000`.
+
+### Writing a correctness test
+
+Since the intrinsics are no-ops on non-AMX hardware, gate the test with `if (!amx.AmxFeatures.available) return;` so CI on x86 (without AMX) doesn't false-fail. On AMX hardware, the test verifies that:
+
+1. `tile_zero` + `tile_stored` produces a buffer of all zeros.
+2. A small BF16 GEMM (`C = A * B^T` with `A` = identity, `B` = ones) produces `C = 1.0` everywhere.
+
+```zig
+test "AMX BF16 GEMM 16x16x16 identity * ones" {
+    if (!amx.AmxFeatures.available) return;
+
+    var a: [16 * 16]amx.bf16 align(64) = undefined;
+    var b: [16 * 16]amx.bf16 align(64) = undefined;
+    var c: [16 * 16]f32 align(64) = undefined;
+
+    // A = identity, B = ones
+    for (0..16) |i| for (0..16) |j| {
+        a[i * 16 + j] = if (i == j) amx.f32_to_bf16(1.0) else amx.f32_to_bf16(0.0);
+        b[i * 16 + j] = amx.f32_to_bf16(1.0);
+    }
+    for (0..c.len) |i| c[i] = 0.0;
+
+    amx.tile_loadconfig(&amx.TileConfig.init());
+    defer amx.tile_release();
+
+    // ... (load A, B, zero C, dpbf16ps, store C) ...
+
+    for (c) |v| try std.testing.expect(@abs(v - 1.0) < 0.01);
+}
+```
+
+### Complete file: `src/kernels/arch/amx.zig`
+
+The file now has 10 working intrinsics (loadconfig, release, loadd, stored, zero, dpbf16ps, dpbssd, dpbsud, dpbusd, dpbuud) plus the XFEATURE permission request. The signedness variants for INT8 (dpbsud/dpusd/dpuud) currently all forward to dpbssd because the AMX ISA only has one INT8 dot-product instruction; the caller is responsible for sign-/zero-extending operands as needed.
+
+## Wiring INT4 Dequantization to AMX
+
+INT4 GPTQ weights are 4 bits per weight, stored two-per-byte in a `BlockQ4_0`. The AMX tile engine only knows how to do INT8 dot products, so the dequantization must happen before the tile load. The C++ reference (`ktransformers/kt-kernel/operators/amx/la/amx_kernels.hpp:1559-1848`, `GemmKernel224Int4`) uses AVX-512 bit-twiddling for the dequant; we use a plain Zig loop in the first cut because correctness matters more than speed here.
+
+### The lo-nibble / hi-nibble pattern
+
+The AMX INT8 dot product (`tileint8dpd`) does not understand 4-bit values. Each K_STEP=64 covers one GPTQ group (32 weights × 2 nibbles = 64 byte positions). For each K_STEP:
+
+1. **Load activations** for the 64 K positions into tmm0/tmm1.
+2. **Dequantize low nibbles** of B into a 16×64 scratch buffer (one row per output channel), `tile_loadd` into tmm2/tmm3, `tile_dpbssd` (4 calls).
+3. **Reload activations** for the 64 K positions.
+4. **Dequantize high nibbles** of B into the same scratch buffer, `tile_loadd` into tmm2/tmm3, `tile_dpbssd` (4 calls).
+
+So each K_STEP runs `runTile()` twice — once for low nibbles, once for high nibbles. The accumulator is the INT32 tile register (tmm4-tmm7), which is never reset between the two runs, so both nibble contributions add up correctly.
+
+### Nibble dequantization to int8
+
+The C++ uses `_mm512_slli_epi32(_mm512_and_si512(lo_mask, ...), 4)` for the low nibble and `_mm512_and_si512(hi_mask, ...)` for the high nibble. The effect is:
+- Lo nibble: extract bits 0-3, shift left by 4 → value is in range [0, 240], stored as int8.
+- Hi nibble: extract bits 4-7 (already in high nibble position) → value is in range [-128, 112] interpreted as int8 (top bit is the sign).
+
+In Zig (no AVX-512 intrinsics in the kernel module yet), we dequant to signed int8 in [-8, 7] (the int4 range shifted to be symmetric around zero):
+```zig
+const nibble: u8 = if (is_lo) (byte & 0x0F) else ((byte >> 4) & 0x0F);
+const signed: i8 = @as(i8, @intCast(nibble)) - 8;
+```
+
+This gives the same mathematical result as the C++ approach, because `tileint8dpd` treats the int8 as signed in both cases (the C++'s "shift left by 4" trick is a way to keep the int8 range positive; we get the same result by subtracting 8 directly).
+
+### Output is INT32, not FP32
+
+Unlike the BF16 GEMM (`tilebf16dpd`, which accumulates into FP32 tile registers), `tileint8dpd` accumulates into INT32 tile registers. The C++ `apply_scale` helper runs after the K-block to multiply by the per-group scale and produce FP32. We do the same:
+```zig
+var int_c: [M_STEP * N_STEP]i32 align(64) = undefined;
+@memset(int_c[0..], 0);
+// ... AMX tile loop fills int_c via tile_stored(tmm, int_c, N_STEP * sizeof(i32)) ...
+// Then:
+for (m_begin..m_end) |i| {
+    for (n_begin..n_end) |j| {
+        const scale = amx.bf16_to_f32(b[j * ldb + blk_idx].d);
+        const val = @as(f32, @floatFromInt(int_c[(i - m_begin) * N_STEP + (j - n_begin)]));
+        c[i * ldc + j] = val * scale;
+    }
+}
+```
+
+The 32×32 scratch buffer is allocated on the stack, 64-byte aligned for the `tile_stored`/`tile_loadd` requirements. One scratch per (m_begin, n_begin) block; we re-zero it at the start of each K-block (or use the K-block boundary to apply the per-group scale).
+
+### The K_BLOCK boundary and per-group scales
+
+GPTQ stores one scale per group of 32 weights. The AMX tile accumulates over K_STEP=64 (two groups), so a K-block must be a multiple of GROUP_SIZE=32 for the per-group scale to be constant across the block. The C++ handles the general case by running the AMX kernel per-group; our initial implementation only supports K_BLOCK == GROUP_SIZE (or K_BLOCK % GROUP_SIZE == 0 with group boundaries aligned). The `applyScales` helper checks this and falls back to zeroing c for the unsupported case.
+
+### Why two `tile_loadd` per K-step
+
+Looking at the C++ loop:
+```cpp
+K::load_a(ba->get_submat(..., k_begin), K_STEP * sizeof(int8_t));
+K::load_b_lo(bb->get_submat(..., k_begin), B_K_STEP / 2);
+K::run_tile();
+K::load_a(ba->get_submat(..., k_begin + K_STEP), K_STEP * sizeof(int8_t));
+K::load_b_hi(bb->get_submat(..., k_begin), B_K_STEP / 2);
+K::run_tile();
+```
+
+The `k_begin` for `load_b_lo` and `load_b_hi` is the SAME — both reference the same set of `BlockQ4_0` bytes. `load_b_lo` extracts and shifts the low nibbles, `load_b_hi` extracts the high nibbles. The activations (`load_a`) are loaded twice because we want the same activations multiplied by the lo-nibble dequantized B and the hi-nibble dequantized B, separately.
+
+### Compiling with `align(64)` for scratch buffers
+
+The `tile_loadd` and `tile_stored` instructions require 64-byte alignment for the base address. Stack-allocated scratch buffers must be declared with `align(64)`:
+```zig
+var b_scratch: [2 * TILE_N * TILE_K]i8 align(64) = undefined;
+var int_c: [M_STEP * N_STEP]i32 align(64) = undefined;
+```
+
+Heap-allocated buffers (from `allocator.alloc`) are page-aligned (4096 bytes) by default, so no explicit alignment is needed there.
+
+### Complete file: `src/kernels/amx/gemm_224_int4.zig`
+
+The `GemmKernel224Int4` struct now has:
+- `config()` — sets the 8-tile config (2 A, 2 B, 4 C)
+- `cleanC()`, `loadC(c, ldc)`, `storeC(c, ldc)` — INT32 tile management
+- `loadA(a, lda)` — INT8 activation loads
+- `runTile()` — 4× `tile_dpbssd` calls
+- `loadB(b, ldb, scratch, is_lo)` — dequantize one row of B and `tile_loadd` tmm2/tmm3
+- `applyScales(...)` — INT32 → FP32 with per-group scale
+
+`gemmFullTile` now calls these helpers instead of the scalar triple-nested loop. On non-AMX hardware it falls back to `gemmFullTileScalar` (the old code, preserved for correctness).
+
+## Zig 0.16 Fixes From the MLA Port (Aug 29, 2026 - Session 3)
+
+All items below were **empirically verified** against the exact toolchain in use
+(`zig 0.16.0-dev.2535+b5bd49460`) by compiling small probe programs before
+writing production code. If your recollection disagrees with the compiler,
+write a 10-line probe — several "known" APIs turned out to be different.
+
+### 1. `std.ArrayList` is UNMANAGED in this toolchain
+
+`std.ArrayList(T)` is an alias for `array_list.Aligned(T, null)`, which has NO
+stored allocator. The managed style (`ArrayList(T).init(allocator)`,
+`list.append(item)`, `list.deinit()`) **does not compile** — there is no
+`init(allocator)` declaration and `append` takes an allocator parameter.
+
+```zig
+// WRONG (managed style — from pre-0.16 muscle memory):
+var list = std.ArrayList(u32).init(allocator);
+defer list.deinit();
+try list.append(1);
+
+// CORRECT (unmanaged style):
+var list: std.ArrayList(u32) = .empty;
+defer list.deinit(allocator);
+try list.append(allocator, 1);
+list.clearRetainingCapacity();          // this one still takes no allocator
+var list2 = try std.ArrayList(u32).initCapacity(allocator, 8);
+defer list2.deinit(allocator);
+```
+
+NOTE: some older files in this repo (`runtime/task_queue.zig`, `memory.zig`,
+`worker_pool.zig`, `cpu_detect.zig`) still use `ArrayList(T).init(allocator)` /
+managed `.append(item)`. That code predates this check — it compiles only if
+those paths are never analyzed, and will break the moment they are. Treat the
+unmanaged style as the repo standard for new code.
+
+### 2. `alignedAlloc` takes a `std.mem.Alignment` enum, not a number
+
+The alignment parameter is a comptime enum of log2 values, not a raw integer:
+
+```zig
+// WRONG (old 2-arg / int-alignment forms):
+allocator.alignedAlloc(f32, 64, n)                    // no 2-arg form
+allocator.alignedAlloc(f32, @enumFromInt(log2(64)), n) // Alignment from log2 — works but clunky
+
+// CORRECT (enum literal, @"64" means 64-byte alignment):
+const buf = try allocator.alignedAlloc(f32, .@"64", n);   // -> []align(64) f32
+allocator.free(buf);
+```
+
+The result is a slice with alignment baked into the TYPE (`[]align(64) f32`),
+which composes correctly with SIMD loads.
+
+### 3. Vector element writes require comptime index — coerce through arrays
+
+`@Vector(N, f32)` cannot be indexed with a runtime variable for WRITES
+(`v[j] = x` with runtime `j` is "vector index not comptime known"). Arrays and
+vectors implicitly coerce into each other, so use an array as a staging area:
+
+```zig
+const Vec16f32 = @Vector(16, f32);
+
+// WRONG:
+var w: Vec16f32 = undefined;
+for (0..16) |j| w[j] = load(j);        // error: vector index not comptime known
+
+// CORRECT (array -> vector coercion is free):
+var tmp: [16]f32 = undefined;
+for (0..16) |j| tmp[j] = load(j);
+const w: Vec16f32 = tmp;               // implicit array -> vector
+const back: [16]f32 = w;               // implicit vector -> array
+const p: *[16]f32 = @ptrCast(&vec_val); // pointer view onto a vector also works
+```
+
+### 4. Runtime-offset vector loads/stores: `ptr[off..][0..16].*`
+
+Open-ended slice on a many-item pointer, then a comptime-length slice, works
+for both loads and stores at ANY byte alignment (verified with 4-byte-aligned
+offsets — the compiler emits unaligned moves):
+
+```zig
+const off: usize = ...; // runtime value
+const v: Vec16f32 = src[off..][0..16].*;   // load
+dst[off..][0..16].* = v;                    // store
+```
+
+This is the main SIMD workhorse pattern in `src/mla/mla_core.zig`.
+
+### 5. `@memcpy` / `@memset` are 2-arg slice forms
+
+```zig
+@memcpy(dst_slice, src_slice);        // both []T, same length required
+@memset(slice, value);                 // value can be runtime or comptime
+@memset(u16_slice, 0x3F80);            // comptime int works for u16 slices
+```
+
+The 3-arg C-style forms (`@memcpy(ptr, ptr, len)`) are gone.
+
+### 6. Copying structs that hold ArrayLists — pointers, not values
+
+`MlaKvCache` (and any struct containing `std.ArrayList` fields) must be
+heap-allocated and passed as `*T` when another object stores a pointer to it:
+
+```zig
+// WRONG — returning the cache by VALUE from a helper copies the ArrayLists;
+// the engine's `cache: *MlaKvCache` then points at a MOVED-FROM stack local.
+// Symptom: General protection exception deep inside appendToken.
+
+// CORRECT:
+const cache = try allocator.create(MlaKvCache);
+errdefer allocator.destroy(cache);
+cache.* = try MlaKvCache.init(allocator, config, page_count);
+const engine = try allocator.create(MlaEngine);
+errdefer allocator.destroy(engine);
+engine.* = try MlaEngine.init(allocator, config, cache);
+```
+
+Debug builds will NOT catch this — the moved-from memory still "looks" valid.
+It showed up as a GP fault inside `page_table.items[token_pos] = ...`.
+
+### 7. BF16 constant 1.0 is `0x3F80`, NOT `0x3C00`
+
+`0x3C00` is **FP16** 1.0. BF16 1.0 shares its top 16 bits with f32
+1.0 (`0x3F800000`):
+
+```zig
+0x3F80 -> 1.0        (BF16 — use this)
+0x3C00 -> 0.0078125  (FP16 bit pattern misread as BF16)
+```
+
+The draft MLA port used `0x3C00` in every test ("~1.0 in BF16"), silently
+shrinking all weights by 128x. Tests still "passed" (output was nonzero) —
+which is exactly why constant-value weight tests must assert exact values,
+not just `!= 0`.
+
+### 8. `errdefer` ordering in multi-allocation init
+
+When `init` allocates several buffers, `errdefer` only unwinds allocations
+made BEFORE the failure point. Two workable patterns:
+
+```zig
+// Pattern A — var self + errdefer self.deinit() (used in MlaEngine.init):
+var self = MlaEngine{ ...all allocations... };
+errdefer self.deinit();
+@memset(self.attention_weights, 0);
+return self;
+
+// Pattern B — one errdefer per allocation, in reverse order.
+```
+
+### 9. Stale `.zig-cache` can report errors that no longer exist
+
+`zig build test` failed with "unused function parameter" pointing at code that
+was already fixed. `rm -rf .zig-cache` and rebuild resolved it. If an error
+survives a no-op rebuild, suspect the cache before suspecting the code.
+
+### 10. Test-signature note
+
+Tests still use plain `test "name" { ... }` with `std.testing` — no `io`
+parameter needed for pure-compute code. `std.testing.expectApproxEqAbs`,
+`expectApproxEqRel`, `std.Random.DefaultPrng.init(seed)` + `.random()` all
+work as in 0.15.
+
+### 11. BF16 conversion intrinsics (for reference)
+
+```zig
+inline fn bf16ToF32(x: u16) f32 {
+    return @bitCast(@as(u32, x) << 16);
+}
+inline fn f32ToBf16(x: f32) u16 {
+    const u: u32 = @bitCast(x);
+    return @intCast((u +% 0x00008000) >> 16);  // +% wrapping add for NaN safety
+}
+```
+
+### 12. Math bugs found in the draft MLA port (vs kt-kernel C++)
+
+These are porting-lessons, not Zig lessons, but they are the kind of thing
+that "compiles and produces output" hides:
+
+1. **Double softmax**: the draft softmaxed the PE attention scores, then added
+   nope scores and softmaxed AGAIN. C++ (`operators/llamafile/mla.hpp`)
+   computes PE + nope scores and applies ONE softmax per query row. Fixed by
+   splitting score computation (`computePeScores`/`computeNopeScores`) from
+   `softmaxWeights`.
+2. **RoPE position for q_pe**: the draft rotated q_pe at the *within-batch*
+   position. The rotation must use the ABSOLUTE cache position
+   (`kv_start_pos + pos`), matching the C++ `rope_angle.cos(token_at)`.
+3. Both bugs survived the original test suite because its assertions were
+   `has_nonzero`-style. Strong tests: exact-value math checks on helpers
+   (rmsNorm, softmax, rope), plus a white-box `projectQ` test that asserts
+   q_pe DIFFERS across two `kv_start_pos` values.
+
+## Integrating a Standalone Zig Module (MLA)
+
+**(a) "zig build green" does NOT mean your module was compiled.** Zig analyzes
+lazily: a file that is not reachable from the root source file's import graph
+is silently skipped. `src/mla/` compiled standalone (`zig test src/mla/...`)
+and `zig build` was green, but the `.so` contained zero MLA code until the
+module was re-exported from `src/root.zig`:
+
+```zig
+pub const mla_config = @import("mla/mla_config.zig");
+pub const mla_cache  = @import("mla/mla_cache.zig");
+pub const mla_core   = @import("mla/mla_core.zig");
+```
+
+A `pub const` re-export alone does NOT force analysis of the module's
+declarations — it only makes the namespace reachable. Probed empirically:
+`pub const lib = @import(...)` and even `comptime { _ = @import(...); }` both
+produced ZERO library symbols. What works is referencing the declarations
+themselves in a comptime block (see root.zig):
+
+```zig
+comptime {
+    _ = &mla_core.MlaEngine.init;   // &fn forces analysis of that function
+    _ = &mla_core.rmsNorm;
+    // ... one line per function you need emitted
+}
+```
+
+Also: functions are emitted only if reachable; standalone fns in a library
+need at least one `_ = &` reference each. Note: `nm -D` (dynamic symbols) only
+shows `export fn` C API symbols; internal Zig symbols appear in the plain
+symbol table as local `t` entries.
+
+**(b) Verify with both symbol tables:**
+```bash
+nm    zig-out/lib/libkt_kernel_ext.so | grep MlaEngine   # internal: MlaEngine_init etc.
+nm -D zig-out/lib/libkt_kernel_ext.so | grep -i mla      # C API: kt_mla_* exports
+```
+If the plain `nm` grep is empty, the import was not picked up.
+
+**(c) Stale `.zig-cache` gotcha** (already hit twice in this repo): after
+adding a new import, an incremental build may still not emit the new symbols.
+`rm -rf .zig-cache zig-out && zig build` from a clean slate. If an error
+persists after a clean rebuild, then it is real.

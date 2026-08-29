@@ -44,11 +44,11 @@ Last updated: 2026-08-29
 - [ ] Implement proper `workerLoop` (currently placeholder spin-wait)
 
 ### Kernels
-- [ ] Complete INT4 GPTQ kernel (`gemm_224_int4.zig`)
+- [x] **Complete INT4 GPTQ kernel (`gemm_224_int4.zig`)** — replaced scalar fallback with AMX tile path (`tileint8dpd` + on-the-fly INT4→INT8 dequantization). Lo/hi nibble pattern from C++ `GemmKernel224Int4` (amx_kernels.hpp:1559-1848). Per-group scales applied at K-block boundary via `applyScales` (INT32 → FP32). Correctness test added to `tests/kernels/test_kernels.zig`. Non-AMX hosts fall back to the preserved scalar implementation.
 - [ ] Complete FP8 E4M3 kernel (`gemm_224_fp8.zig`)
 - [ ] Complete MXFP4/MXFP8 kernels
 - [ ] Implement `applySwiGLU` vectorized version using `std.simd`
-- [ ] Add actual AMX inline assembly (currently placeholder)
+- [x] **Add actual AMX inline assembly (previously placeholder)** — `ldtilecfg`, `tilerelease`, `tileloadd`, `tilestored`, `tilezero`, `tilebf16dpd`, `tileint8dpd` all wired in `src/kernels/arch/amx.zig` with proper comptime tile-register immediates. Includes XFEATURE_XTILEDATA permission request via `arch_prctl`. Correctness tests added to `tests/kernels/test_kernels.zig` (skip on non-AMX hardware).
 
 ### MoE Layer
 - [ ] Implement `TpMoe.loadWeights()` with online quantization (BF16 → INT8/INT4)
@@ -56,7 +56,7 @@ Last updated: 2026-08-29
 - [ ] Expert routing with top-k selection (SIMD optimized)
 
 ### C API Completeness
-- [ ] MLA attention (`kt_mla_*` functions)
+- [x] **MLA attention — code complete in `src/mla/`, re-exported from `root.zig`** (config, cache, core modules wired into the library; 11/11 standalone tests passing). C API integration (`kt_mla_*` in `main.zig` still placeholder) tracked as separate plan.
 - [ ] Gate (`kt_gate_*` functions)
 - [ ] Linear/MLP (`kt_linear_*`, `kt_mlp_*`)
 - [ ] FP8 layerwise transport (`kt_fp8_*` functions)
@@ -101,11 +101,11 @@ Last updated: 2026-08-29
 | Component | Status | % |
 |-----------|--------|---|
 | Runtime (pool/queue/memory/cpu) | Working, basic impl | 75% |
-| AMX Intrinsics | Placeholder (no inline asm) | 50% |
+| AMX Intrinsics | Real inline asm (tile_loadconfig/loadd/stored/zero/dpbf16ps/dpbssd) | 90% |
 | Buffer Packing | Working | 80% |
 | BF16 GEMM | Working | 70% |
 | INT8 GEMM | Working | 70% |
-| INT4/FP8/MXFP4/8 GEMM | Not started | 0% |
+| INT4/FP8/MXFP4/8 GEMM | INT4 done (AMX), FP8/MXFP4/8 not started | 25% |
 | MoE Orchestration | Partial | 40% |
 | C API | Basic functions only | 50% |
 | Build System | Single variant | 60% |
