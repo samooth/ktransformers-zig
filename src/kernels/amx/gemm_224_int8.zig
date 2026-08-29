@@ -47,17 +47,17 @@ pub const GemmKernel224Int8 = struct {
 
         // Tile 0,1: A matrices (16 x 64 INT8)
         for (0..2) |i| {
-            tile_config.setTile(i, TILE_M, TILE_K * @sizeOf(dt));
+            tile_config.setTile(@as(u8, @intCast(i)), TILE_M, @as(u16, @intCast(TILE_K * @sizeOf(dt))));
         }
 
         // Tile 2,3: B matrices (16 x 64 INT8 VNNI)
         for (2..4) |i| {
-            tile_config.setTile(i, TILE_K / VNNI_BLK, TILE_N * VNNI_BLK * @sizeOf(dt));
+            tile_config.setTile(@as(u8, @intCast(i)), @as(u16, @intCast(TILE_K / VNNI_BLK)), @as(u16, @intCast(TILE_N * VNNI_BLK * @sizeOf(dt))));
         }
 
         // Tile 4,5,6,7: C matrices (16 x 16 INT32)
         for (4..8) |i| {
-            tile_config.setTile(i, TILE_M, TILE_N * @sizeOf(output_t));
+            tile_config.setTile(@as(u8, @intCast(i)), TILE_M, @as(u16, @intCast(TILE_N * @sizeOf(output_t))));
         }
 
         amx.tile_loadconfig(&tile_config);
@@ -79,12 +79,12 @@ pub const GemmKernel224Int8 = struct {
 
     pub fn loadA(a: *const dt, lda: usize) void {
         amx.tile_loadd(amx.TileReg.tmm0, @ptrCast(a), lda);
-        amx.tile_loadd(amx.TileReg.tmm1, @ptrCast(a + TILE_M * lda), lda);
+        amx.tile_loadd(amx.TileReg.tmm1, @ptrCast(@as([*]const dt, @ptrCast(a)) + TILE_M * lda), lda);
     }
 
     pub fn loadB(b: *const dt, ldb: usize) void {
         amx.tile_loadd(amx.TileReg.tmm2, @ptrCast(b), ldb);
-        amx.tile_loadd(amx.TileReg.tmm3, @ptrCast(b + TILE_N * ldb), ldb);
+        amx.tile_loadd(amx.TileReg.tmm3, @ptrCast(@as([*]const dt, @ptrCast(b)) + TILE_N * ldb), ldb);
     }
 
     pub fn cleanC() void {
@@ -96,16 +96,16 @@ pub const GemmKernel224Int8 = struct {
 
     pub fn loadC(c: *output_t, ldc: usize) void {
         amx.tile_loadd(amx.TileReg.tmm4, @ptrCast(c), ldc);
-        amx.tile_loadd(amx.TileReg.tmm5, @ptrCast(c + TILE_N), ldc);
-        amx.tile_loadd(amx.TileReg.tmm6, @ptrCast(c + ldc * TILE_M), ldc);
-        amx.tile_loadd(amx.TileReg.tmm7, @ptrCast(c + ldc * TILE_M + TILE_N), ldc);
+        amx.tile_loadd(amx.TileReg.tmm5, @ptrCast(@as([*]output_t, @ptrCast(c)) + TILE_N), ldc);
+        amx.tile_loadd(amx.TileReg.tmm6, @ptrCast(@as([*]output_t, @ptrCast(c)) + ldc * TILE_M), ldc);
+        amx.tile_loadd(amx.TileReg.tmm7, @ptrCast(@as([*]output_t, @ptrCast(c)) + ldc * TILE_M + TILE_N), ldc);
     }
 
     pub fn storeC(c: *output_t, ldc: usize) void {
         amx.tile_stored(amx.TileReg.tmm4, @ptrCast(c), ldc);
-        amx.tile_stored(amx.TileReg.tmm5, @ptrCast(c + TILE_N), ldc);
-        amx.tile_stored(amx.TileReg.tmm6, @ptrCast(c + ldc * TILE_M), ldc);
-        amx.tile_stored(amx.TileReg.tmm7, @ptrCast(c + ldc * TILE_M + TILE_N), ldc);
+        amx.tile_stored(amx.TileReg.tmm5, @ptrCast(@as([*]output_t, @ptrCast(c)) + TILE_N), ldc);
+        amx.tile_stored(amx.TileReg.tmm6, @ptrCast(@as([*]output_t, @ptrCast(c)) + ldc * TILE_M), ldc);
+        amx.tile_stored(amx.TileReg.tmm7, @ptrCast(@as([*]output_t, @ptrCast(c)) + ldc * TILE_M + TILE_N), ldc);
     }
 
     pub fn runTile() void {
@@ -143,7 +143,7 @@ pub const GemmKernel224Int8 = struct {
 
         for (0..k) |i| {
             const val = amx.bf16_to_f32(src[i]);
-            const quantized = @as(i8, @intCast(val / scale.* + 0.5));
+            const quantized = @as(i8, @intFromFloat(val / scale.* + 0.5));
             dst[i] = if (quantized < -128) -128 else if (quantized > 127) 127 else quantized;
         }
     }
@@ -151,7 +151,7 @@ pub const GemmKernel224Int8 = struct {
     /// Dequantize INT8 row to BF16
     pub fn dequantizeRowInt8ToBF16(src: [*]const i8, scale: f32, dst: [*]amx.bf16, k: usize) void {
         for (0..k) |i| {
-            dst[i] = amx.f32_to_bf16(@as(f32, @intCast(src[i])) * scale);
+            dst[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(src[i])) * scale);
         }
     }
 
@@ -173,8 +173,8 @@ pub const GemmKernel224Int8 = struct {
             const k_step = @min(K_STEP, k_remain);
 
             if (k_step == K_STEP) {
-                loadA(a + k_processed, lda);
-                loadB(b + k_processed, ldb);
+                loadA(@ptrCast((@as([*]const dt, @ptrCast(a)) + k_processed)), lda);
+                loadB(@ptrCast((@as([*]const dt, @ptrCast(b)) + k_processed)), ldb);
 
                 if (k_processed == 0) {
                     cleanC();
@@ -185,7 +185,7 @@ pub const GemmKernel224Int8 = struct {
                 runTile();
                 storeC(c, ldc);
             } else {
-                gemmPartialTile(a + k_processed, lda, b + k_processed, ldb, c, ldc, k_step);
+                gemmPartialTile(@ptrCast(@as([*]const dt, @ptrCast(a)) + k_processed), lda, @ptrCast(@as([*]const dt, @ptrCast(b)) + k_processed), ldb, c, ldc, k_step);
             }
         }
     }
@@ -200,9 +200,9 @@ pub const GemmKernel224Int8 = struct {
             for (0..N_STEP) |n| {
                 var sum: i32 = 0;
                 for (0..k_step) |k| {
-                    sum += @as(i32, @intCast(a[m * lda + k])) * @as(i32, @intCast(b[n * ldb + k]));
+                    sum += @as(i32, @intCast((@as([*]const i8, @ptrCast(a)))[m * lda + k])) * @as(i32, @intCast((@as([*]const i8, @ptrCast(b)))[n * ldb + k]));
                 }
-                c[m * ldc + n] += sum;
+                (@as([*]i32, @ptrCast(c)))[m * ldc + n] += sum;
             }
         }
     }
@@ -243,8 +243,8 @@ pub const Int8BufferB = struct {
     pub fn init(n: usize, k: usize, ptr: *i8, n_step: usize, k_step: usize, k_block: usize, n_block: usize) Int8BufferB {
         const scale_offset = n * k;
         return Int8BufferB{
-            .ptr = ptr,
-            .scales = @ptrCast(@alignCast(ptr + scale_offset)),
+            .ptr = @as([*]i8, @ptrCast(ptr)),
+            .scales = @as([*]f32, @ptrCast(@alignCast(@as([*]i8, @ptrCast(ptr)) + scale_offset))),
             .n = n,
             .k = k,
             .n_step = n_step,

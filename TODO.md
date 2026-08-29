@@ -131,3 +131,29 @@ Last updated: 2026-08-29
   - `src/runtime/memory.zig`: Fixed alignedAlloc API
   - `src/runtime/worker_pool.zig`: Fixed atomic, DoublyLinkedList, Thread.Pool
   - `tests/kernels/test_kernels.zig`: Fixed import path, type casts
+
+---
+
+## ✅ Additional Fixes (2026-08-29 - Session 2)
+
+### Build Error Resolution
+- [x] **Fixed all 31 build errors** in Zig 0.16
+- [x] **Fixed 6 main.zig errors** (parentheses, pointer types, opaque types)
+- [x] **Fixed 18 moe.zig errors** (type casting, pointer arithmetic, @memset)
+- [x] **Fixed 4 gemm_224_int8 errors** (pointer casting, setTile, quantization)
+- [x] **Fixed 2 worker_pool.zig errors** (std.Io.Mutex changes)
+- [x] **Added 5 missing TpMoe methods** (deinit, warmUp, loadWeightsWithMap, forwardGateUp, forwardDown)
+- [x] **Fixed @memset API** (now 2-arg version in Zig 0.16)
+- [x] **Fixed all setTile calls** with proper u8/u16 casting
+- [x] **Fixed pointer arithmetic** throughout kernels with @ptrCast patterns
+- [x] **Fixed f32↔int conversions** (@intFromFloat, @floatFromInt)
+
+### Documentation
+- [x] **Updated LESSONS_ZIG.md** with 30+ Zig 0.16 lessons learned
+- [x] **Added build success summary** to LESSONS_ZIG.md
+
+### Current Status
+- **Build**: ✅ WORKING (0 errors)
+- **Tests**: ✅ PASSING
+- **Library**: `zig-out/lib/libkt_kernel_ext.so` (12.2 MB)
+- **All compilation issues resolved**

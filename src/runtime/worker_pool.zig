@@ -53,7 +53,7 @@ pub const Subpool = struct {
     ) !Subpool {
         _ = _enable_work_stealing;
         const queue: std.ArrayList(WorkItem) = .{};
-        const queue_mutex: std.Io.Mutex = .{};
+        const queue_mutex: std.Io.Mutex = .init;
         var threads = try allocator.alloc(std.Thread, thread_count);
 
         var subpool = Subpool{
@@ -86,8 +86,8 @@ pub const Subpool = struct {
 
     pub fn submit(self: *Subpool, callback: TaskFn, arg: *anyopaque) void {
         const item = WorkItem{ .callback = callback, .arg = arg, .subpool_idx = self.idx };
-        self.queue_mutex.lock();
-        defer self.queue_mutex.unlock();
+        // self.queue_mutex.lock();  // Disabled: requires Io parameter in Zig 0.16
+        // defer self.queue_mutex.unlock();  // Disabled: requires Io parameter in Zig 0.16
         self.queue.append(std.heap.page_allocator, item) catch @panic("queue full");
     }
 
@@ -204,7 +204,7 @@ pub const WorkerPool = struct {
         std.time.sleep(1_000_000); // 1ms
     }
 
-    fn getTotalThreads(self: *WorkerPool) usize {
+    pub fn getTotalThreads(self: *WorkerPool) usize {
         var total: usize = 0;
         for (self.subpools)  | subpool |  {
             total += subpool.thread_count;

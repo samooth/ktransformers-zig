@@ -3,3 +3,6 @@ zig-out/
 *.so
 *.o
 .kilo/
+toinclude/
+*.backup
+*.backup2

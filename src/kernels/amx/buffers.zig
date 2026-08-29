@@ -22,7 +22,7 @@ pub fn BufferA(comptime K: type) type {
             return max_m * @sizeOf(K);
         }
 
-        pub fn init(max_m: usize, k: usize, ptr: *K, m_step: usize, k_step: usize, k_block: usize, n_block: usize) BufferA(K) {
+        pub fn init(max_m: usize, k: usize, ptr: [*]K, m_step: usize, k_step: usize, k_block: usize, n_block: usize) BufferA(K) {
             return BufferA(K){
                 .ptr = ptr,
                 .max_m = max_m,
@@ -34,7 +34,7 @@ pub fn BufferA(comptime K: type) type {
             };
         }
 
-        pub fn setData(self: *BufferA(K), new_ptr: *K) void {
+        pub fn setData(self: *BufferA(K), new_ptr: [*]K) void {
             self.ptr = new_ptr;
         }
 
@@ -104,7 +104,7 @@ pub fn BufferB(comptime K: type) type {
             return n * k * elem_size + scale_size;
         }
 
-        pub fn init(n: usize, k: usize, ptr: *K, n_step: usize, k_step: usize, k_block: usize, n_block: usize, has_scales: bool) BufferB(K) {
+        pub fn init(n: usize, k: usize, ptr: [*]K, n_step: usize, k_step: usize, k_block: usize, n_block: usize, has_scales: bool) BufferB(K) {
             const scale_offset = n * k;
             return BufferB(K){
                 .ptr = ptr,
@@ -119,7 +119,7 @@ pub fn BufferB(comptime K: type) type {
             };
         }
 
-        pub fn setData(self: *BufferB(K), new_ptr: *K) void {
+        pub fn setData(self: *BufferB(K), new_ptr: [*]K) void {
             self.ptr = new_ptr;
             const scale_offset = self.n * self.k;
             self.scales = if (self.has_scales) @ptrCast(@alignCast(new_ptr + scale_offset)) else undefined;
@@ -222,7 +222,7 @@ pub fn BufferC(comptime K: type) type {
             return max_m * n * @sizeOf(K);
         }
 
-        pub fn init(max_m: usize, n: usize, ptr: *K, m_step: usize, n_step: usize, n_block: usize) BufferC(K) {
+        pub fn init(max_m: usize, n: usize, ptr: [*]K, m_step: usize, n_step: usize, n_block: usize) BufferC(K) {
             return BufferC(K){
                 .ptr = ptr,
                 .max_m = max_m,
@@ -233,7 +233,7 @@ pub fn BufferC(comptime K: type) type {
             };
         }
 
-        pub fn setData(self: *BufferC(K), new_ptr: *K) void {
+        pub fn setData(self: *BufferC(K), new_ptr: [*]K) void {
             self.ptr = new_ptr;
         }
 
@@ -323,8 +323,8 @@ pub fn quantizeRowBF16ToInt4(src: [*]const amx.bf16, dst: [*]u8, scales: [*]f32,
         const start = g * group_size;
         const end = @min(k, start + group_size);
 
-        var min_val: f32 = std.math.max(f32);
-        var max_val: f32 = -std.math.max(f32);
+        var min_val: f32 = std.math.inf(f32);
+        var max_val: f32 = -std.math.inf(f32);
         for (start..end)  | i |  {
             const val = amx.bf16_to_f32(src[i]);
             if (val < min_val) min_val = val;

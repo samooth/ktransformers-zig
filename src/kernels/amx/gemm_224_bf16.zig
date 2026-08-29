@@ -47,17 +47,17 @@ pub const GemmKernel224BF = struct {
 
         // Tile 0,1: A matrices (16 x 32 BF16)
         for (0..2) |i| {
-            tile_config.setTile(i, TILE_M, TILE_K * @sizeOf(dt));
+            tile_config.setTile(@as(u8, @intCast(i)), TILE_M, @as(u16, @intCast(TILE_K * @sizeOf(dt))));
         }
 
         // Tile 2,3: B matrices (16 x 32 BF16 VNNI)
         for (2..4) |i| {
-            tile_config.setTile(i, TILE_K / VNNI_BLK, TILE_N * VNNI_BLK * @sizeOf(dt));
+            tile_config.setTile(@as(u8, @intCast(i)), @as(u16, @intCast(TILE_K / VNNI_BLK)), @as(u16, @intCast(TILE_N * VNNI_BLK * @sizeOf(dt))));
         }
 
         // Tile 4,5,6,7: C matrices (16 x 16 FP32)
         for (4..8) |i| {
-            tile_config.setTile(i, TILE_M, TILE_N * @sizeOf(output_t));
+            tile_config.setTile(@as(u8, @intCast(i)), TILE_M, @as(u16, @intCast(TILE_N * @sizeOf(output_t))));
         }
 
         amx.tile_loadconfig(&tile_config);
