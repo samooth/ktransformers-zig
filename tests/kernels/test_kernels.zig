@@ -4,7 +4,7 @@
 const std = @import("std");
 const testing = std.testing;
 
-const root = @import("root.zig");
+const root = @import("kt");
 
 const amx = root.amx;
 const buffers = root.buffers;
@@ -33,8 +33,8 @@ test "BF16 conversion" {
 }
 
 test "BufferA required size" {
-    const size = buffers.BufferA(amx.bf16).requiredSize(128, 4096, 32, 32);
-    try testing.expect(size == 128 * 4096 * 2); // 2 bytes per BF16
+    const size = buffers.BufferA(amx.bf16).requiredSize(128);
+    try testing.expect(size == 128 * 2); // 2 bytes per BF16
 }
 
 test "BufferB required size" {
@@ -64,7 +64,6 @@ test "GEMM INT8 config" {
 test "CPU detection" {
     const allocator = testing.allocator;
     const cpu = cpu_detect.detectCpu(allocator) catch @panic("CPU detect failed");
-    defer cpu.flags.deinit();
 
     try testing.expect(cpu.vendor != cpu_detect.Vendor.unknown);
     try testing.expect(cpu.arch.len > 0);
@@ -75,7 +74,7 @@ test "CPU detection" {
 
 test "Worker pool creation" {
     const allocator = testing.allocator;
-    const pool = try worker_pool.WorkerPool.initSimple(allocator, 2);
+    var pool = try worker_pool.WorkerPool.initSimple(allocator, 2);
     defer pool.deinit();
 
     try testing.expect(pool.config.subpool_count == 1);
@@ -95,7 +94,8 @@ test "Worker pool with config" {
     config.subpool_thread_count[1] = 2;
 
     const pool = try worker_pool.WorkerPool.init(allocator, config);
-    defer pool.deinit();
+    var pool_mut = pool;
+    defer pool_mut.deinit();
 
     try testing.expect(pool.config.subpool_count == 2);
     try testing.expect(pool.config.subpool_thread_count[0] == 2);
@@ -150,7 +150,7 @@ test "Quantize BF16 to INT8" {
 
     // Fill with values
     for (0..k) |i| {
-        src[i] = amx.f32_to_bf16(@intToFloat(f32, i) * 0.1);
+        src[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(i)) * 0.1);
     }
 
     buffers.quantizeRowBF16ToInt8(src.ptr, dst.ptr, &scale, k);
@@ -171,7 +171,7 @@ test "Dequantize INT8 to BF16" {
 
     // Fill with values
     for (0..k) |i| {
-        src[i] = @intCast(i8, i - 16);
+        src[i] = @as(i8, @intCast(i - 16));
     }
 
     buffers.dequantizeRowInt8ToBF16(src.ptr, 0.1, dst.ptr, k);

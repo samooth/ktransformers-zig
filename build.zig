@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
 
     std.debug.print("Building variant: {s} (cpu_instruct={s})\n", .{ suffix, cpu_instruct });
 
-    // Create module for this variant - main.zig is the root, other files are imported
+    // Create module for this variant - root.zig re-exports all submodules and includes main.zig
     const mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -66,15 +66,15 @@ pub fn build(b: *std.Build) void {
     const default_step = b.step("build", "Build CPU variant");
     default_step.dependOn(b.getInstallStep());
 
-    // Test step (disabled for now)
-    // const test_step = b.step("test", "Run tests");
-    // const test_mod = b.createModule(.{
-    //     .root_source_file = b.path("tests/kernels/test_kernels.zig"),
-    //     .target = target,
-    //     .optimize = optimize,
-    // });
-    // test_mod.addImport("root", b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize }));
-    //
-    // const test_obj = b.addTest(.{ .root_module = test_mod });
-    // test_step.dependOn(&test_obj.step);
+    // Test step
+    const test_step = b.step("test", "Run tests");
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("tests/kernels/test_kernels.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_mod.addImport("kt", b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize }));
+
+    const test_obj = b.addTest(.{ .root_module = test_mod });
+    test_step.dependOn(&test_obj.step);
 }

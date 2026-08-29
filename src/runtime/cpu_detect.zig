@@ -2,7 +2,12 @@
 // Ported from ktransformers kt-kernel/python/_cpu_detect.py
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const avx512vnni_str = "avx512vnni";
+const avx512_vnni_str = "avx512_vnni";
+
+
 
 /// CPU vendor identification
 pub const Vendor = enum {
@@ -34,12 +39,14 @@ pub const Features = struct {
     neon: bool = false,
 };
 
+
+
 /// CPU information
 pub const CpuInfo = struct {
     vendor: Vendor,
     arch: []const u8,
     features: Features,
-    flags: std.ArrayList([]const u8),
+    flags: [16]u8,
     model_name: []const u8,
     cpu_family: u32,
     model: u32,
@@ -48,18 +55,21 @@ pub const CpuInfo = struct {
     numa_nodes: usize = 1,
 };
 
+
 /// Detect CPU features and vendor
+
 pub fn detectCpu(allocator: Allocator) !CpuInfo {
-    const os = std.Target.current.os.tag;
+        var io = std.Io.Threaded.init(allocator, .{ .environ = std.process.Environ.empty });
+    const os = builtin.target.os.tag;
     switch (os) {
-        .linux => return detectCpuLinux(allocator),
-        .macos => return detectCpuDarwin(allocator),
-        .windows => return detectCpuWindows(allocator),
+        .linux => return detectCpuLinux(allocator, &io),
+        .macos => return detectCpuDarwin(allocator, &io),
+        .windows => return detectCpuWindows(allocator, &io),
         else => return CpuInfo{
             .vendor = .unknown,
-            .arch = std.Target.current.cpu.arch.name() orelse "unknown",
+            .arch = @tagName(builtin.target.cpu.arch) orelse "unknown",
             .features = Features{},
-            .flags = std.ArrayList([]const u8).init(allocator),
+            .flags = std.ArrayList(u8).init(allocator),
             .model_name = "unknown",
             .cpu_family = 0,
             .model = 0,
@@ -68,25 +78,34 @@ pub fn detectCpu(allocator: Allocator) !CpuInfo {
     }
 }
 
-fn detectCpuLinux(allocator: Allocator) !CpuInfo {
-    const file = try std.fs.cwd().openFile("/proc/cpuinfo", .{});
-    defer file.close();
-    const content = try file.readToEndAlloc(allocator, 1_000_000);
-    defer allocator.free(content);
 
-    const lines = std.mem.split(u8, content, "\n");
+fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
+    const dir = std.Io.Dir.cwd();
+    const file = try dir.openFile(std.Io.Threaded.io(io), "/proc/cpuinfo", .{});
+    defer file.close(std.Io.Threaded.io(io));
 
-    const vendor: Vendor = .unknown;
-    const model_name: []const u8 = "unknown";
-    const cpu_family: u32 = 0;
-    const model: u32 = 0;
-    const stepping: u32 = 0;
-    const flags = std.StringArray.init(allocator);
+    // Read file content using a buffer
+    var buffer = try allocator.alloc(u8, 1_000_000);
+    defer allocator.free(buffer);
+    const n = try file.readPositionalAll(std.Io.Threaded.io(io), buffer, 0);
+    const content = buffer[0..n];
+
+    var lines = std.mem.splitScalar(u8, content, 10);
+
+    var vendor: Vendor = .unknown;
+    var model_name: []const u8 = "unknown";
+    var cpu_family: u32 = 0;
+    var model: u32 = 0;
+    var stepping: u32 = 0;
+    var flags: [16]u8 = undefined;
+    var flags_len: usize = 0;
+    for (&flags) |*elem| elem.* = 0;
     const features = Features{};
 
-    for (lines) |line| {
+
+    while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "vendor_id")) {
-            const parts = std.mem.split(u8, line, ":");
+            var parts = std.mem.splitScalar(u8, line, 58);
             if (parts.next()) |_| {
                 if (parts.next()) |value| {
                     const v = std.mem.trim(u8, value, " \t");
@@ -98,42 +117,42 @@ fn detectCpuLinux(allocator: Allocator) !CpuInfo {
                 }
             }
         } else if (std.mem.startsWith(u8, line, "model name")) {
-            const parts = std.mem.split(u8, line, ":");
+            var parts = std.mem.splitScalar(u8, line, 58);
             if (parts.next()) |_| {
                 if (parts.next()) |value| {
                     model_name = std.mem.trim(u8, value, " \t");
                 }
             }
         } else if (std.mem.startsWith(u8, line, "cpu family")) {
-            const parts = std.mem.split(u8, line, ":");
+            var parts = std.mem.splitScalar(u8, line, 58);
             if (parts.next()) |_| {
                 if (parts.next()) |value| {
                     cpu_family = std.fmt.parseInt(u32, std.mem.trim(u8, value, " \t"), 10) catch 0;
                 }
             }
         } else if (std.mem.startsWith(u8, line, "model")) {
-            const parts = std.mem.split(u8, line, ":");
+            var parts = std.mem.splitScalar(u8, line, 58);
             if (parts.next()) |_| {
                 if (parts.next()) |value| {
                     model = std.fmt.parseInt(u32, std.mem.trim(u8, value, " \t"), 10) catch 0;
                 }
             }
         } else if (std.mem.startsWith(u8, line, "stepping")) {
-            const parts = std.mem.split(u8, line, ":");
+            var parts = std.mem.splitScalar(u8, line, 58);
             if (parts.next()) |_| {
                 if (parts.next()) |value| {
                     stepping = std.fmt.parseInt(u32, std.mem.trim(u8, value, " \t"), 10) catch 0;
                 }
             }
-        } else if (std.mem.startsWith(u8, line, "flags") || std.mem.startsWith(u8, line, "Features")) {
-            const parts = std.mem.split(u8, line, ":");
+                } else if (std.mem.startsWith(u8, line, "flags") or std.mem.startsWith(u8, line, "Features")) {
+            var parts = std.mem.splitScalar(u8, line, 58);
             if (parts.next()) |_| {
                 if (parts.next()) |value| {
                     const flag_str = std.mem.trim(u8, value, " \t");
-                    for (std.mem.split(u8, flag_str, " ")) |flag| {
+                    var iter = std.mem.splitScalar(u8, flag_str, 32); while (iter.next()) |flag| {
                         if (flag.len > 0) {
-                            _ = flags.append(allocator, flag) catch {};
-                            parseFlag(flag, &features);
+                            if (flags_len < 16) { flags[flags_len] = flag[0]; flags_len += 1; }
+                            try parseFlag(allocator, flag, @constCast(&features));
                         }
                     }
                 }
@@ -143,7 +162,7 @@ fn detectCpuLinux(allocator: Allocator) !CpuInfo {
 
     // Detect ARM from model name if vendor unknown
     if (vendor == .unknown) {
-        const lower = std.ascii.lower(model_name);
+        const lower = std.ascii.allocLowerString(allocator, model_name) catch return error.OutOfMemory;
         if ((std.mem.indexOf(u8, lower, "aarch64") != null) or
             (std.mem.indexOf(u8, lower, "armv8") != null) or
             (std.mem.indexOf(u8, lower, "arm cortex") != null) or
@@ -155,7 +174,7 @@ fn detectCpuLinux(allocator: Allocator) !CpuInfo {
     }
 
     // Get architecture
-    const arch = switch (std.Target.current.cpu.arch) {
+    const arch = switch (builtin.target.cpu.arch) {
         .x86_64 => "x86_64",
         .aarch64 => "aarch64",
         .arm => "arm",
@@ -174,8 +193,8 @@ fn detectCpuLinux(allocator: Allocator) !CpuInfo {
     };
 }
 
-fn detectCpuDarwin(allocator: Allocator) !CpuInfo {
-    const arch = switch (std.Target.current.cpu.arch) {
+fn detectCpuDarwin(allocator: Allocator, _io: std.Io) !CpuInfo { _ = _io;
+    const arch = switch (builtin.target.cpu.arch) {
         .aarch64 => "aarch64",
         .x86_64 => "x86_64",
         else => "unknown",
@@ -183,7 +202,8 @@ fn detectCpuDarwin(allocator: Allocator) !CpuInfo {
 
     const vendor: Vendor = if (std.mem.eql(u8, arch, "aarch64")) .arm else .intel;
     const features = Features{};
-
+    
+    
     if (std.mem.eql(u8, arch, "aarch64")) {
         features.neon = true;
         features.sve = true; // Apple Silicon has SVE-like features
@@ -193,7 +213,7 @@ fn detectCpuDarwin(allocator: Allocator) !CpuInfo {
         .vendor = vendor,
         .arch = arch,
         .features = features,
-        .flags = std.StringArray.init(allocator),
+        .flags = std.ArrayList(u8).init(allocator),
         .model_name = "Apple Silicon",
         .cpu_family = 0,
         .model = 0,
@@ -201,8 +221,8 @@ fn detectCpuDarwin(allocator: Allocator) !CpuInfo {
     };
 }
 
-fn detectCpuWindows(allocator: Allocator) !CpuInfo {
-    const arch = switch (std.Target.current.cpu.arch) {
+fn detectCpuWindows(allocator: Allocator, _io: anytype) !CpuInfo { _ = _io; _ = _io;
+    const arch = switch (builtin.target.cpu.arch) {
         .x86_64 => "x86_64",
         .aarch64 => "aarch64",
         .arm => "arm",
@@ -211,12 +231,13 @@ fn detectCpuWindows(allocator: Allocator) !CpuInfo {
 
     const vendor: Vendor = if (std.mem.eql(u8, arch, "aarch64")) .arm else .unknown;
     const features = Features{};
-
+    
+    
     return CpuInfo{
         .vendor = vendor,
         .arch = arch,
         .features = features,
-        .flags = std.StringArray.init(allocator),
+        .flags = std.ArrayList(u8).init(allocator),
         .model_name = "Windows CPU",
         .cpu_family = 0,
         .model = 0,
@@ -224,8 +245,9 @@ fn detectCpuWindows(allocator: Allocator) !CpuInfo {
     };
 }
 
-fn parseFlag(flag: []const u8, features: *Features) void {
-    const f = std.ascii.lower(flag);
+fn parseFlag(allocator: std.mem.Allocator, flag: []const u8, features: *Features) error{OutOfMemory}!void {
+    const f = try std.ascii.allocLowerString(allocator, flag);
+                        defer allocator.free(f);
     if (std.mem.eql(u8, f, "avx")) {
         features.avx = true;
     } else if (std.mem.eql(u8, f, "avx2")) {
@@ -249,25 +271,25 @@ fn parseFlag(flag: []const u8, features: *Features) void {
     else if (std.mem.eql(u8, f, "avx512vl")) {
         features.avx512vl = true;
     }
-    else if (std.mem.eql(u8, f, "avx512vnni") || std.mem.eql(u8, f, "avx512_vnni")) {
+    else if (std.mem.eql(u8, f, "avx512vnni") or std.mem.eql(u8, f, "avx512_vnni")) {
         features.avx512vnni = true;
     }
-    else if (std.mem.eql(u8, f, "avx512bf16") || std.mem.eql(u8, f, "avx512_bf16")) {
+    else if (std.mem.eql(u8, f, "avx512bf16") or std.mem.eql(u8, f, "avx512_bf16")) {
         features.avx512bf16 = true;
     }
-    else if (std.mem.eql(u8, f, "avx512vbmi") || std.mem.eql(u8, f, "avx512_vbmi")) {
+    else if (std.mem.eql(u8, f, "avx512vbmi") or std.mem.eql(u8, f, "avx512_vbmi")) {
         features.avx512vbmi = true;
     }
-    else if (std.mem.eql(u8, f, "avx512vpopcntdq") || std.mem.eql(u8, f, "avx512_vpopcntdq")) {
+    else if (std.mem.eql(u8, f, "avx512vpopcntdq") or std.mem.eql(u8, f, "avx512_vpopcntdq")) {
         features.avx512vpopcntdq = true;
     }
-    else if (std.mem.eql(u8, f, "amx_bf16") || std.mem.eql(u8, f, "amx-bf16")) {
+    else if (std.mem.eql(u8, f, "amx_bf16") or std.mem.eql(u8, f, "amx-bf16")) {
         features.amx_bf16 = true;
     }
-    else if (std.mem.eql(u8, f, "amx_int8") || std.mem.eql(u8, f, "amx-int8")) {
+    else if (std.mem.eql(u8, f, "amx_int8") or std.mem.eql(u8, f, "amx-int8")) {
         features.amx_int8 = true;
     }
-    else if (std.mem.eql(u8, f, "amx_tile") || std.mem.eql(u8, f, "amx-tile")) {
+    else if (std.mem.eql(u8, f, "amx_tile") or std.mem.eql(u8, f, "amx-tile")) {
         features.amx_tile = true;
     }
     else if (std.mem.eql(u8, f, "sve")) {

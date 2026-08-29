@@ -165,9 +165,9 @@ pub const kt_moe_config_t = extern struct {
     gate_scales: [*]*[*]f32,
     up_scales: [*]*[*]f32,
     down_scales: [*]*[*]f32,
-    gate_zeros: [*]*[*]anyopaque,
-    up_zeros: [*]*[*]anyopaque,
-    down_zeros: [*]*[*]anyopaque,
+    gate_zeros: ?*anyopaque,
+    up_zeros: ?*anyopaque,
+    down_zeros: ?*anyopaque,
     gate_bwd_projs: [*]*[*]amx.bf16,
     up_bwd_projs: [*]*[*]amx.bf16,
     down_bwd_projs: [*]*[*]amx.bf16,
@@ -199,8 +199,8 @@ pub const KT_Gate = opaque {};
 pub const KT_Linear = opaque {};
 pub const KT_MLP = opaque {};
 
-const g_cpu_variant: [16]u8 = undefined;
-var g_cpu_variant_ptr: [*]const u8 = &g_cpu_variant[0];
+var g_cpu_variant: [16]u8 = undefined;
+var g_cpu_variant_ptr: [*]const u8 = @ptrCast(&g_cpu_variant[0]);
 
 // ============================================================================
 // C API Implementation
@@ -220,7 +220,6 @@ fn detect_cpu_variant() void {
         g_cpu_variant_ptr = "unknown";
         return;
     };
-    defer cpu.flags.deinit();
 
     const variant = cpu_detect.selectBestVariant(cpu);
     // Copy to global buffer
@@ -246,7 +245,8 @@ export fn kt_f32_to_bf16(src: [*]const f32, dst: [*]amx.bf16, count: usize) void
 
 export fn kt_worker_pool_new(thread_count: c_int) *KT_WorkerPool {
     const allocator = std.heap.page_allocator;
-    const pool = try worker_pool.WorkerPool.initSimple(allocator, @intCast(thread_count));
+    const pool = allocator.create(worker_pool.WorkerPool) catch @panic("OOM");
+    pool.* = worker_pool.WorkerPool.initSimple(allocator, @intCast(thread_count)) catch @panic("pool init");
     return @ptrCast(pool);
 }
 
@@ -255,8 +255,9 @@ export fn kt_worker_pool_new_config(config: kt_worker_pool_config_t) *KT_WorkerP
 }
 
 export fn kt_worker_pool_free(pool: *KT_WorkerPool) void {
-    const wp: *worker_pool.WorkerPool = @ptrCast(pool);
-    wp.deinit(std.heap.page_allocator);
+    const wp: *worker_pool.WorkerPool = @ptrCast(@alignCast(pool));
+    wp.deinit();
+    std.heap.page_allocator.destroy(wp);
 }
 
 export fn kt_cpuinfer_new(thread_count: c_int) *KT_CPUInfer {
@@ -264,7 +265,8 @@ export fn kt_cpuinfer_new(thread_count: c_int) *KT_CPUInfer {
     kt_ggml_init();
 
     const allocator = std.heap.page_allocator;
-    const pool = try worker_pool.WorkerPool.initSimple(allocator, @intCast(thread_count));
+    const pool = allocator.create(worker_pool.WorkerPool) catch @panic("OOM");
+    pool.* = worker_pool.WorkerPool.initSimple(allocator, @intCast(thread_count)) catch @panic("pool init");
     return @ptrCast(pool);
 }
 
@@ -273,13 +275,21 @@ export fn kt_cpuinfer_new_config(config: kt_worker_pool_config_t) *KT_CPUInfer {
 }
 
 export fn kt_cpuinfer_free(cpuinfer: *KT_CPUInfer) void {
-    const pool: *worker_pool.WorkerPool = @ptrCast(cpuinfer);
-    pool.deinit(std.heap.page_allocator);
+    const pool: *worker_pool.WorkerPool = @ptrCast(@alignCast(cpuinfer));
+    pool.deinit();
+    std.heap.page_allocator.destroy(pool);
 }
 
-export fn kt_cpuinfer_submit(cpuinfer: *KT_CPUInfer, func: *const fn(*anyopaque) void, arg: *anyopaque) void {
-    const pool: *worker_pool.WorkerPool = @ptrCast(cpuinfer);
-    pool.subpools[0].submit(func, arg);
+var g_submit_fn: ?*const fn (*anyopaque) callconv(.c) void = null;
+
+fn submitAdapter(_: usize, arg: *anyopaque) void {
+    if (g_submit_fn) |f| f(arg);
+}
+
+export fn kt_cpuinfer_submit(cpuinfer: *KT_CPUInfer, func: *const fn (*anyopaque) callconv(.c) void, arg: *anyopaque) void {
+    const pool: *worker_pool.WorkerPool = @ptrCast(@alignCast(cpuinfer));
+    g_submit_fn = func;
+    pool.subpools[0].submit(submitAdapter, arg);
 }
 
 export fn kt_cpuinfer_sync(cpuinfer: *KT_CPUInfer, allow_n_pending: usize) void {
@@ -290,28 +300,51 @@ export fn kt_cpuinfer_sync(cpuinfer: *KT_CPUInfer, allow_n_pending: usize) void 
 }
 
 export fn kt_cpuinfer_get_backend(cpuinfer: *KT_CPUInfer) *KT_WorkerPool {
-    return cpuinfer;
+    return @ptrCast(cpuinfer);
+}
+
+fn toMoeConfig(config: kt_moe_config_t) moe.MoeConfig {
+    return .{
+        .expert_num = config.expert_num,
+        .num_experts_per_tok = config.num_experts_per_tok,
+        .hidden_size = config.hidden_size,
+        .intermediate_size = config.intermediate_size,
+        .layer_idx = config.layer_idx,
+        .pool = null,
+        .gate_proj = @ptrCast(config.gate_proj),
+        .up_proj = @ptrCast(config.up_proj),
+        .down_proj = @ptrCast(config.down_proj),
+        .gate_scale = @ptrCast(config.gate_scale),
+        .up_scale = @ptrCast(config.up_scale),
+        .down_scale = @ptrCast(config.down_scale),
+        .max_len = config.max_len,
+        .swiglu_limit = config.swiglu_limit,
+        .swiglu_alpha = config.swiglu_alpha,
+    };
 }
 
 export fn kt_moe_new(cpuinfer: *KT_CPUInfer, config: kt_moe_config_t) *KT_MOE {
-    const pool = @ptrCast(cpuinfer);
-    const moe_inst = moe.TpMoe.init(config, std.heap.page_allocator) catch @panic("Failed to init MoE");
+    const pool: *worker_pool.WorkerPool = @ptrCast(@alignCast(cpuinfer));
+    var cfg = toMoeConfig(config);
+    cfg.pool = pool;
+    const moe_inst = std.heap.page_allocator.create(moe.TpMoe) catch @panic("OOM");
+    moe_inst.* = moe.TpMoe.init(cfg, std.heap.page_allocator) catch @panic("Failed to init MoE");
     return @ptrCast(moe_inst);
 }
 
 export fn kt_moe_free(moe_ptr: *KT_MOE) void {
-    // In a real implementation, we'd deinit the MoE
-    _ = moe_ptr;
+    const m: *moe.TpMoe = @ptrCast(@alignCast(moe_ptr));
+    std.heap.page_allocator.destroy(m);
 }
 
 export fn kt_moe_warm_up(moe_ptr: *KT_MOE) void {
-    const m = @ptrCast(moe.TpMoe, moe_ptr);
+    const m: *moe.TpMoe = @ptrCast(@alignCast(moe_ptr));
     // Warm up implementation would go here
     _ = m;
 }
 
 export fn kt_moe_load_weights(moe_ptr: *KT_MOE) void {
-    const m = @ptrCast(moe.TpMoe, moe_ptr);
+    const m: *moe.TpMoe = @ptrCast(@alignCast(moe_ptr));
     m.loadWeights();
 }
 
@@ -330,7 +363,7 @@ export fn kt_moe_forward(
     output: [*]amx.bf16,
     incremental: c_int
 ) void {
-    const m = @ptrCast(moe.TpMoe, moe_ptr);
+    const m: *moe.TpMoe = @ptrCast(@alignCast(moe_ptr));
     m.forward(
         @intCast(qlen),
         @intCast(k),

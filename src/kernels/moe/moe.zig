@@ -29,25 +29,25 @@ pub const MoeConfig = struct {
     intermediate_size: i32 = 0,
 
     layer_idx: i32 = 0,
-    pool: *worker_pool.WorkerPool = null,
+    pool: ?*worker_pool.WorkerPool = null,
 
     // SGLang offload
     num_gpu_experts: i32 = 0,
-    gpu_experts_mask: [*]u8 = null,
-    physical_to_logical_map: *anyopaque = null,
+    gpu_experts_mask: ?[*]u8 = null,
+    physical_to_logical_map: ?*anyopaque = null,
 
     // Weights (BF16 format)
-    gate_proj: [*]amx.bf16 = null,
-    up_proj: [*]amx.bf16 = null,
-    down_proj: [*]amx.bf16 = null,
+    gate_proj: ?[*]amx.bf16 = null,
+    up_proj: ?[*]amx.bf16 = null,
+    down_proj: ?[*]amx.bf16 = null,
 
     // Quantized weights (INT8)
-    gate_proj_int8: [*]i8 = null,
-    up_proj_int8: [*]i8 = null,
-    down_proj_int8: [*]i8 = null,
-    gate_scale: [*]f32 = null,
-    up_scale: [*]f32 = null,
-    down_scale: [*]f32 = null,
+    gate_proj_int8: ?[*]i8 = null,
+    up_proj_int8: ?[*]i8 = null,
+    down_proj_int8: ?[*]i8 = null,
+    gate_scale: ?[*]f32 = null,
+    up_scale: ?[*]f32 = null,
+    down_scale: ?[*]f32 = null,
 
     // Quantization config
     quant_config: QuantConfig = QuantConfig{},
@@ -229,7 +229,8 @@ pub const TpMoe = struct {
     };
 
     pub fn init(config: MoeConfig, allocator: std.mem.Allocator) !TpMoe {
-        const tp_count = config.pool.config.subpool_count;
+        const pool = config.pool orelse return error.NoWorkerPool;
+        const tp_count = pool.config.subpool_count;
 
         // Validate intermediate_size divisible by tp_count
         if (config.intermediate_size % tp_count != 0) {
@@ -323,7 +324,7 @@ pub const TpMoe = struct {
 
     pub fn loadWeights(self: *TpMoe) void {
         // Load weights into expert buffers
-        for (0..self.config.expert_num)  | e |  {
+        for (0..@as(usize, @intCast(self.config.expert_num)))  | e |  {
             const expert = &self.experts[e];
 
             if (self.config.gate_proj_int8 != null) {
@@ -380,15 +381,15 @@ pub const TpMoe = struct {
         // Merge results across TP ranks
 
         // Simplified implementation - route and compute per expert
-        var expert_tokens = std.heap.page_allocator.alloc([]usize, self.config.expert_num) catch @panic("OOM");
+        var expert_tokens = std.heap.page_allocator.alloc([]usize, @intCast(self.config.expert_num)) catch @panic("OOM");
         defer std.heap.page_allocator.free(expert_tokens);
 
         // Count tokens per expert
         for (expert_tokens) |*count| count = 0;
         for (0..qlen)  | i |  {
-            for (0..k)  | j |  {
-                const eid = expert_ids[i * k + j];
-                if (eid >= 0 and eid < self.config.expert_num) {
+            for (0..@as(usize, @intCast(k)))  | j |  {
+                const eid = expert_ids[i * @as(usize, @intCast(k)) + j];
+                if (eid >= 0 and eid < @as(i64, self.config.expert_num)) {
                     expert_tokens[@intCast(eid)] += 1;
                 }
             }
@@ -400,7 +401,7 @@ pub const TpMoe = struct {
         @memset(output_f32, 0);
 
         // Process each expert
-        for (0..self.config.expert_num)  | e |  {
+        for (0..@as(usize, @intCast(self.config.expert_num)))  | e |  {
             const count = expert_tokens[e];
             if (count == 0) continue;
 
@@ -413,8 +414,8 @@ pub const TpMoe = struct {
 
             var token_idx: usize = 0;
             for (0..qlen)  | i |  {
-                for (0..k)  | j |  {
-                    const eid = expert_ids[i * k + j];
+                for (0..@as(usize, @intCast(k)))  | j |  {
+                    const eid = expert_ids[i * @as(usize, @intCast(k)) + j];
                     if (eid == @as(i64, @intCast(e))) {
                         @memcpy(expert_input[token_idx * self.config.hidden_size ..][0..self.config.hidden_size],
                             input[i * self.config.hidden_size ..][0..self.config.hidden_size]);
@@ -425,8 +426,8 @@ pub const TpMoe = struct {
 
             // Compute expert
             const gate_scale_ptr = if (self.config.gate_scale != null) &self.config.gate_scale[e * self.config.intermediate_size] else null;
-                const up_scale_ptr = if (self.config.up_scale != null) &self.config.up_scale[e * self.config.intermediate_size] else null;
-                const down_scale_ptr = if (self.config.down_scale != null) &self.config.down_scale[e * self.config.hidden_size] else null;
+            const up_scale_ptr = if (self.config.up_scale != null) &self.config.up_scale[e * self.config.intermediate_size] else null;
+            const down_scale_ptr = if (self.config.down_scale != null) &self.config.down_scale[e * self.config.hidden_size] else null;
                 computeExpert(
                     expert_input,
                     self.config.gate_proj + e * self.config.intermediate_size * self.config.hidden_size,

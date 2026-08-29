@@ -63,3 +63,50 @@ asm (
 - `b.addTest(.{ .root_module = test_mod })` creates test step
 - Test modules need all imports added explicitly
 - `@import()` paths relative to the test file location
+- Use `test_mod.addImport("name", b.createModule(.{ .root_source_file = ... }))` to add named imports
+- Don't use "root" as an import name - conflicts with builtin module
+- `const` test variables can't be passed to `deinit(self: *T)` - use `var` for mutable structs
+
+## Zig 0.16 API Changes (Discovered While Fixing)
+
+### Standard Library Removals/Migrations
+- **`std.atomic.Bool`** → **`std.atomic.Value(bool)`**: `std.atomic.Value(bool).init(false)`
+- **`std.Thread.Pool`** → **Removed**: Use `std.Io.Group` or placeholder
+- **`std.DoublyLinkedList(T)`** → **`std.DoublyLinkedList`**: Top-level type, use `std.DoublyLinkedList{}` (not `std.DoublyLinkedList(T).empty`)
+- **`std.time.sleep()`** → **`io.sleep()`**: Now requires `Io` parameter. For simple cases, use spin-wait
+- **`std.mem.eql` with `*c` slices**: String literals may be auto-cast to `[*c]const u8` which doesn't match `[]const u8`
+
+### `std.mem.Allocator.alignedAlloc` Signature Change
+```zig
+// OLD (Zig 0.15):
+allocator.alignedAlloc(alignment, n)
+
+// NEW (Zig 0.16):
+allocator.alignedAlloc(T, alignment, n)
+// where alignment is comptime `?std.mem.Alignment` (enum of log2 values)
+```
+
+### `std.mem.Alignment` Enum
+- Values are log2 of byte alignment: `Alignment.@"1"=0, @"2"=1, @"4"=2, ..., @"64"=6`
+- To convert bytes: `@as(std.mem.Alignment, @enumFromInt(std.math.log2(alignment_val)))`
+
+### Pointer Types Need Optional for Default `null`
+- `[*]T = null` → `?[*]T = null` (in Zig 0.16, untyped nullable pointers require optional)
+- `*anyopaque = null` → `?*anyopaque = null`
+
+### Packed Structs Cannot Contain Arrays
+- `packed struct { [N]u8 = undefined }` → ERROR
+- Solution: Use `extern struct` or individual fields
+
+### CPU Feature Detection
+- `builtin.cpu.features.amx_int8` → May not exist on all targets
+- Use `@hasField(std.Target.Cpu.Feature.Set, "amx_int8")` for comptime checks
+
+### `std.Thread.getCpuCount()` Returns Error
+- Old: `orelse 1`
+- New: `catch 1`
+
+### String Equality with Runtime Values
+- `std.mem.eql(u8, f, "literal")` requires both args to be slices
+- String literals work directly: `std.mem.eql(u8, f, "avx512vnni")` (not via intermediate const)
+- `||` between two eql calls causes auto-cast issues - use `or` instead

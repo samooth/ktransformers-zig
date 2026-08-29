@@ -304,7 +304,7 @@ pub fn quantizeRowBF16ToInt8(src: [*]const amx.bf16, dst: [*]i8, scale: *f32, k:
 
     for (0..k)  | i |  {
         const val = amx.bf16_to_f32(src[i]);
-        const quantized = @as(i8, @intCast(val / scale.* + 0.5));
+        const quantized: i8 = @intFromFloat(val / scale.*);
         dst[i] = if (quantized < -128) -128 else if (quantized > 127) 127 else quantized;
     }
 }
@@ -312,7 +312,7 @@ pub fn quantizeRowBF16ToInt8(src: [*]const amx.bf16, dst: [*]i8, scale: *f32, k:
 /// Dequantize INT8 row to BF16
 pub fn dequantizeRowInt8ToBF16(src: [*]const i8, scale: f32, dst: [*]amx.bf16, k: usize) void {
     for (0..k)  | i |  {
-        dst[i] = amx.f32_to_bf16(@as(f32, @intCast(src[i])) * scale);
+        dst[i] = amx.f32_to_bf16(@as(f32, src[i]) * scale);
     }
 }
 

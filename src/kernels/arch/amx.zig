@@ -10,7 +10,7 @@ const builtin = @import("builtin");
 
 pub const AmxFeatures = struct {
     pub const available: bool = switch (builtin.cpu.arch) {
-        .x86_64 => builtin.cpu.features.amx_int8 || builtin.cpu.features.amx_bf16 || builtin.cpu.features.amx_tile,
+        .x86_64 => @hasField(std.Target.Cpu.Feature.Set, "amx_int8"),
         else => false,
     };
 };
@@ -20,21 +20,16 @@ pub const AmxFeatures = struct {
 // ============================================================================
 
 /// Tile configuration structure (matches Intel AMX tile config)
-pub const TileConfig = packed struct {
+pub const TileConfig = extern struct {
     palette_id: u16 = 1,
     start_row: u16 = 0,
-    reserved_0: [14]u8 = undefined,
-    rows: [8]u16 = undefined,
-    cols: [8]u16 = undefined,
+    reserved_0a: [8]u8 = [_]u8{0} ** 8,
+    reserved_0b: [6]u8 = [_]u8{0} ** 6,
+    rows: [8]u16 = [_]u16{0} ** 8,
+    cols: [8]u16 = [_]u16{0} ** 8,
 
     pub fn init() TileConfig {
-        return TileConfig{
-            .palette_id = 1,
-            .start_row = 0,
-            .reserved_0 = undefined,
-            .rows = undefined,
-            .cols = undefined,
-        };
+        return TileConfig{};
     }
 
     pub fn setTile(self: *TileConfig, tile: u8, rows: u16, cols: u16) void {
@@ -130,16 +125,20 @@ pub fn tile_dpbuud(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
 // BF16 Type Support
 // ============================================================================
 
-pub const bf16 = @import("std").math.bfloat16;
+/// BF16 type - represents a 16-bit brain float
+pub const bf16 = u16;
+
+// Buffer alignment constants
+const BF16_ALIGN = 16;
 
 /// Convert f32 to bf16 (upper 16 bits of f32)
 pub fn f32_to_bf16(x: f32) bf16 {
-    return @as(bf16, @bitCast(@as(u16, @as(u32, @bitCast(x)) >> 16)));
+    return @truncate(@as(u32, @bitCast(x)) >> 16);
 }
 
 /// Convert bf16 to f32 (lower 16 bits zeroed)
 pub fn bf16_to_f32(x: bf16) f32 {
-    return @as(f32, @bitCast(@as(u32, @bitCast(x)) << 16));
+    return @bitCast(@as(u32, x) << 16);
 }
 
 /// Vectorized BF16 <-> FP32 conversion using AVX512
@@ -280,7 +279,9 @@ pub fn swiglu(gate: f32, up: f32) f32 {
 }
 
 /// SwiGLU with asymmetric clamp (for MXFP4)
-pub fn swiglu_clamp(gate: f32, up: f32, limit: f32) f32 {
+pub fn swiglu_clamp(gate_param: f32, up_param: f32, limit: f32) f32 {
+    var gate = gate_param;
+    var up = up_param;
     if (gate > limit) gate = limit;
     if (up > limit) {
         up = limit;
@@ -291,7 +292,9 @@ pub fn swiglu_clamp(gate: f32, up: f32, limit: f32) f32 {
 }
 
 /// SwiGLU-OAI (MiniMax M3): gate * sigmoid(gate * alpha) * (up + 1)
-pub fn swiglu_oai(gate: f32, up: f32, alpha: f32, limit: f32) f32 {
+pub fn swiglu_oai(gate_param: f32, up_param: f32, alpha: f32, limit: f32) f32 {
+    var gate = gate_param;
+    var up = up_param;
     if (gate > limit) {
         gate = limit;
     } else if (gate < -limit) {
