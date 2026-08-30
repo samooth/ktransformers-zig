@@ -5,9 +5,9 @@
 Last updated: 2026-08-30
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
-**Tests: WORKING** - `zig build test` RUNS all suites: 32 kernels + 11 MLA = 43 total pass, 0 leaks, exit 0 (committed state). NOTE: currently blocked by uncommitted work-stealing prototype in moe.zig (WIP, compile error at moe.zig:699).
+**Tests: WORKING** - `zig build test` RUNS all suites: 32 kernels + 11 MLA = 43 total pass, 0 leaks, exit 0
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so`, each exporting 59 C API symbols.
-**Runtime: WORKING** - work-stealing worker pool (pthread mutex/cond, threads block when idle); NUMA topology via /sys and /proc/cpuinfo. WIRING WIP (uncommitted moe.zig prototype).
+**Runtime: WORKING** - work-stealing worker pool (pthread mutex/cond, threads block when idle); NUMA topology via /sys and /proc/cpuinfo.
 **SFT/LoRA: FORWARD+BACKWARD COMPLETE** - training path done; C API exports (forward_sft/backward/update_lora_weights); smoke test passes.
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` (avx2, avx512_base, avx512_vnni, avx512_vbmi, avx512_bf16, amx), each exporting 59 C API symbols.
 

@@ -236,6 +236,61 @@ pub fn computeExpert(
 // Tensor-Parallel MoE
 // ============================================================================
 
+const MoeParallelCtx = struct {
+    self: *TpMoe,
+    input: []const amx.bf16,
+    qlen: usize,
+    k: usize,
+    hidden: usize,
+    inter: usize,
+    expert_num: usize,
+    expert_input_bufs: [][]amx.bf16,
+    expert_token_counts: []usize,
+    expert_scratch_bufs: [][]amx.bf16,
+    expert_global_idx: [][]usize,
+    expert_route_weight: [][]f32,
+    routing_ids: []const i64,
+    routing_weights: []const f32,
+    output_f32: []f32,
+};
+
+var g_parallel: ?MoeParallelCtx = null;
+
+fn parallelExpertTask(e: usize) void {
+    const ctx = g_parallel orelse @panic("parallelExpertTask: no context");
+    const count = ctx.expert_token_counts[e];
+    if (count == 0) return;
+    const hidden = ctx.hidden;
+    const inter = ctx.inter;
+    const expert_in = ctx.expert_input_bufs[e];
+    var token_idx: usize = 0;
+    for (0..ctx.qlen) |i| {
+        for (0..ctx.k) |j| {
+            const ridx = i * ctx.k + j;
+            const eid = ctx.routing_ids[ridx];
+            if (eid == @as(i64, @intCast(e))) {
+                @memcpy(expert_in[token_idx * hidden ..][0..hidden], ctx.input[i * hidden ..][0..hidden]);
+                ctx.expert_global_idx[e][token_idx] = i;
+                ctx.expert_route_weight[e][token_idx] = ctx.routing_weights[ridx];
+                token_idx += 1;
+            }
+        }
+    }
+    const gate_bf16 = std.heap.page_allocator.alloc(amx.bf16, count * inter) catch @panic("OOM");
+    defer std.heap.page_allocator.free(gate_bf16);
+    const up_bf16 = std.heap.page_allocator.alloc(amx.bf16, count * inter) catch @panic("OOM");
+    defer std.heap.page_allocator.free(up_bf16);
+    ctx.self.forwardGateUp(e, count, expert_in.ptr, gate_bf16.ptr, up_bf16.ptr);
+    for (0..count * inter) |idx| {
+        const g = amx.bf16_to_f32(gate_bf16[idx]);
+        const u = amx.bf16_to_f32(up_bf16[idx]);
+        gate_bf16[idx] = amx.f32_to_bf16(amx.swiglu(g, u));
+    }
+    const scratch = ctx.expert_scratch_bufs[e];
+    @memset(scratch, 0);
+    ctx.self.forwardDown(e, count, gate_bf16.ptr, scratch.ptr);
+}
+
 pub const TpMoe = struct {
     config: MoeConfig,
     tp_configs: []MoeConfig,
@@ -490,64 +545,43 @@ pub const TpMoe = struct {
         defer std.heap.page_allocator.free(output_f32);
         @memset(output_f32, 0);
 
-        // Process each expert
-        for (0..@as(usize, @intCast(self.config.expert_num)))  | e |  {
+        const inter = @as(usize, @intCast(self.config.intermediate_size));
+        const hidden = @as(usize, @intCast(self.config.hidden_size));
+        const expert_num = @as(usize, @intCast(self.config.expert_num));
+        for (0..expert_num) |e| {
             const count = expert_tokens[e];
             if (count == 0) continue;
-
-            const _expert = &self.experts[e];
-            _ = _expert;
-
-            // Gather input tokens for this expert
-            const expert_input = std.heap.page_allocator.alloc(amx.bf16, count * @as(usize, @intCast(self.config.hidden_size))) catch @panic("OOM");
+            const expert_input = std.heap.page_allocator.alloc(amx.bf16, count * hidden) catch @panic("OOM");
             defer std.heap.page_allocator.free(expert_input);
-
             var token_idx: usize = 0;
-            for (0..qlen)  | i |  {
-                for (0..@as(usize, @intCast(k)))  | j |  {
+            for (0..qlen) |i| {
+                for (0..@as(usize, @intCast(k))) |j| {
                     const eid = expert_ids[i * @as(usize, @intCast(k)) + j];
-                    if (eid == @as(i64, @intCast(e))) {
-                        @memcpy(expert_input[token_idx * @as(usize, @intCast(self.config.hidden_size)) ..][0..@as(usize, @intCast(self.config.hidden_size))],
-                            input[i * @as(usize, @intCast(self.config.hidden_size)) ..][0..@as(usize, @intCast(self.config.hidden_size))]);
+                    if (eid == @as(i64, @intCast(e))){
+                        @memcpy(expert_input[token_idx * hidden ..][0..hidden], input[i * hidden ..][0..hidden]);
                         token_idx += 1;
                     }
                 }
             }
-
-            // Compute expert: gate+up GEMMs, SwiGLU activation, down GEMM
-            const inter = @as(usize, @intCast(self.config.intermediate_size));
-            const hidden = @as(usize, @intCast(self.config.hidden_size));
             const gate_output = std.heap.page_allocator.alloc(amx.bf16, count * inter) catch @panic("OOM");
             defer std.heap.page_allocator.free(gate_output);
             const up_output = std.heap.page_allocator.alloc(amx.bf16, count * inter) catch @panic("OOM");
             defer std.heap.page_allocator.free(up_output);
-
-            // Per-expert gate + up projections
             self.forwardGateUp(e, count, expert_input.ptr, gate_output.ptr, up_output.ptr);
-
-            // Apply SwiGLU: silu(gate) * up, in-place into gate_output
             for (0..count * inter) |idx| {
                 const g = amx.bf16_to_f32(gate_output[idx]);
                 const u = amx.bf16_to_f32(up_output[idx]);
                 gate_output[idx] = amx.f32_to_bf16(amx.swiglu(g, u));
             }
-
-            // Per-expert down projection, accumulates into output_f32
-            // For each token routed to this expert, find its weight and accumulate
             token_idx = 0;
             for (0..qlen) |i| {
                 for (0..@as(usize, @intCast(k))) |j| {
                     const eid = expert_ids[i * @as(usize, @intCast(k)) + j];
                     if (eid == @as(i64, @intCast(e))) {
-                        // Compute this token's down projection
                         const expert_down_out = std.heap.page_allocator.alloc(amx.bf16, hidden) catch @panic("OOM");
                         defer std.heap.page_allocator.free(expert_down_out);
-                        // Zero the output (forwardDown accumulates)
                         @memset(expert_down_out, 0);
-
                         self.forwardDown(e, count, gate_output.ptr, expert_down_out.ptr);
-
-                        // Scale by routing weight and accumulate into output_f32
                         const w = weights[i * @as(usize, @intCast(k)) + j];
                         for (0..hidden) |h| {
                             const val = amx.bf16_to_f32(expert_down_out[h]);
@@ -563,6 +597,42 @@ pub const TpMoe = struct {
         for (0..qlen * @as(usize, @intCast(self.config.hidden_size))) |i| {
             output[i] = amx.f32_to_bf16(output_f32[i]);
         }
+    }
+
+
+    fn forwardParallel(
+        self: *TpMoe, expert_num: usize, qlen: usize, k: i32, expert_tokens: []usize,
+        routing_ids: []const i64, routing_weights: []const f32, input: []const amx.bf16,
+        output_f32: []f32, hidden: usize, inter: usize, pool: *worker_pool.WorkerPool) void {
+        const subpool = pool.subpools[0];
+        const allocator = std.heap.page_allocator;
+        var input_bufs = allocator.alloc([]amx.bf16, expert_num) catch @panic("OOM");
+        var scratch_bufs = allocator.alloc([]amx.bf16, expert_num) catch @panic("OOM");
+        var gidx_bufs = allocator.alloc([]usize, expert_num) catch @panic("OOM");
+        var wt_bufs = allocator.alloc([]f32, expert_num) catch @panic("OOM");
+        for (0..expert_num) |e| {
+            const count = expert_tokens[e];
+            if (count == 0) { input_bufs[e] = &[_]amx.bf16{}; scratch_bufs[e] = &[_]amx.bf16{};
+                gidx_bufs[e] = &[_]usize{}; wt_bufs[e] = &[_]f32{}; }
+            else { input_bufs[e] = allocator.alloc(amx.bf16, count * hidden) catch @panic("OOM");
+                scratch_bufs[e] = allocator.alloc(amx.bf16, count * hidden) catch @panic("OOM");
+                gidx_bufs[e] = allocator.alloc(usize, count) catch @panic("OOM");
+                wt_bufs[e] = allocator.alloc(f32, count) catch @panic("OOM"); }
+        }
+        g_parallel = MoeParallelCtx{ .self=self,.input=input,.qlen=qlen,.k=@as(usize,@intCast(k)),
+            .hidden=hidden,.inter=inter,.expert_num=expert_num,.expert_input_bufs=input_bufs,
+            .expert_token_counts=expert_tokens,.expert_scratch_bufs=scratch_bufs,
+            .expert_global_idx=gidx_bufs,.expert_route_weight=wt_bufs,
+            .routing_ids=routing_ids,.routing_weights=routing_weights,.output_f32=output_f32 };
+        defer g_parallel = null;
+        subpool.doWorkStealingJob(expert_num, &parallelExpertTask);
+        for (0..expert_num) |e| { const count=expert_tokens[e]; if (count==0) continue;
+            for (0..count) |s| { const gi=gidx_bufs[e][s]; const w=wt_bufs[e][s];
+                for (0..hidden) |h| { output_f32[gi*h+h]+=amx.bf16_to_f32(scratch_bufs[e][s*h+h])*w; } } }
+        for (input_bufs) |slab| allocator.free(slab); allocator.free(input_bufs);
+        for (scratch_bufs) |slab| allocator.free(slab); allocator.free(scratch_bufs);
+        for (gidx_bufs) |slab| allocator.free(slab); allocator.free(gidx_bufs);
+        for (wt_bufs) |slab| allocator.free(slab); allocator.free(wt_bufs);
     }
 
     pub fn deinit(self: *TpMoe) void {
