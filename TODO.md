@@ -5,7 +5,7 @@
 Last updated: 2026-08-30
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
-**Tests: WORKING** - `zig build test` RUNS all suites: 32 kernels + 11 MLA = 43 total pass, 0 leaks, exit 0
+**Tests: WORKING** - `zig build test` RUNS all suites: 34 kernels + 11 MLA = 45 total pass, 0 leaks, exit 0
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so`, each exporting 59 C API symbols.
 **Runtime: WORKING** - work-stealing worker pool (pthread mutex/cond, threads block when idle); NUMA topology via /sys and /proc/cpuinfo.
 **SFT/LoRA: FORWARD+BACKWARD COMPLETE** - training path done; C API exports (forward_sft/backward/update_lora_weights); smoke test passes.
@@ -95,9 +95,9 @@ Last updated: 2026-08-30
 
 ### Python Packaging
 - [x] **Minimal ctypes wrapper** (`python/kt_kernel/__init__.py`) — pure-Python `ctypes` wrapper that `dlopen`s the variant `.so` (auto-detected from `/proc/cpuinfo`), exposes `kt_version`, `kt_get_cpu_variant`, worker pool, CPUInfer, Linear, Gate, MLP, and bf16 conversion functions. Smoke-tested: `import kt_kernel; print(kt_kernel.kt_version())` works.
-- [ ] `pyproject.toml` for `kt-kernel` wheel
-- [ ] Minimal pybind11 wrapper in C++ that loads Zig `.so`
-- [ ] CI/CD for multi-variant wheel building
+- [x] **`pyproject.toml` + `setup.py` for `kt-kernel` wheel** — setuptools with package-data for the 6 variant `.so` files; custom `build_ext` runs `zig build all-variants` and bundles them into `python/kt_kernel/`. Verified: `python3 setup.py build_ext --inplace` → `import kt_kernel` → `kt_version()` returns `b'0.6.1-zig'`.
+- [x] **CI/CD for multi-variant wheel building** — `.github/workflows/wheels.yml` builds all 6 variants and packages the wheel.
+- [ ] Minimal pybind11 wrapper in C++ that loads Zig `.so` (optional; ctypes wrapper is functional)
 
 ### Advanced Features
 - [x] **SFT/LoRA backward pass** — forward_sft (Dev A) + backward (Dev B) complete with LoRA kernels; kt_moe_forward_sft/kt_moe_backward/kt_moe_update_lora_weights C API exports. 43/43 tests pass.
@@ -114,18 +114,17 @@ Last updated: 2026-08-30
 ## 📊 Progress Tracking
 | Component | Status | % |
 |-----------|--------|---|
-| Runtime (pool/queue/memory/cpu) | Work-stealing pool + NUMA topology done; kernels still single-threaded | 85% |
+| Runtime (pool/queue/memory/cpu) | Work-stealing pool + NUMA topology + kernel wiring done (MoE + SFT paths parallel) | 100% |
 | AMX Intrinsics | Real inline asm (tile_loadconfig/loadd/stored/zero/dpbf16ps/dpbssd) | 90% |
 | Buffer Packing | Working | 80% |
 | BF16 GEMM | Working | 70% |
 | INT8 GEMM | Working | 70% |
 | INT4/FP8/MXFP4/8 GEMM | INT4, FP8, MXFP4, MXFP8 all done (AMX + scalar fallback) | 100% |
 | MoE Orchestration | Forward + work-stealing parallel path complete (per-expert parallelism, sequential reduction); Gate C API wired; weight_ld OOB fixed | 100% |
-| SFT/LoRA Training | Forward + backward complete; 3 C API exports (forward_sft/backward/update_lora) | 70% |
-| Runtime (pool/queue/memory/cpu) | Work-stealing pool + NUMA topology + kernel wiring done; kernels still single-threaded | 100% |
+| SFT/LoRA Training | Forward + backward complete + work-stealing parallel forward (pool equivalence + backward round-trip tests); 4 C API exports (new_sft/forward_sft/backward/update_lora) | 90% |
 | C API | MLA + MoE + Gate + Linear + MLP + SFT backward complete; kt_get_cpu_variant fixed; FP8 still placeholder | 90% |
 | Build System | Multi-variant (6 variants, distinct .so names) | 85% |
-| Tests | 32/32 kernels + 11 MLA = 43 total pass, 0 leaks, zig build test exits 0 | 100% |
+| Tests | 34/34 kernels + 11 MLA = 45 total pass, 0 leaks, zig build test exits 0 | 100% |
 | Python Integration | ctypes wrapper + pyproject.toml + CI workflow; wheel build verified | 60% |
 
 ---
