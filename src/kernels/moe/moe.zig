@@ -579,8 +579,11 @@ pub const TpMoe = struct {
         // (kt_moe_free in main.zig), which passes std.heap.page_allocator to
         // both create() and TpMoe.init() — therefore page_allocator here.
     const allocator = self.allocator;
-    // BF16 storage is module-level global state — always allocated/freed with page_allocator.
-    freeBf16Storage(std.heap.page_allocator);
+    // BF16 weight storage is allocated by loadWeights via ensureBf16Storage
+    // (which uses self.allocator). Free it through the same allocator — using
+    // a hardcoded page_allocator here causes "Invalid free" when TpMoe is
+    // constructed with a different allocator (e.g. std.testing.allocator).
+    freeBf16Storage(allocator);
     allocator.free(self.experts);
     allocator.free(self.tp_configs);
     self.* = undefined;
