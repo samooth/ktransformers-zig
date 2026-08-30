@@ -1639,3 +1639,48 @@ unpackMXFP4(&b, &unpacked);
 try expect(unpacked[0] == 1.0);
 try expect(unpacked[1] == 0.5);
 ```
+
+## Vectorized SwiGLU with `std.simd` — Zig 0.16 gotchas
+
+Three Zig 0.16 issues hit while vectorizing `applySwiGLU` (MoE/MLA hot path)
+with `@Vector(8, f32)`:
+
+### `@splat` is 1-arg only — length is inferred
+
+Zig 0.16 removed the `(@splat(len, value))` 2-arg form. `@splat(value)`
+infers the vector length from context. But the context must be explicit —
+a bare `@splat(1.0)` inside an expression may fail with "@splat must have
+a known result type". Fix: bind to a typed constant first:
+
+```zig
+const ones: VecF32 = @splat(1.0);  // VecF32 = @Vector(8, f32)
+return g / (ones + @exp(-g)) * u;
+```
+
+### `@Vector` has no `.len` member
+
+`VecF32.len` compiles in some Zig versions but not 0.16 ("type '@Vector(8, f32)'
+has no members"). Add a separate constant:
+
+```zig
+pub const VecF32 = @Vector(8, f32);
+pub const VEC_LEN: usize = 8;
+```
+
+### Vector element access needs a comptime index
+
+`vec[k]` with a runtime `k` fails with "vector index not comptime known".
+To extract all elements at once, coerce the whole vector to an array:
+
+```zig
+const res: VecF32 = swigluVec(gv, uv);
+const res_arr: [VEC_LEN]f32 = res;  // array←vector coercion, no per-element loop
+```
+
+### Accuracy note
+
+The vectorized math is bit-exact vs scalar in pure f32 (verified: 0.000 diff).
+Any test comparing vectorized output against scalar must account for the bf16
+round-trip quantization if the vectorized path stores to bf16 — bf16 round-trip
+alone introduces up to 0.025 error, so a 1e-5 tolerance is impossible there.
+Compare in pure f32, or apply the same bf16 round-trip to the scalar reference.
