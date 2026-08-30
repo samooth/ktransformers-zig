@@ -999,3 +999,67 @@ test "MXFP4 GEMM 16x16x32 with constant B" {
         }
     }
 }
+
+// ============================================================================
+// Vectorized applySwiGLU (Dev B)
+// ============================================================================
+
+test "applySwiGLU vectorized matches scalar (all variants, n with tail)" {
+    // The vectorized applySwiGLU (std.simd, VecF32=8) must match the scalar
+    // amx.swiglu* functions element-wise across all three variants. We test
+    // n = 5..17 to exercise the scalar tail loop (5, 17), the
+    // exact-vector-length case (8), and multi-vector with no tail (16).
+    //
+    // Comparison note: the vectorized code round-trips each element through bf16
+    // (f32_to_bf16 then bf16_to_f32) as part of its staging. To compare
+    // fairly, the scalar reference does the SAME round-trip (mirrors the real
+    // code path exactly). Tolerance 1e-2 covers the bf16 ulp (~0.025 for
+    // values up to ~10); identical-code-path results match to ~1e-5.
+    const M: usize = 2;
+
+    for (1..4) |variant| { // 1=standard, 2=clamp, 3=oai
+        const limit: f32 = if (variant == 1) 0.0 else 7.5;
+        const use_alpha = variant == 3;
+        const alpha: f32 = if (use_alpha) 1.5 else 0.0; // function branches on alpha>0
+
+        for (5..18) |n| { // 5..18 covers 5,8,16,17 plus the in-between values
+            var gate: [M * 32]amx.bf16 = undefined;
+            var up: [M * 32]amx.bf16 = undefined;
+            var dst: [M * 32]amx.bf16 = undefined;
+            // Fill with a non-trivial, signed mix so silu / clamp / OAI differ
+            for (0..M) |i| {
+                for (0..n) |j| {
+                    const g_raw: f32 = @as(f32, @floatFromInt((i * n + j) % 7)) - 3.0; // -3..3
+                    const u_raw: f32 = @as(f32, @floatFromInt((i * n + j) % 5)) - 2.0; // -2..2
+                    gate[i * n + j] = amx.f32_to_bf16(g_raw * 0.7);
+                    up[i * n + j] = amx.f32_to_bf16(u_raw * 0.7);
+                }
+            }
+            // Vectorized
+            for (0..M * 32) |k| dst[k] = 0;
+            gemm_bf16.GemmKernel224BF.applySwiGLU(
+                &gate, &up, &dst, M, n, limit, alpha,
+            );
+            // Scalar reference, element-by-element, with the SAME bf16 round-trip
+            // the vectorized code performs. This mirrors the real code path exactly.
+            for (0..M) |i| {
+                for (0..n) |j| {
+                    const g = amx.bf16_to_f32(gate[i * n + j]);
+                    const u = amx.bf16_to_f32(up[i * n + j]);
+                    const expected: f32 = if (use_alpha)
+                        amx.swiglu_oai(g, u, alpha, limit)
+                    else if (limit > 0)
+                        amx.swiglu_clamp(g, u, limit)
+                    else
+                        amx.swiglu(g, u);
+                    // Mirror the bf16 round-trip the vectorized path performs, so
+                    // the comparison is fair (the real code path round-trips).
+                    const expected_bf16 = amx.bf16_to_f32(amx.f32_to_bf16(expected));
+                    const got = amx.bf16_to_f32(dst[i * n + j]);
+                    const diff = if (got > expected_bf16) got - expected_bf16 else expected_bf16 - got;
+                    try testing.expect(diff < 1e-2);
+                }
+            }
+        }
+    }
+}
