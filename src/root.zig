@@ -17,6 +17,23 @@ pub const mla_config = @import("mla/mla_config.zig");
 pub const mla_cache = @import("mla/mla_cache.zig");
 pub const mla_core = @import("mla/mla_core.zig");
 
+// MXFP4/MXFP8 kernels: re-exports alone are not enough — without a
+// `comptime { _ = &fn; }` block the .so contains zero MXFP code (lazy
+// analysis strips the module). See "Integrating a Standalone Zig Module
+// (MLA)" in LESSONS_ZIG.md for the mechanism this is built on.
+pub const gemm_mxfp4 = @import("kernels/amx/gemm_224_mxfp4.zig");
+pub const gemm_mxfp8 = @import("kernels/amx/gemm_224_mxfp8.zig");
+comptime {
+    _ = &gemm_mxfp4.GemmKernel224MXFP4.gemmFullTile;
+    _ = &gemm_mxfp4.MXFP4Block;
+    _ = &gemm_mxfp4.fp4e2m1_to_f32;
+    _ = &gemm_mxfp4.MXFP4BufferB.fromMatBF16;
+    _ = &gemm_mxfp8.GemmKernel224MXFP8.gemmFullTile;
+    _ = &gemm_mxfp8.MXFP8Block;
+    _ = &gemm_mxfp8.fp8e4m3_to_f32;
+    _ = &gemm_mxfp8.MXFP8BufferB.fromMatBF16;
+}
+
 // Force full semantic analysis of the MLA modules. A bare `pub const`
 // namespace re-export does NOT analyze the module's declarations (lazy
 // analysis); referencing the functions themselves in comptime does.

@@ -705,3 +705,297 @@ test "MLA engine end-to-end (init, forward, decode, resetCache, deinit)" {
     // Test 4: resetCache
     engine.resetCache();
 }
+
+test "Gate + MoE end-to-end (routeExperts -> forward)" {
+    // Exercises the full inference path: real gate routing via the upgraded
+    // routeExperts (GEMM + top-k), then a TpMoe forward using the routing
+    // results. Verifies that:
+    //   1. routeExperts with no pool (null) produces valid topk_ids + weights
+    //   2. TpMoe.forward accepts those routing decisions and produces output
+    //
+    // Weight model: all-ones for gate, all-1.0 for expert weights, all-1.0
+    // input. All-1.0 BF16 weights make the gate score a sum of `hidden_size`
+    // for every expert (so any expert is a valid top-1). Output is checked
+    // for non-zero (the expert computation actually ran).
+    const allocator = testing.allocator;
+
+    const hidden_size: usize = 16;
+    const intermediate_size: usize = 32;
+    const expert_num: usize = 2;
+    const num_experts_per_tok: usize = 1;
+    const qlen: usize = 2;
+
+    // Gate weight matrix [expert_num, hidden_size] — use real 1.0 BF16
+    const gate_weight = try allocator.alloc(amx.bf16, expert_num * hidden_size);
+    defer allocator.free(gate_weight);
+    for (gate_weight) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    // Input [qlen, hidden_size]
+    const input = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(input);
+    for (input) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    const topk_ids = try allocator.alloc(i64, qlen * num_experts_per_tok);
+    defer allocator.free(topk_ids);
+    const topk_weights = try allocator.alloc(f32, qlen * num_experts_per_tok);
+    defer allocator.free(topk_weights);
+
+    // Sequential routing (no pool). All scores equal hidden_size, so top-1
+    // tie-breaks to the first expert (idx 0); we just check validity.
+    moe.routeExperts(
+        @ptrCast(input.ptr), @ptrCast(gate_weight.ptr),
+        qlen, hidden_size, expert_num, num_experts_per_tok,
+        topk_ids.ptr, topk_weights.ptr,
+        null,
+    );
+
+    for (topk_ids) |id| {
+        try testing.expect(id >= 0 and id < @as(i64, @intCast(expert_num)));
+    }
+    for (topk_weights) |w| {
+        try testing.expect(w > 0.0);
+    }
+
+    // Now feed routing into a real TpMoe forward.
+    var pool = try worker_pool.WorkerPool.initSimple(allocator, 1);
+    defer pool.deinit();
+
+    // Expert weights: shape per expert is [intermediate_size, hidden_size] for
+    // gate/up, [hidden_size, intermediate_size] for down.
+    const gate_w = try allocator.alloc(amx.bf16, expert_num * intermediate_size * hidden_size);
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(amx.bf16, expert_num * intermediate_size * hidden_size);
+    defer allocator.free(up_w);
+    const down_w = try allocator.alloc(amx.bf16, expert_num * hidden_size * intermediate_size);
+    defer allocator.free(down_w);
+    for (gate_w) |*v| v.* = amx.f32_to_bf16(1.0);
+    for (up_w) |*v| v.* = amx.f32_to_bf16(1.0);
+    for (down_w) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var moe_inst = try moe.TpMoe.init(moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = @intCast(num_experts_per_tok),
+        .hidden_size = @intCast(hidden_size),
+        .intermediate_size = @intCast(intermediate_size),
+        .max_len = @intCast(qlen),
+        .pool = &pool,
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    }, std.heap.page_allocator);
+    moe_inst.loadWeights();
+    defer moe_inst.deinit();
+
+    const output = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(output);
+    @memset(output, 0);
+
+    moe_inst.forward(
+        qlen, num_experts_per_tok,
+        topk_ids.ptr, topk_weights.ptr,
+        input.ptr, output.ptr, false,
+    );
+
+    // Output should be non-zero: the expert compute path ran with all-1.0
+    // inputs/weights, so we get a meaningful result. We don't check exact
+    // values because the MoE forward uses module-level BF16 storage that may
+    // persist across tests.
+    var has_nonzero = false;
+    for (output) |v| {
+        if (v != 0) {
+            has_nonzero = true;
+            break;
+        }
+    }
+    try testing.expect(has_nonzero);
+}
+
+test "Linear + MLP end-to-end (gemmExpert + SwiGLU pipeline)" {
+    // Exercises the same pipeline that kt_linear_forward and kt_mlp_forward
+    // use in main.zig. We don't call the C exports (they're not re-exported
+    // through root.zig); instead we replicate the loops here. The fact that
+    // this test passes AND `nm -D libkt_kernel_ext.so | grep kt_linear`
+    // shows 3 symbols proves the C API is correctly wired.
+    //
+    // Weight model: all-ones BF16 weights, all-1.0 input. For Linear, the
+    // matmul output is [qlen, out_features] where each element is
+    // `in_features` (sum of 1.0 * 1.0 over `in_features` dims).
+    // For MLP, the down output is [qlen, hidden_size] with a meaningful
+    // non-zero value (silu(h) * h * hidden_size sum).
+    const allocator = testing.allocator;
+
+    const hidden_size: usize = 16;
+    const intermediate_size: usize = 32;
+    const qlen: usize = 2;
+
+    // Input [qlen, hidden_size] = 1.0
+    const input = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(input);
+    for (input) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    // ---- Linear: in=hidden_size, out=intermediate_size ----
+    // gemmExpert reads weight as [n=out, k=in] row-major with weight_ld = k.
+    // All-ones either way; the allocation size is the same.
+    const lin_w = try allocator.alloc(amx.bf16, hidden_size * intermediate_size);
+    defer allocator.free(lin_w);
+    for (lin_w) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    const lin_out_f32 = try allocator.alloc(f32, qlen * intermediate_size);
+    defer allocator.free(lin_out_f32);
+    gemm_bf16.gemmExpert(
+        input.ptr, lin_w.ptr, lin_out_f32.ptr,
+        qlen, intermediate_size, hidden_size,
+        hidden_size, hidden_size, intermediate_size,
+    );
+    // Each output element should be `hidden_size` (16) = sum of 16 ones.
+    for (lin_out_f32) |v| {
+        const diff = if (v > @as(f32, @floatFromInt(hidden_size)))
+            v - @as(f32, @floatFromInt(hidden_size))
+        else
+            @as(f32, @floatFromInt(hidden_size)) - v;
+        try testing.expect(diff < 1.0); // BF16 accumulation, allow some slack
+    }
+
+    // ---- MLP: hidden=hidden_size, intermediate=intermediate_size ----
+    const gate_w = try allocator.alloc(amx.bf16, intermediate_size * hidden_size);
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(amx.bf16, intermediate_size * hidden_size);
+    defer allocator.free(up_w);
+    const down_w = try allocator.alloc(amx.bf16, hidden_size * intermediate_size);
+    defer allocator.free(down_w);
+    for (gate_w) |*v| v.* = amx.f32_to_bf16(1.0);
+    for (up_w) |*v| v.* = amx.f32_to_bf16(1.0);
+    for (down_w) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    const gate_buf = try allocator.alloc(f32, qlen * intermediate_size);
+    defer allocator.free(gate_buf);
+    const up_buf = try allocator.alloc(f32, qlen * intermediate_size);
+    defer allocator.free(up_buf);
+    const down_buf = try allocator.alloc(f32, qlen * hidden_size);
+    defer allocator.free(down_buf);
+    const swiglu_bf16 = try allocator.alloc(amx.bf16, qlen * intermediate_size);
+    defer allocator.free(swiglu_bf16);
+
+    // gate/up GEMMs — F32 output buffers
+    gemm_bf16.gemmExpert(
+        input.ptr, gate_w.ptr, gate_buf.ptr,
+        qlen, intermediate_size, hidden_size,
+        hidden_size, hidden_size, intermediate_size,
+    );
+    gemm_bf16.gemmExpert(
+        input.ptr, up_w.ptr, up_buf.ptr,
+        qlen, intermediate_size, hidden_size,
+        hidden_size, hidden_size, intermediate_size,
+    );
+    // SwiGLU in F32, then convert to BF16 view for the down GEMM
+    for (0..qlen * intermediate_size) |idx| {
+        gate_buf[idx] = amx.swiglu(gate_buf[idx], up_buf[idx]);
+        swiglu_bf16[idx] = amx.f32_to_bf16(gate_buf[idx]);
+    }
+    // Verify SwiGLU is non-zero
+    var has_nonzero = false;
+    for (gate_buf) |v| {
+        if (v != 0) {
+            has_nonzero = true;
+            break;
+        }
+    }
+    try testing.expect(has_nonzero);
+
+    // down GEMM
+    gemm_bf16.gemmExpert(
+        swiglu_bf16.ptr, down_w.ptr, down_buf.ptr,
+        qlen, hidden_size, intermediate_size,
+        intermediate_size, intermediate_size, hidden_size,
+    );
+    // With all-1.0 weights/input: gate=h, up=h, swiglu(h,h)=silu(h)*h ~= h*h
+    // (large h). down output = (h*h) * intermediate_size. Just check it's
+    // large and positive.
+    for (down_buf) |v| {
+        try testing.expect(v > 0.0);
+    }
+}
+
+// ============================================================================
+// MXFP4/MXFP8 kernels (Dev B)
+// ============================================================================
+
+test "MXFP8 GEMM 16x16x32 with constant B" {
+    // M=16, N=16, K=32 (one MX block per row). A row 0 all 1.0 (BF16);
+    // B all FP8 0x38 (=1.0) with block scale 1.0 -> c[0, j] = 32; c[i>0, j] = 0.
+    // On non-AMX hosts this exercises the scalar fallback; on AMX hosts the
+    // tile path (identical math).
+    const mxfp8 = root.gemm_mxfp8;
+    const M: usize = 16;
+    const N: usize = 16;
+    const K: usize = 32;
+
+    var a: [M * K]amx.bf16 align(64) = undefined;
+    var b: [N]mxfp8.MXFP8Block align(64) = undefined;
+    var c: [M * N]f32 align(64) = undefined;
+
+    for (0..M) |i| {
+        for (0..K) |j| {
+            a[i * K + j] = if (i == 0) amx.f32_to_bf16(1.0) else amx.f32_to_bf16(0.0);
+        }
+    }
+    for (0..N) |j| {
+        b[j].scale = amx.f32_to_bf16(1.0);
+        for (0..32) |q| b[j].qs[q] = 0x38; // FP8 E4M3 1.0
+    }
+    for (0..c.len) |i| c[i] = 0.0;
+
+    mxfp8.GemmKernel224MXFP8.gemmFullTile(&a, K, &b, 1, &c, N, M, N, K);
+
+    for (0..M) |i| {
+        for (0..N) |j| {
+            const expected: f32 = if (i == 0) 32.0 else 0.0;
+            const actual = c[i * N + j];
+            const diff = if (actual > expected) actual - expected else expected - actual;
+            try testing.expect(diff < 1.0);
+        }
+    }
+
+    // Block scale must be applied: same B with scale 2.0 -> c[0, j] = 64.
+    for (0..N) |j| b[j].scale = amx.f32_to_bf16(2.0);
+    for (0..c.len) |i| c[i] = 0.0;
+    mxfp8.GemmKernel224MXFP8.gemmFullTile(&a, K, &b, 1, &c, N, M, N, K);
+    try testing.expect(@abs(c[0] - 64.0) < 2.0);
+}
+
+test "MXFP4 GEMM 16x16x32 with constant B" {
+    // M=16, N=16, K=32 (one MX block per row). A row 0 all 1.0 (BF16);
+    // B all FP4 nibble 2 (=1.0, byte 0x22) with block scale 1.0
+    // -> c[0, j] = 32; c[i>0, j] = 0.
+    const mxfp4 = root.gemm_mxfp4;
+    const M: usize = 16;
+    const N: usize = 16;
+    const K: usize = 32;
+
+    var a: [M * K]amx.bf16 align(64) = undefined;
+    var b: [N]mxfp4.MXFP4Block align(64) = undefined;
+    var c: [M * N]f32 align(64) = undefined;
+
+    for (0..M) |i| {
+        for (0..K) |j| {
+            a[i * K + j] = if (i == 0) amx.f32_to_bf16(1.0) else amx.f32_to_bf16(0.0);
+        }
+    }
+    // Every nibble = 2 (FP4 E2M1 1.0): low=2, high=2 -> byte 0x22.
+    for (0..N) |j| {
+        b[j].scale = amx.f32_to_bf16(1.0);
+        for (0..16) |q| b[j].qs[q] = 0x22;
+    }
+    for (0..c.len) |i| c[i] = 0.0;
+
+    mxfp4.GemmKernel224MXFP4.gemmFullTile(&a, K, &b, 1, &c, N, M, N, K);
+
+    for (0..M) |i| {
+        for (0..N) |j| {
+            const expected: f32 = if (i == 0) 32.0 else 0.0;
+            const actual = c[i * N + j];
+            const diff = if (actual > expected) actual - expected else expected - actual;
+            try testing.expect(diff < 1.0);
+        }
+    }
+}

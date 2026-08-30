@@ -1481,3 +1481,161 @@ export fn kt_mla_update_kv_cache(mla: *KT_MLA, kv_cache: *anyopaque, ...) void {
     ctx.cache.appendToken(...);
 }
 ```
+
+## Expert routing: GEMM + top-k
+
+The expert routing function computes `logits = input @ gate_proj^T` (a
+matmul) then selects top-k experts per token. The naive implementation
+does a scalar dot product per (token, expert) pair. The optimized
+version does one batched matmul (all tokens, all experts) and then a
+naive O(n*k) top-k selection. The matmul reuses the existing
+`gemm_bf16.gemmExpert`, which is the same kernel the MLA engine uses
+for `projectQ`. The top-k selection is left as a simple loop because
+k is typically 2-8 and the inner loop is only n iterations.
+
+Pattern: the routing function signature should take `?*WorkerPool` so
+the C API can pass null (no pool = sequential) while the MoE forward
+path passes a real pool. Inside the function, use the pool's thread
+count to decide whether to parallelize (future enhancement).
+
+## Test weight pattern: always use `amx.f32_to_bf16(1.0)`
+
+BF16 weights in test fixtures must be initialized via
+`amx.f32_to_bf16(1.0)`, never `v.* = 1`. The literal `1` is u16
+`0x0001`, which is a denormal BF16 (~7e-39) — not 1.0 (`0x3F80`). With
+near-zero weights, the forward path produces near-zero outputs and
+"non-zero" assertions become flaky depending on residual data.
+
+## `gemmExpert` weight layout: `[n, k]` row-major, `weight_ld = k`
+
+`gemm_bf16.gemmExpert(input, weight, output, m, n, k, input_ld, weight_ld, output_ld)`
+computes `C[m, n] = A[m, k] @ B[n, k]^T`. The kernel reads
+`weight[(n_idx) * weight_ld + k_idx]` with `n_idx in [0, n)` and
+`k_idx in [0, k)`. For this access to be in-bounds for a
+contiguous `[n, k]` row-major matrix, `weight_ld` MUST equal `k` (the
+row width), NOT `n`. The buffer size is `n * k` elements.
+
+### Fixed in `moe.computeExpert` and `TpMoe.forwardGateUp/forwardDown`
+
+The legacy code in `moe.computeExpert` (3 sites) and
+`TpMoe.forwardGateUp` (2 sites) + `TpMoe.forwardDown` (1 site) was
+passing `weight_ld = n`, causing the kernel to read up to
+`n^2 - n + k - 1` bytes past the end of an `n*k`-element buffer. The
+OOB reads happened to land in page allocator zero-fill on Linux, so
+the existing TpMoe tests passed by accident. All 6 sites are now
+fixed (`weight_ld = k`) and the tests still pass.
+
+When adding new `gemmExpert` callers, use `weight_ld = k`.
+
+## C API config structs: keep Zig-side in sync with `include/kt_kernel.h`
+
+The C header `kt_kernel.h` is the contract — Python/pybind11 depends on
+it. The Zig-side `extern struct` definitions in `main.zig` must use
+identical field names, types, and order. The C API is using
+`hidden_size` / `intermediate_size` / `proj` / `proj_type` /
+`hidden_type` (Linear) and `gate_proj` / `up_proj` / `down_proj` /
+`gate_type` / etc. (MLP) — not the older `in_features` / `out_features`
+/ `weight_ptr` / `dtype` names that some early Zig placeholders used.
+When adding new C API wrappers, copy the field list from the header
+verbatim.
+
+## MXFP4/MXFP8 kernels: wiring a never-compiled module end-to-end
+
+### The "bare `}` at EOF" gotcha — why your mxfp8.zig build passed once and then broke
+
+`zig build` was green the first time the file was force-analyzed (via the
+`comptime { _ = &fn; }` wiring trick) — but adding a `test` block at the
+end of the file exposed a parse error that had been hidden the entire
+time. Both `gemm_224_mxfp{4,8}.zig` were originally dead code (not in
+root.zig's import graph), so the parser was never invoked on them. Once
+I wired them in and added tests, the parser ran on the whole file and
+complained about a missing `;` after `pub const MXFP8BufferB = struct
+{ ... }` (bare `}` at EOF — tolerated at file end, rejected once more
+declarations followed it).
+
+Lesson: when re-wiring a never-compiled module, probe for parse errors
+**before** you start adding code, not after. A one-line test that just
+`test "x" {}` and references the module is the cheapest way to surface
+this class of bug; a complex test that follows can mask it with multiple
+errors. The exact `;` rule: `pub const X = struct { ... }` is a
+declaration; declarations need a trailing `;`. The probe:
+
+```sh
+cat > /tmp/m.zig <<EOF
+pub const S = struct { x: i32, }
+const std = @import("std");
+test "t" { try std.testing.expect(true); }
+
+## MXFP4/MXFP8 kernels: wiring a never-compiled module end-to-end
+
+### The "bare `}` at EOF" gotcha — why your mxfp8.zig build passed once and then broke
+
+`zig build` was green the first time the file was force-analyzed (via the
+`comptime { _ = &fn; }` wiring trick) — but adding a `test` block at the
+end of the file exposed a parse error that had been hidden the entire
+time. Both `gemm_224_mxfp{4,8}.zig` were originally dead code (not in
+root.zig's import graph), so the parser was never invoked on them. Once
+I wired them in and added tests, the parser ran on the whole file and
+complained about a missing `;` after `pub const MXFP8BufferB = struct
+{ ... }` (bare `}` at EOF — tolerated at file end, rejected once more
+declarations followed it).
+
+Lesson: when re-wiring a never-compiled module, probe for parse errors
+**before** you start adding code, not after. A one-line test that just
+`test "x" {}` and references the module is the cheapest way to surface
+this class of bug; a complex test that follows can mask it with multiple
+errors. The exact `;` rule: `pub const X = struct { ... }` is a
+declaration; declarations need a trailing `;`. The probe:
+
+```sh
+cat > /tmp/m.zig <<'E'
+pub const S = struct { x: i32, }
+const std = @import("std");
+test "t" { try std.testing.expect(true); }
+E
+zig test /tmp/m.zig   # error: expected ';' after declaration
+#                    # error points at the bare `}` even though it's at line 2
+# fix: change `}` to `};`
+```
+
+### `_ = &InstanceMethod` in a comptime block is valid Zig 0.16
+
+When forcing lazy-analysis emission via `comptime { _ = &foo.bar; }`, the
+function reference can be a method (with implicit `self`) or a static
+function — `&Type.method` gives a `*const fn (Type, args...) void`
+pointer. The comptime discard satisfies the analyzer and the function
+body gets emitted into the .so. The same trick is what the existing
+MLA block in `src/root.zig` uses; MXFP just added the same pattern
+alongside it. (Dev A's first proposed fix was "make fromMatBF16 a
+static function" — that's a valid refactor but is *not* required.)
+
+### MXFP per-32-block scale: fold it into the dequant
+
+Unlike FP8 (one scale per row, constant across K), MXFP has one scale
+per 32-element block. The naive approach (dequant to BF16, then scale
+in a post-pass per block) is correct but adds a tile reload per block
+boundary. The trick used in `gemm_224_mxfp{4,8}.zig`'s `loadB`: multiply
+the scale into the BF16 value at dequant time
+(`fp8e4m3_to_f32(qs[kk]) * scale`, then `amx.f32_to_bf16(...)`). One
+scale multiplication per element, no post-pass. The single-block K_STEP=32
+boundary lines up with the block size (GROUP_SIZE=32), so each tile
+step covers exactly one MXFP block — the dequant path is branch-free
+across the K loop.
+
+### Nibble order in MXFP4 — verify against the C++ reference, not the name
+
+The MXFP4 `qs: [16]u8` packs 32 four-bit values: 2 nibbles per byte,
+low nibble = element at even k, high nibble = element at odd k. This
+is the convention in `avx2/mxfp4-moe.hpp:314`:
+`const uint8_t nib = (pos & 1) ? (packed >> 4) : (packed & 0x0F);`.
+The order is invisible to scalar correctness (any 2-nibble packing is
+self-consistent) but visible to any code that compares against another
+implementation. Test for it explicitly:
+
+```zig
+// Low nibble first (k=0), high nibble second (k=1).
+b.qs[0] = 0x12;  // low=2 -> 1.0, high=1 -> 0.5
+unpackMXFP4(&b, &unpacked);
+try expect(unpacked[0] == 1.0);
+try expect(unpacked[1] == 0.5);
+```

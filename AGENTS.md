@@ -126,6 +126,10 @@ enabled by the loadWeights fix.
 - `LESSONS_ZIG.md` — Zig 0.16 gotchas, verified AMX asm patterns, lazy-analysis/integration lessons (**read first**)
 - `include/kt_kernel.h` — C API contract (do not change without coordinating: Python/pybind11 depends on it)
 
+
+  The reference repo is at /ai/repos/2026/ktransformers
+
+
 ## Coordination notes
 
 - `PLAN.md`, `LESSONS_KTRANSFORMERS.md` referenced by older docs do not exist.

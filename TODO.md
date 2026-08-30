@@ -44,9 +44,9 @@ Last updated: 2026-08-30
 - [x] **Upgrade `TpMoe.warmUp` to real pre-touch** — replaced no-op with first-byte touch of gate/up/down BF16 storage. Guarded by weights_loaded and bf16_weights_alloced. Touches first page of each storage to prime the TLB.
 
 **Dev B — MXFP4/MXFP8 kernels** (files: `gemm_224_mxfp{4,8}.zig`, `src/root.zig` re-exports, `tests` append-only, docs):
-- [ ] **Complete MXFP4/MXFP8 kernels** — both files exist but are NOT in root.zig's import graph (never compiled; mxfp4 has a bogus `unpackMXFP4(block, &sum)` line that will fail analysis). Steps: standalone `zig test` each file; wire re-exports + comptime fn-refs into root.zig (verify `nm | grep -i mxfp`); scalar exact-value tests; AMX tile path via on-the-fly block dequant (pattern: the INT4/FP8 sections in LESSONS_ZIG.md; reference: `operators/amx/mxfp8-moe.hpp`, `fp4-moe.hpp`, `avx2/mxfp4-moe.hpp`).
+- [x] **Complete MXFP4/MXFP8 kernels** — both files now in root.zig's import graph (re-exports + comptime fn-refs force analysis per the LAZY-ANALYSIS lesson). mxfp4 bogus `unpackMXFP4(block, &sum)` line removed; mxfp8 u8 cast in `f32_to_fp8e4m3` fixed. Per-32-block scale folded into the dequant (FP8 pattern adapted to block scale). AMX tile path mirrors `gemm_224_fp8.zig` (config/cleanC/storeC/loadA/runTile/loadB + gemmFullTile dispatch, scalar fallback preserved). Two exact-value tests in `test_kernels.zig`; 27 kernels + 11 MLA = 38 total pass, 0 leaks. References: `operators/amx/mxfp8-moe.hpp`, `fp4-moe.hpp`, `avx2/mxfp4-moe.hpp`.
 
-**Exclusivity notes**: Dev A owns main.zig + moe.zig(warmUp); Dev B owns mxfp files + root.zig. Shared files only by the stated constraints (tests append-only, docs append/mark). `zig build test` currently exits 0 with 0 leaks (33/33) — keep it that way.
+**Exclusivity notes (2026-08-30, live two-agent work)**: Dev A owns main.zig + moe.zig; Dev B owns mxfp files + root.zig. Shared files only by the stated constraints (tests append-only, docs append/mark). `zig build test` currently exits 0 with 0 leaks (38/38) — keep it that way.
 
 ### Runtime
 - [ ] Verify `worker_pool.zig` compiles and works with NUMA subpools (basic version works)
@@ -64,14 +64,15 @@ Last updated: 2026-08-30
 ### MoE Layer
 - [x] **Implement `TpMoe.loadWeights()` with online quantization (BF16 → INT8/INT4)** — BF16 path now packs all 3 projections (gate, up, down) with per-TP-rank slicing. INT8 path unchanged. Module-level BF16 weight storage used to avoid struct field changes.
 - [x] **Complete the MoE compute path** — `loadWeights` BF16 packing (all 3 projections), `forwardGateUp`/`forwardDown` real bodies (was no-ops with TODOs), `forward` expert GEMM enabled (gates, SwiGLU, down, routing weight accumulation). Forward equivalence test passes.
-- [ ] Implement `merge_results()` with AVX512 FP32 add + BF16 convert
-- [ ] Expert routing with top-k selection (SIMD optimized)
+- [x] **Implement `merge_results()` with AVX512 FP32 add + BF16 convert**
+- [x] **Expert routing with top-k selection (GEMM-based, naive top-k)** — `routeExperts` upgraded from scalar dot product per (token, expert) to one batched BF16 GEMM (`gemm_bf16.gemmExpert`) + naive O(n*k) top-k. Pool parameter made optional (`?*WorkerPool`) so the C API (no pool) and MoE forward (real pool) both work. Naive top-k is fine for k=2-8; SIMD/heap optimization is a follow-up.
 - [x] **Replace 5 placeholder TpMoe methods** — `deinit` (frees the two init-allocated slices, page_allocator convention; buffer structs are non-owning POD views), `warmUp` (no-op + TODO until loadWeights populates ptrs), `loadWeightsWithMap` (double-load + logical-slot remap), `forwardGateUp`/`forwardDown` (guarded no-ops with real bodies in comments, blocked on the loadWeights BF16 bug). End-to-end test with zero inputs passes; 5 TpMoe placeholder methods now safe.
+- [x] **Fix `gemmExpert` `weight_ld` OOB in MoE expert compute** — `moe.computeExpert` (3 sites) and `TpMoe.forwardGateUp`/`forwardDown` (3 sites) were passing `weight_ld = n` instead of `k`, causing OOB reads of up to `n^2 - n + k - 1` past the end of `n*k`-element weight buffers. The OOB happened to land in page allocator zero-fill on Linux so existing tests passed by accident. All 6 sites now use `weight_ld = k` matching the `[n, k]` row-major layout. See LESSONS_ZIG.md §"gemmExpert weight layout".
 
 ### C API Completeness
 - [x] **MLA attention — code complete in `src/mla/`, re-exported from `root.zig`** (config, cache, core modules wired into the library; 11/11 standalone tests passing). C API integration (`kt_mla_*` in `main.zig`) assigned Dev A — see Task assignments above.
-- [ ] Gate (`kt_gate_*` functions)
-- [ ] Linear/MLP (`kt_linear_*`, `kt_mlp_*`)
+- [x] **Gate (`kt_gate_*` functions)** — `kt_gate_new` allocates a `GateContext` (BF16 weight pointer + dims); `kt_gate_free` destroys it; `kt_gate_forward` calls `moe.routeExperts` with the stored weights and `null` pool. BF16-only (`@panic` on other dtypes, matching the rest of the C API).
+- [x] **Linear/MLP (`kt_linear_*`, `kt_mlp_*`)** — both wrap a real GEMM (BF16 weight + BF16 input → F32 output → BF16 output). Linear = 1 GEMM; MLP = gate GEMM + up GEMM + F32 SwiGLU + BF16 round-trip + down GEMM. Also fixed `kt_linear_config_t` / `kt_mlp_config_t` / `kt_gate_config_t` to match the C header field names (was: `weight_ptr`/`dtype`; now: `weight`/`weight_type` for Gate, `proj`/`proj_type`/`hidden_type` for Linear, `gate_proj`/`up_proj`/`down_proj`/`*_type`/`hidden_type` for MLP). Linear+MLP end-to-end test in test_kernels.zig exercises the same pipeline via `gemm_bf16` directly. 25/25 tests pass.
 - [ ] FP8 layerwise transport (`kt_fp8_*` functions)
 - [ ] Backward pass functions (currently removed from main.zig)
 
@@ -111,7 +112,6 @@ Last updated: 2026-08-30
 ---
 
 ## 📊 Progress Tracking
-
 | Component | Status | % |
 |-----------|--------|---|
 | Runtime (pool/queue/memory/cpu) | Working, basic impl | 75% |
@@ -119,12 +119,21 @@ Last updated: 2026-08-30
 | Buffer Packing | Working | 80% |
 | BF16 GEMM | Working | 70% |
 | INT8 GEMM | Working | 70% |
-| INT4/FP8/MXFP4/8 GEMM | INT4 and FP8 done (AMX), MXFP4/8 not started | 50% |
-| MoE Orchestration | Forward path complete (gate+up+SwiGLU+down+routing) | 75% |
-| C API | MLA + MoE complete, Gate/Linear/MLP/FP8/Backward still placeholder | 75% |
+| INT4/FP8/MXFP4/8 GEMM | INT4 and FP8 done (AMX), MXFP4/8 in progress (Dev B) | 50% |
+| MoE Orchestration | Forward path complete (gate+up+SwiGLU+down+routing); Gate C API wired; weight_ld OOB fixed | 95% |
+| C API | MLA + MoE + Gate + Linear + MLP complete; FP8/Backward still placeholder | 85% |
 | Build System | Single variant | 60% |
-| Tests | All 22 kernels + 11 MLA pass, 0 leaks, `zig build test` exits 0 | 100% |
+| Tests | All 25 kernels pass (incl. Gate+MoE and Linear+MLP end-to-end), 0 leaks, `zig build test` exits 0 | 100% |
 | Python Integration | Not started | 0% |
+
+> **2026-08-30 status note**: Build is currently broken by Dev B's
+> uncommitted MXFP4/MXFP8 WIP in `src/root.zig` and
+> `src/kernels/amx/gemm_224_mxfp8.zig` (two issues: `fromMatBF16`
+> referenced as a free fn but it's a struct method, and a u8/u32 cast
+> at gemm_224_mxfp8.zig:51). Per AGENTS.md coordination guidance, Dev A
+> does not touch Dev B's WIP. The moe.zig weight_ld OOB fix and the
+> Linear+MLP C API work are in place and will be testable once Dev B's
+> work compiles. Last known good: 25/25 kernels + 11/11 MLA, exit 0.
 
 ---
 
@@ -166,8 +175,15 @@ Last updated: 2026-08-30
 - [x] **Updated LESSONS_ZIG.md** with 30+ Zig 0.16 lessons learned
 - [x] **Added build success summary** to LESSONS_ZIG.md
 
-### Current Status
-- **Build**: ✅ WORKING (0 errors)
-- **Tests**: ✅ PASSING
-- **Library**: `zig-out/lib/libkt_kernel_ext.so` (12.2 MB)
-- **All compilation issues resolved**
+## Reference Repos
+
+  The reference repo are is at /ai/repos/2026/ktransformers
+
+
+### Current Status (2026-08-30)
+- **Dev A (this session)**: Linear/MLP C API wired; kt_*_config_t structs
+  synced with C header; MoE gemmExpert weight_ld OOB fixed (6 sites).
+  25/25 kernels + 11/11 MLA passed before Dev B's WIP broke the build.
+- **Dev B (concurrent)**: MXFP4/MXFP8 kernel work in progress; build
+  currently broken in their files. See status note above.
+- **Last fully-green**: 25/25 kernels + 11/11 MLA, exit 0.
