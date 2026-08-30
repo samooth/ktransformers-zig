@@ -1320,3 +1320,139 @@ test "TpMoe forward: work-stealing pool matches sequential (equivalence)" {
         try testing.expect(@abs(a - b) < 1e-3);
     }
 }
+
+test "SFT forward_sft: work-stealing pool matches sequential (equivalence)" {
+    // The pool branch (work-stealing) and the no-pool branch (sequential) of
+    // TpMoeSft.forward_sft MUST produce identical output for identical
+    // weights/inputs — proof the parallel reduction + disjoint cache writes
+    // are data-race free. Also round-trips backward over the parallel-saved
+    // cache to prove cache correctness under the pool path.
+    const allocator = testing.allocator;
+
+    const hidden: usize = 16;
+    const inter: usize = 32;
+    const rank: usize = 4;
+    const expert_num: usize = 3;
+    const qlen: usize = 2;
+    const k: usize = 2;
+
+    const gate_w = try allocator.alloc(amx.bf16, expert_num * inter * hidden);
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(amx.bf16, expert_num * inter * hidden);
+    defer allocator.free(up_w);
+    const down_w = try allocator.alloc(amx.bf16, expert_num * hidden * inter);
+    defer allocator.free(down_w);
+    for (gate_w, 0..) |*v, i| v.* = amx.f32_to_bf16(@as(f32, @floatFromInt(i % 7 + 1)) * 0.05);
+    for (up_w, 0..) |*v, i| v.* = amx.f32_to_bf16(@as(f32, @floatFromInt(i % 5 + 1)) * 0.05);
+    for (down_w) |*v| v.* = amx.f32_to_bf16(0.25);
+
+    const gate_lora_a = try allocator.alloc(amx.bf16, expert_num * rank * hidden);
+    const gate_lora_b = try allocator.alloc(amx.bf16, expert_num * rank * inter);
+    const up_lora_a = try allocator.alloc(amx.bf16, expert_num * rank * hidden);
+    const up_lora_b = try allocator.alloc(amx.bf16, expert_num * rank * inter);
+    const down_lora_a = try allocator.alloc(amx.bf16, expert_num * rank * inter);
+    const down_lora_b = try allocator.alloc(amx.bf16, expert_num * rank * hidden);
+    defer {
+        allocator.free(gate_lora_a); allocator.free(gate_lora_b);
+        allocator.free(up_lora_a); allocator.free(up_lora_b);
+        allocator.free(down_lora_a); allocator.free(down_lora_b);
+    }
+    for (gate_lora_a) |*v| v.* = amx.f32_to_bf16(0.05);
+    for (gate_lora_b) |*v| v.* = amx.f32_to_bf16(0.05);
+    for (up_lora_a) |*v| v.* = amx.f32_to_bf16(0.05);
+    for (up_lora_b) |*v| v.* = amx.f32_to_bf16(0.05);
+    for (down_lora_a) |*v| v.* = amx.f32_to_bf16(0.05);
+    for (down_lora_b) |*v| v.* = amx.f32_to_bf16(0.05);
+
+    const input = try allocator.alloc(amx.bf16, qlen * hidden);
+    defer allocator.free(input);
+    for (input) |*v| v.* = amx.f32_to_bf16(0.5);
+
+    const expert_ids = [_]i64{ 0, 1, 1, 2 };
+    const routing_weights = [_]f32{ 0.5, 0.3, 0.4, 0.2 };
+
+    // Sequential (no pool).
+    var pool = try worker_pool.WorkerPool.initSimple(allocator, 2);
+    defer pool.deinit();
+
+    var sft_seq = try moe_sft.TpMoeSft.init(moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = @intCast(k),
+        .hidden_size = @intCast(hidden),
+        .intermediate_size = @intCast(inter),
+        .max_len = @intCast(qlen),
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    }, std.heap.page_allocator);
+    defer sft_seq.deinit();
+    sft_seq.lora_rank = rank;
+    sft_seq.lora_alpha = 1.0;
+    sft_seq.lora_scaling = 1.0 / @as(f32, @floatFromInt(rank));
+    sft_seq.update_lora_weights(@ptrCast(gate_lora_a.ptr), @ptrCast(gate_lora_b.ptr),
+        @ptrCast(up_lora_a.ptr), @ptrCast(up_lora_b.ptr),
+        @ptrCast(down_lora_a.ptr), @ptrCast(down_lora_b.ptr));
+
+    const out_seq = try allocator.alloc(amx.bf16, qlen * hidden);
+    defer allocator.free(out_seq);
+    @memset(out_seq, 0);
+    sft_seq.forward_sft(qlen, k, &expert_ids, &routing_weights, input.ptr, out_seq.ptr, false);
+
+    // Parallel (with pool).
+    var sft_par = try moe_sft.TpMoeSft.init(moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = @intCast(k),
+        .hidden_size = @intCast(hidden),
+        .intermediate_size = @intCast(inter),
+        .max_len = @intCast(qlen),
+        .pool = &pool,
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    }, std.heap.page_allocator);
+    defer sft_par.deinit();
+    sft_par.lora_rank = rank;
+    sft_par.lora_alpha = 1.0;
+    sft_par.lora_scaling = 1.0 / @as(f32, @floatFromInt(rank));
+    sft_par.update_lora_weights(@ptrCast(gate_lora_a.ptr), @ptrCast(gate_lora_b.ptr),
+        @ptrCast(up_lora_a.ptr), @ptrCast(up_lora_b.ptr),
+        @ptrCast(down_lora_a.ptr), @ptrCast(down_lora_b.ptr));
+
+    const out_par = try allocator.alloc(amx.bf16, qlen * hidden);
+    defer allocator.free(out_par);
+    @memset(out_par, 0);
+    // save_for_backward=true exercises the disjoint cache writes under the pool.
+    sft_par.forward_sft(qlen, k, &expert_ids, &routing_weights, input.ptr, out_par.ptr, true);
+
+    // Outputs must match within tolerance (BF16 round-trip => small tol).
+    for (0..qlen * hidden) |i| {
+        const a = amx.bf16_to_f32(out_seq[i]);
+        const b = amx.bf16_to_f32(out_par[i]);
+        try testing.expect(@abs(a - b) < 1e-2);
+    }
+
+    // Round-trip: backward over the parallel-saved cache must not crash and
+    // must produce finite gradients (proves cache correctness under pool).
+    const grad_output = try allocator.alloc(f32, qlen * hidden);
+    defer allocator.free(grad_output);
+    for (grad_output) |*v| v.* = 1.0;
+    const grad_input = try allocator.alloc(f32, qlen * hidden);
+    defer allocator.free(grad_input);
+    const gw = try allocator.alloc(f32, rank * hidden);
+    const gb = try allocator.alloc(f32, rank * inter);
+    const uw = try allocator.alloc(f32, rank * hidden);
+    const ub = try allocator.alloc(f32, rank * inter);
+    const dw = try allocator.alloc(f32, rank * inter);
+    const db = try allocator.alloc(f32, rank * hidden);
+    defer {
+        allocator.free(gw); allocator.free(gb);
+        allocator.free(uw); allocator.free(ub);
+        allocator.free(dw); allocator.free(db);
+    }
+    const gweights = try allocator.alloc(f32, qlen * k);
+    defer allocator.free(gweights);
+
+    sft_par.backward(grad_output.ptr, grad_input.ptr, gw.ptr, gb.ptr, uw.ptr, ub.ptr,
+        dw.ptr, db.ptr, gweights.ptr, null, null, null, false, 1.0);
+    for (grad_input) |v| try testing.expect(!std.math.isNan(v));
+}

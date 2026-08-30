@@ -9,6 +9,7 @@ const std = @import("std");
 const amx = @import("../arch/amx.zig");
 const moe = @import("moe.zig");
 const lora = @import("../amx/lora_kernels.zig");
+const worker_pool = @import("../../runtime/worker_pool.zig");
 const bf16 = amx.bf16;
 
 // ============================================================================
@@ -33,6 +34,106 @@ pub const ForwardCache = struct {
     activated_expert: usize,
     lora_dropout_seed: u64,
 };
+
+// ============================================================================
+// Work-stealing per-expert dispatch context for SFT forward. The pool's
+// doWorkStealingJob requires a bare fn(usize) void (no capture), so the
+// per-expert task reads these globals. Safe because the C API is single-
+// threaded per MoE instance and doWorkStealingJob blocks.
+// NOTE: g_parallel is process-global single-slot; multi-subpool spread is a
+// follow-up (uses subpool[0] only).
+const MoeParallelCtx = struct {
+    self: *TpMoeSft,
+    input: [*]const amx.bf16,
+    qlen: usize,
+    k: usize,
+    hidden: usize,
+    inter: usize,
+    expert_num: usize,
+    expert_input_bufs: [][]amx.bf16,
+    expert_token_counts: []usize,
+    expert_scratch_bufs: [][]amx.bf16,
+    expert_token_offset: []usize,
+    cache_gate: ?[]bf16,
+    cache_up: ?[]bf16,
+    cache_inter: ?[]bf16,
+    cache_down: ?[]bf16,
+    cache_down_lora_u: ?[]f32,
+    routing_ids: []const i64,
+    routing_weights: []const f32,
+    output_f32: [*]f32,
+};
+
+var g_parallel: ?MoeParallelCtx = null;
+
+fn parallelSftTask(e: usize) void {
+    const ctx = g_parallel orelse @panic("parallelSftTask: no context");
+    const count = ctx.expert_token_counts[e];
+    if (count == 0) return;
+    const hidden = ctx.hidden;
+    const inter = ctx.inter;
+    const expert_in = ctx.expert_input_bufs[e];
+    var token_idx: usize = 0;
+    for (0..ctx.qlen) |i| {
+        for (0..ctx.k) |j| {
+            const ridx = i * ctx.k + j;
+            const eid = ctx.routing_ids[ridx];
+            if (eid == @as(i64, @intCast(e))) {
+                @memcpy(expert_in[token_idx * hidden ..][0..hidden], ctx.input[i * hidden ..][0..hidden]);
+                token_idx += 1;
+            }
+        }
+    }
+    const gate_bf16 = std.heap.page_allocator.alloc(amx.bf16, count * inter) catch @panic("OOM");
+    defer std.heap.page_allocator.free(gate_bf16);
+    const up_bf16 = std.heap.page_allocator.alloc(amx.bf16, count * inter) catch @panic("OOM");
+    defer std.heap.page_allocator.free(up_bf16);
+    ctx.self.moe.forwardGateUp(e, count, expert_in.ptr, gate_bf16.ptr, up_bf16.ptr);
+    if (ctx.self.lora_rank > 0 and ctx.self.gate_lora_a != null and ctx.self.gate_lora_b != null) {
+        const gate_lora_a_ptr = @as([*]const bf16, @ptrCast(@alignCast(ctx.self.gate_lora_a)));
+        const gate_lora_b_ptr = @as([*]const bf16, @ptrCast(@alignCast(ctx.self.gate_lora_b)));
+        const up_lora_a_ptr = @as([*]const bf16, @ptrCast(@alignCast(ctx.self.up_lora_a)));
+        const up_lora_b_ptr = @as([*]const bf16, @ptrCast(@alignCast(ctx.self.up_lora_b)));
+        const gate_lora_a_offset = e * ctx.self.lora_rank * hidden;
+        const gate_lora_b_offset = e * ctx.self.lora_rank * inter;
+        const up_lora_a_offset = e * ctx.self.lora_rank * hidden;
+        const up_lora_b_offset = e * ctx.self.lora_rank * inter;
+        var u_gate = std.heap.page_allocator.alloc(f32, count * ctx.self.lora_rank) catch @panic("OOM");
+        defer std.heap.page_allocator.free(u_gate);
+        lora.loraBf16MatmulT4r4(expert_in.ptr, gate_lora_a_ptr + gate_lora_a_offset, u_gate.ptr, count, hidden, ctx.self.lora_rank);
+        lora.loraFp32Bf16FusedAddTransposed(u_gate.ptr, gate_lora_b_ptr + gate_lora_b_offset, gate_bf16.ptr, count, ctx.self.lora_rank, inter, ctx.self.lora_scaling);
+        var u_up = std.heap.page_allocator.alloc(f32, count * ctx.self.lora_rank) catch @panic("OOM");
+        defer std.heap.page_allocator.free(u_up);
+        lora.loraBf16MatmulT4r4(expert_in.ptr, up_lora_a_ptr + up_lora_a_offset, u_up.ptr, count, hidden, ctx.self.lora_rank);
+        lora.loraFp32Bf16FusedAddTransposed(u_up.ptr, up_lora_b_ptr + up_lora_b_offset, up_bf16.ptr, count, ctx.self.lora_rank, inter, ctx.self.lora_scaling);
+    }
+    const off = ctx.expert_token_offset[e];
+    if (ctx.cache_gate) |cg| @memcpy(cg[off * inter ..][0..count * inter], gate_bf16[0..count * inter]);
+    if (ctx.cache_up) |cu| @memcpy(cu[off * inter ..][0..count * inter], up_bf16[0..count * inter]);
+    for (0..count * inter) |idx| {
+        const g = amx.bf16_to_f32(gate_bf16[idx]);
+        const u = amx.bf16_to_f32(up_bf16[idx]);
+        gate_bf16[idx] = amx.f32_to_bf16(amx.swiglu(g, u));
+    }
+    if (ctx.cache_inter) |ci| @memcpy(ci[off * inter ..][0..count * inter], gate_bf16[0..count * inter]);
+    if (ctx.self.lora_rank > 0 and ctx.self.down_lora_a != null and ctx.self.down_lora_b != null) {
+        const down_lora_a_ptr = @as([*]const bf16, @ptrCast(@alignCast(ctx.self.down_lora_a)));
+        const down_lora_b_ptr = @as([*]const bf16, @ptrCast(@alignCast(ctx.self.down_lora_b)));
+        const down_lora_a_offset = e * ctx.self.lora_rank * inter;
+        const down_lora_b_offset = e * ctx.self.lora_rank * hidden;
+        var u_down = std.heap.page_allocator.alloc(f32, count * ctx.self.lora_rank) catch @panic("OOM");
+        defer std.heap.page_allocator.free(u_down);
+        lora.loraBf16MatmulT4r4(gate_bf16.ptr, down_lora_a_ptr + down_lora_a_offset, u_down.ptr, count, inter, ctx.self.lora_rank);
+        if (ctx.cache_down_lora_u) |cdlu| @memcpy(cdlu[off * ctx.self.lora_rank ..][0..count * ctx.self.lora_rank], u_down[0..count * ctx.self.lora_rank]);
+        lora.loraFp32Bf16FusedAddTransposed(u_down.ptr, down_lora_b_ptr + down_lora_b_offset, gate_bf16.ptr, count, ctx.self.lora_rank, hidden, ctx.self.lora_scaling);
+    }
+    const scratch = ctx.expert_scratch_bufs[e];
+    @memset(scratch, 0);
+    ctx.self.moe.forwardDown(e, count, gate_bf16.ptr, scratch.ptr);
+    if (ctx.cache_down) |cd| {
+        @memcpy(cd[off * hidden ..][0..count * hidden], scratch[0..count * hidden]);
+    }
+}
 
 // ============================================================================
 // TpMoeSft — SFT MoE wrapping the inference TpMoe
@@ -166,191 +267,201 @@ pub const TpMoeSft = struct {
         var token_offset: usize = 0;
 
         // Process each activated expert
-        for (0..activated_expert) |a| {
-            const e = activated[a];
-            const count = m_local_num[e];
-            if (count == 0) continue;
+        if (self.moe.config.pool) |pool| {
+            const route_len = qlen * k;
+            self.forwardParallelSft(
+                activated_expert, qlen, @intCast(k), m_local_num,
+                expert_ids[0..route_len], weights[0..route_len],
+                input, output_f32.ptr, hidden, inter, save_for_backward,
+                cache_gate, cache_up, cache_inter, cache_down, cache_down_lora_u, pool,
+            );
+        } else {
+            for (0..activated_expert) |a| {
+                const e = activated[a];
+                const count = m_local_num[e];
+                if (count == 0) continue;
 
-            // Gather input tokens for this expert
-            var expert_input = std.heap.page_allocator.alloc(bf16, count * hidden) catch @panic("OOM");
-            defer std.heap.page_allocator.free(expert_input);
-            var token_idx: usize = 0;
-            for (0..qlen) |i| {
-                for (0..k) |j| {
-                    const eid = expert_ids[i * k + j];
-                    if (eid == @as(i64, @intCast(e))) {
-                        @memcpy(
-                            expert_input[token_idx * hidden ..][0..hidden],
-                            input[i * hidden ..][0..hidden],
-                        );
-                        token_idx += 1;
+                // Gather input tokens for this expert
+                var expert_input = std.heap.page_allocator.alloc(bf16, count * hidden) catch @panic("OOM");
+                defer std.heap.page_allocator.free(expert_input);
+                var token_idx: usize = 0;
+                for (0..qlen) |i| {
+                    for (0..k) |j| {
+                        const eid = expert_ids[i * k + j];
+                        if (eid == @as(i64, @intCast(e))) {
+                            @memcpy(
+                                expert_input[token_idx * hidden ..][0..hidden],
+                                input[i * hidden ..][0..hidden],
+                            );
+                            token_idx += 1;
+                        }
                     }
                 }
-            }
 
-            // Gate + up GEMM
-            var gate_output = std.heap.page_allocator.alloc(bf16, count * inter) catch @panic("OOM");
-            defer std.heap.page_allocator.free(gate_output);
-            var up_output = std.heap.page_allocator.alloc(bf16, count * inter) catch @panic("OOM");
-            defer std.heap.page_allocator.free(up_output);
+                // Gate + up GEMM
+                var gate_output = std.heap.page_allocator.alloc(bf16, count * inter) catch @panic("OOM");
+                defer std.heap.page_allocator.free(gate_output);
+                var up_output = std.heap.page_allocator.alloc(bf16, count * inter) catch @panic("OOM");
+                defer std.heap.page_allocator.free(up_output);
 
-            self.moe.forwardGateUp(e, count, expert_input.ptr, gate_output.ptr, up_output.ptr);
+                self.moe.forwardGateUp(e, count, expert_input.ptr, gate_output.ptr, up_output.ptr);
 
-            // LoRA gate/up: u = input @ lora_A^T, then gate += scale * u @ lora_B^T
-            if (self.lora_rank > 0 and self.gate_lora_a != null and self.gate_lora_b != null) {
-                const gate_lora_a_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.gate_lora_a)));
-                const gate_lora_b_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.gate_lora_b)));
-                const up_lora_a_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.up_lora_a)));
-                const up_lora_b_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.up_lora_b)));
+                // LoRA gate/up: u = input @ lora_A^T, then gate += scale * u @ lora_B^T
+                if (self.lora_rank > 0 and self.gate_lora_a != null and self.gate_lora_b != null) {
+                    const gate_lora_a_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.gate_lora_a)));
+                    const gate_lora_b_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.gate_lora_b)));
+                    const up_lora_a_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.up_lora_a)));
+                    const up_lora_b_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.up_lora_b)));
 
-                const gate_lora_a_offset = e * self.lora_rank * hidden;
-                const gate_lora_b_offset = e * self.lora_rank * inter;
-                const up_lora_a_offset = e * self.lora_rank * hidden;
-                const up_lora_b_offset = e * self.lora_rank * inter;
+                    const gate_lora_a_offset = e * self.lora_rank * hidden;
+                    const gate_lora_b_offset = e * self.lora_rank * inter;
+                    const up_lora_a_offset = e * self.lora_rank * hidden;
+                    const up_lora_b_offset = e * self.lora_rank * inter;
 
-                // u_gate = input @ gate_lora_A^T
-                var u_gate = std.heap.page_allocator.alloc(f32, count * self.lora_rank) catch @panic("OOM");
-                defer std.heap.page_allocator.free(u_gate);
-                lora.loraBf16MatmulT4r4(
-                    expert_input.ptr,
-                    gate_lora_a_ptr + gate_lora_a_offset,
-                    u_gate.ptr,
-                    count,
-                    hidden,
-                    self.lora_rank,
-                );
-                // gate_output += scale * u_gate @ gate_lora_B^T
-                lora.loraFp32Bf16FusedAddTransposed(
-                    u_gate.ptr,
-                    gate_lora_b_ptr + gate_lora_b_offset,
-                    gate_output.ptr,
-                    count,
-                    self.lora_rank,
-                    inter,
-                    self.lora_scaling,
-                );
+                    // u_gate = input @ gate_lora_A^T
+                    var u_gate = std.heap.page_allocator.alloc(f32, count * self.lora_rank) catch @panic("OOM");
+                    defer std.heap.page_allocator.free(u_gate);
+                    lora.loraBf16MatmulT4r4(
+                        expert_input.ptr,
+                        gate_lora_a_ptr + gate_lora_a_offset,
+                        u_gate.ptr,
+                        count,
+                        hidden,
+                        self.lora_rank,
+                    );
+                    // gate_output += scale * u_gate @ gate_lora_B^T
+                    lora.loraFp32Bf16FusedAddTransposed(
+                        u_gate.ptr,
+                        gate_lora_b_ptr + gate_lora_b_offset,
+                        gate_output.ptr,
+                        count,
+                        self.lora_rank,
+                        inter,
+                        self.lora_scaling,
+                    );
 
-                // u_up = input @ up_lora_A^T
-                var u_up = std.heap.page_allocator.alloc(f32, count * self.lora_rank) catch @panic("OOM");
-                defer std.heap.page_allocator.free(u_up);
-                lora.loraBf16MatmulT4r4(
-                    expert_input.ptr,
-                    up_lora_a_ptr + up_lora_a_offset,
-                    u_up.ptr,
-                    count,
-                    hidden,
-                    self.lora_rank,
-                );
-                // up_output += scale * u_up @ up_lora_B^T
-                lora.loraFp32Bf16FusedAddTransposed(
-                    u_up.ptr,
-                    up_lora_b_ptr + up_lora_b_offset,
-                    up_output.ptr,
-                    count,
-                    self.lora_rank,
-                    inter,
-                    self.lora_scaling,
-                );
-            }
-
-            // Save gate/up to cache (after LoRA, before activation)
-            if (save_for_backward) {
-                @memcpy(
-                    gate_output[0..count * inter],
-                    cache_gate[token_offset * inter ..][0..count * inter],
-                );
-                @memcpy(
-                    up_output[0..count * inter],
-                    cache_up[token_offset * inter ..][0..count * inter],
-                );
-            }
-
-            // SwiGLU activation: silu(gate) * up, in-place into gate_output
-            for (0..count * inter) |idx| {
-                const g = amx.bf16_to_f32(gate_output[idx]);
-                const u = amx.bf16_to_f32(up_output[idx]);
-                gate_output[idx] = amx.f32_to_bf16(amx.swiglu(g, u));
-            }
-
-            // Save intermediate (post-activation) to cache
-            if (save_for_backward) {
-                @memcpy(
-                    gate_output[0..count * inter],
-                    cache_inter[token_offset * inter ..][0..count * inter],
-                );
-            }
-
-            // LoRA down: u = intermediate @ down_lora_A^T, then down_input += scale * u @ down_lora_B^T
-            if (self.lora_rank > 0 and self.down_lora_a != null and self.down_lora_b != null) {
-                const down_lora_a_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.down_lora_a)));
-                const down_lora_b_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.down_lora_b)));
-                const down_lora_a_offset = e * self.lora_rank * inter;
-                const down_lora_b_offset = e * self.lora_rank * hidden;
-
-                // u_down = intermediate @ down_lora_A^T
-                var u_down = std.heap.page_allocator.alloc(f32, count * self.lora_rank) catch @panic("OOM");
-                defer std.heap.page_allocator.free(u_down);
-                lora.loraBf16MatmulT4r4(
-                    gate_output.ptr,
-                    down_lora_a_ptr + down_lora_a_offset,
-                    u_down.ptr,
-                    count,
-                    inter,
-                    self.lora_rank,
-                );
-
-                // Save down_lora_u to cache (for backward's grad_down_lora_b)
-                if (save_for_backward) {
-                    @memcpy(
-                        u_down[0..count * self.lora_rank],
-                        cache_down_lora_u[token_offset * self.lora_rank ..][0..count * self.lora_rank],
+                    // u_up = input @ up_lora_A^T
+                    var u_up = std.heap.page_allocator.alloc(f32, count * self.lora_rank) catch @panic("OOM");
+                    defer std.heap.page_allocator.free(u_up);
+                    lora.loraBf16MatmulT4r4(
+                        expert_input.ptr,
+                        up_lora_a_ptr + up_lora_a_offset,
+                        u_up.ptr,
+                        count,
+                        hidden,
+                        self.lora_rank,
+                    );
+                    // up_output += scale * u_up @ up_lora_B^T
+                    lora.loraFp32Bf16FusedAddTransposed(
+                        u_up.ptr,
+                        up_lora_b_ptr + up_lora_b_offset,
+                        up_output.ptr,
+                        count,
+                        self.lora_rank,
+                        inter,
+                        self.lora_scaling,
                     );
                 }
 
-                // down_input += scale * u_down @ down_lora_B^T
-                // (accumulated into gate_output which feeds forwardDown)
-                lora.loraFp32Bf16FusedAddTransposed(
-                    u_down.ptr,
-                    down_lora_b_ptr + down_lora_b_offset,
-                    gate_output.ptr,
-                    count,
-                    self.lora_rank,
-                    hidden,
-                    self.lora_scaling,
-                );
-            }
+                // Save gate/up to cache (after LoRA, before activation)
+                if (save_for_backward) {
+                    @memcpy(
+                        gate_output[0..count * inter],
+                        cache_gate[token_offset * inter ..][0..count * inter],
+                    );
+                    @memcpy(
+                        up_output[0..count * inter],
+                        cache_up[token_offset * inter ..][0..count * inter],
+                    );
+                }
 
-            // Down projection
-            var expert_down_out = std.heap.page_allocator.alloc(bf16, count * hidden) catch @panic("OOM");
-            defer std.heap.page_allocator.free(expert_down_out);
-            @memset(expert_down_out, 0);
-            self.moe.forwardDown(e, count, gate_output.ptr, expert_down_out.ptr);
+                // SwiGLU activation: silu(gate) * up, in-place into gate_output
+                for (0..count * inter) |idx| {
+                    const g = amx.bf16_to_f32(gate_output[idx]);
+                    const u = amx.bf16_to_f32(up_output[idx]);
+                    gate_output[idx] = amx.f32_to_bf16(amx.swiglu(g, u));
+                }
 
-            // Save down_output to cache
-            if (save_for_backward) {
-                @memcpy(
-                    expert_down_out[0..count * hidden],
-                    cache_down[token_offset * hidden ..][0..count * hidden],
-                );
-            }
+                // Save intermediate (post-activation) to cache
+                if (save_for_backward) {
+                    @memcpy(
+                        gate_output[0..count * inter],
+                        cache_inter[token_offset * inter ..][0..count * inter],
+                    );
+                }
 
-            // Accumulate weighted output
-            token_idx = 0;
-            for (0..qlen) |i| {
-                for (0..k) |j| {
-                    const eid = expert_ids[i * k + j];
-                    if (eid == @as(i64, @intCast(e))) {
-                        const w = weights[i * k + j];
-                        for (0..hidden) |h| {
-                            const val = amx.bf16_to_f32(expert_down_out[token_idx * hidden + h]);
-                            output_f32[i * hidden + h] += val * w;
+                // LoRA down: u = intermediate @ down_lora_A^T, then down_input += scale * u @ down_lora_B^T
+                if (self.lora_rank > 0 and self.down_lora_a != null and self.down_lora_b != null) {
+                    const down_lora_a_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.down_lora_a)));
+                    const down_lora_b_ptr = @as([*]const bf16, @ptrCast(@alignCast(self.down_lora_b)));
+                    const down_lora_a_offset = e * self.lora_rank * inter;
+                    const down_lora_b_offset = e * self.lora_rank * hidden;
+
+                    // u_down = intermediate @ down_lora_A^T
+                    var u_down = std.heap.page_allocator.alloc(f32, count * self.lora_rank) catch @panic("OOM");
+                    defer std.heap.page_allocator.free(u_down);
+                    lora.loraBf16MatmulT4r4(
+                        gate_output.ptr,
+                        down_lora_a_ptr + down_lora_a_offset,
+                        u_down.ptr,
+                        count,
+                        inter,
+                        self.lora_rank,
+                    );
+
+                    // Save down_lora_u to cache (for backward's grad_down_lora_b)
+                    if (save_for_backward) {
+                        @memcpy(
+                            u_down[0..count * self.lora_rank],
+                            cache_down_lora_u[token_offset * self.lora_rank ..][0..count * self.lora_rank],
+                        );
+                    }
+
+                    // down_input += scale * u_down @ down_lora_B^T
+                    // (accumulated into gate_output which feeds forwardDown)
+                    lora.loraFp32Bf16FusedAddTransposed(
+                        u_down.ptr,
+                        down_lora_b_ptr + down_lora_b_offset,
+                        gate_output.ptr,
+                        count,
+                        self.lora_rank,
+                        hidden,
+                        self.lora_scaling,
+                    );
+                }
+
+                // Down projection
+                var expert_down_out = std.heap.page_allocator.alloc(bf16, count * hidden) catch @panic("OOM");
+                defer std.heap.page_allocator.free(expert_down_out);
+                @memset(expert_down_out, 0);
+                self.moe.forwardDown(e, count, gate_output.ptr, expert_down_out.ptr);
+
+                // Save down_output to cache
+                if (save_for_backward) {
+                    @memcpy(
+                        expert_down_out[0..count * hidden],
+                        cache_down[token_offset * hidden ..][0..count * hidden],
+                    );
+                }
+
+                // Accumulate weighted output
+                token_idx = 0;
+                for (0..qlen) |i| {
+                    for (0..k) |j| {
+                        const eid = expert_ids[i * k + j];
+                        if (eid == @as(i64, @intCast(e))) {
+                            const w = weights[i * k + j];
+                            for (0..hidden) |h| {
+                                const val = amx.bf16_to_f32(expert_down_out[token_idx * hidden + h]);
+                                output_f32[i * hidden + h] += val * w;
+                            }
+                            token_idx += 1;
                         }
-                        token_idx += 1;
                     }
                 }
-            }
 
-            token_offset += count;
+                token_offset += count;
+            }
         }
 
         // Convert FP32 output to BF16
@@ -420,6 +531,71 @@ pub const TpMoeSft = struct {
             self.grad_inter = allocator.alloc(f32, needed) catch @panic("OOM");
             self.grad_up_scratch = allocator.alloc(f32, needed) catch @panic("OOM");
             self.buffer_len = needed;
+        }
+    }
+
+    pub fn forwardParallelSft(
+        self: *TpMoeSft,
+        expert_num: usize,
+        qlen: usize,
+        k: i32,
+        expert_tokens: []usize,
+        routing_ids: []const i64,
+        routing_weights: []const f32,
+        input: [*]const amx.bf16,
+        output_f32: [*]f32,
+        hidden: usize,
+        inter: usize,
+        save_fb: bool,
+        cache_gate: ?[]bf16,
+        cache_up: ?[]bf16,
+        cache_inter: ?[]bf16,
+        cache_down: ?[]bf16,
+        cache_down_lora_u: ?[]f32,
+        pool: *worker_pool.WorkerPool,
+    ) void {
+        const subpool = pool.subpools[0];
+        const allocator = std.heap.page_allocator;
+        var offsets = allocator.alloc(usize, expert_num) catch @panic("OOM");
+        defer allocator.free(offsets);
+        var running: usize = 0;
+        for (0..expert_num) |e| { offsets[e] = running; running += expert_tokens[e]; }
+        var input_bufs = allocator.alloc([]amx.bf16, expert_num) catch @panic("OOM");
+        defer { for (input_bufs) |slab| allocator.free(slab); allocator.free(input_bufs); }
+        var scratch_bufs = allocator.alloc([]amx.bf16, expert_num) catch @panic("OOM");
+        defer { for (scratch_bufs) |slab| allocator.free(slab); allocator.free(scratch_bufs); }
+        for (0..expert_num) |e| {
+            const count = expert_tokens[e];
+            if (count == 0) { input_bufs[e] = &[_]amx.bf16{}; scratch_bufs[e] = &[_]amx.bf16{}; }
+            else { input_bufs[e] = allocator.alloc(amx.bf16, count * hidden) catch @panic("OOM");
+                scratch_bufs[e] = allocator.alloc(amx.bf16, count * hidden) catch @panic("OOM"); }
+        }
+        // save_fb gates whether the caller allocated caches; when false they
+        // are all null and the task skips cache writes.
+        _ = save_fb;
+        g_parallel = MoeParallelCtx{
+            .self = self, .input = input, .qlen = qlen, .k = @as(usize, @intCast(k)),
+            .hidden = hidden, .inter = inter, .expert_num = expert_num,
+            .expert_input_bufs = input_bufs, .expert_token_counts = expert_tokens,
+            .expert_scratch_bufs = scratch_bufs, .expert_token_offset = offsets,
+            .cache_gate = cache_gate, .cache_up = cache_up, .cache_inter = cache_inter,
+            .cache_down = cache_down, .cache_down_lora_u = cache_down_lora_u,
+            .routing_ids = routing_ids, .routing_weights = routing_weights, .output_f32 = output_f32,
+        };
+        defer g_parallel = null;
+        subpool.doWorkStealingJob(expert_num, &parallelSftTask);
+        for (0..expert_num) |e| {
+            const count = expert_tokens[e]; if (count == 0) continue;
+            const scratch = scratch_bufs[e];
+            var slot: usize = 0;
+            for (0..qlen) |i| { for (0..@as(usize, @intCast(k))) |j| {
+                const ridx = i * @as(usize, @intCast(k)) + j;
+                if (routing_ids[ridx] == @as(i64, @intCast(e))) {
+                    const w = routing_weights[ridx];
+                    for (0..hidden) |h| output_f32[i * hidden + h] += amx.bf16_to_f32(scratch[slot * hidden + h]) * w;
+                    slot += 1;
+                }
+            } }
         }
     }
 
