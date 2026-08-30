@@ -16,6 +16,7 @@ const cpu_detect = root.cpu_detect;
 const worker_pool = root.worker_pool;
 const memory = root.memory;
 const moe = root.moe;
+const moe_sft = root.moe_sft;
 const mla_config = root.mla_config;
 const mla_cache = root.mla_cache;
 const mla_core = root.mla_core;
@@ -145,6 +146,148 @@ test "getCpuCountPerNuma parses /proc/cpuinfo" {
     var total: usize = 0;
     for (counts) |c| total += c;
     try testing.expect(total >= 1);
+}
+
+test "SFT forward+backward smoke test" {
+    // Verifies TpMoeSft.forward_sft + backward run without crashing and
+    // produce finite gradients. Small dims: hidden=4, inter=4, rank=2, 2 experts.
+    const allocator = testing.allocator;
+
+    const hidden: usize = 4;
+    const inter: usize = 4;
+    const rank: usize = 2;
+    const expert_num: usize = 2;
+    const k: usize = 1;
+    const qlen: usize = 2;
+
+    var pool = try worker_pool.WorkerPool.initSimple(allocator, 1);
+    defer pool.deinit();
+
+    // Allocate weights
+    const gate_w = try allocator.alloc(amx.bf16, inter * hidden);
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(amx.bf16, inter * hidden);
+    defer allocator.free(up_w);
+    const down_w = try allocator.alloc(amx.bf16, hidden * inter);
+    defer allocator.free(down_w);
+    for (0..inter * hidden) |i| {
+        gate_w[i] = amx.f32_to_bf16(0.1);
+        up_w[i] = amx.f32_to_bf16(0.1);
+    }
+    for (0..hidden * inter) |i| {
+        down_w[i] = amx.f32_to_bf16(0.1);
+    }
+
+    // LoRA weights: gate_lora_a [rank, hidden], gate_lora_b [rank, inter], etc.
+    const gate_lora_a = try allocator.alloc(amx.bf16, rank * hidden);
+    defer allocator.free(gate_lora_a);
+    const gate_lora_b = try allocator.alloc(amx.bf16, rank * inter);
+    defer allocator.free(gate_lora_b);
+    const up_lora_a = try allocator.alloc(amx.bf16, rank * hidden);
+    defer allocator.free(up_lora_a);
+    const up_lora_b = try allocator.alloc(amx.bf16, rank * inter);
+    defer allocator.free(up_lora_b);
+    const down_lora_a = try allocator.alloc(amx.bf16, rank * inter);
+    defer allocator.free(down_lora_a);
+    const down_lora_b = try allocator.alloc(amx.bf16, rank * hidden);
+    defer allocator.free(down_lora_b);
+    for (0..rank * hidden) |i| {
+        gate_lora_a[i] = amx.f32_to_bf16(0.05);
+        up_lora_a[i] = amx.f32_to_bf16(0.05);
+    }
+    for (0..rank * inter) |i| {
+        gate_lora_b[i] = amx.f32_to_bf16(0.05);
+        up_lora_b[i] = amx.f32_to_bf16(0.05);
+        down_lora_a[i] = amx.f32_to_bf16(0.05);
+    }
+    for (0..rank * hidden) |i| {
+        down_lora_b[i] = amx.f32_to_bf16(0.05);
+    }
+
+    const base_config = moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = @intCast(k),
+        .hidden_size = @intCast(hidden),
+        .intermediate_size = @intCast(inter),
+        .max_len = @intCast(qlen),
+        .pool = &pool,
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    };
+
+    var sft = try moe_sft.TpMoeSft.init(base_config, allocator);
+    defer sft.deinit();
+    sft.lora_rank = rank;
+    sft.lora_alpha = 1.0;
+    sft.lora_scaling = 1.0 / @as(f32, @floatFromInt(rank));
+    sft.gate_lora_a = gate_lora_a.ptr;
+    sft.gate_lora_b = gate_lora_b.ptr;
+    sft.up_lora_a = up_lora_a.ptr;
+    sft.up_lora_b = up_lora_b.ptr;
+    sft.down_lora_a = down_lora_a.ptr;
+    sft.down_lora_b = down_lora_b.ptr;
+
+    // Input
+    const input = try allocator.alloc(amx.bf16, qlen * hidden);
+    defer allocator.free(input);
+    for (0..qlen * hidden) |i| input[i] = amx.f32_to_bf16(0.5);
+
+    // Expert routing: token 0 -> expert 0, token 1 -> expert 1
+    const expert_ids = [_]i64{ 0, 1 };
+    const routing_weights = [_]f32{ 1.0, 1.0 };
+
+    // Forward with backward cache
+    const output = try allocator.alloc(amx.bf16, qlen * hidden);
+    defer allocator.free(output);
+    @memset(output, 0);
+    sft.forward_sft(qlen, k, &expert_ids, &routing_weights, input.ptr, output.ptr, true);
+
+    // Backward buffers
+    const grad_output = try allocator.alloc(f32, qlen * hidden);
+    defer allocator.free(grad_output);
+    for (0..qlen * hidden) |i| grad_output[i] = 1.0;
+    const grad_input = try allocator.alloc(f32, qlen * hidden);
+    defer allocator.free(grad_input);
+    const grad_gate_lora_a = try allocator.alloc(f32, expert_num * rank * hidden);
+    defer allocator.free(grad_gate_lora_a);
+    const grad_gate_lora_b = try allocator.alloc(f32, expert_num * rank * inter);
+    defer allocator.free(grad_gate_lora_b);
+    const grad_up_lora_a = try allocator.alloc(f32, expert_num * rank * hidden);
+    defer allocator.free(grad_up_lora_a);
+    const grad_up_lora_b = try allocator.alloc(f32, expert_num * rank * inter);
+    defer allocator.free(grad_up_lora_b);
+    const grad_down_lora_a = try allocator.alloc(f32, expert_num * rank * inter);
+    defer allocator.free(grad_down_lora_a);
+    const grad_down_lora_b = try allocator.alloc(f32, expert_num * rank * hidden);
+    defer allocator.free(grad_down_lora_b);
+    const grad_weights = try allocator.alloc(f32, qlen * k);
+    defer allocator.free(grad_weights);
+
+    sft.backward(
+        grad_output.ptr,
+        grad_input.ptr,
+        grad_gate_lora_a.ptr,
+        grad_gate_lora_b.ptr,
+        grad_up_lora_a.ptr,
+        grad_up_lora_b.ptr,
+        grad_down_lora_a.ptr,
+        grad_down_lora_b.ptr,
+        grad_weights.ptr,
+        null, null, null,
+        false, 1.0,
+    );
+
+    // Verify gradients are finite (not NaN/inf)
+    var max_abs: f32 = 0;
+    for (0..qlen * hidden) |i| {
+        const v = @abs(grad_input[i]);
+        try testing.expect(!std.math.isNan(v));
+        try testing.expect(std.math.isFinite(v));
+        if (v > max_abs) max_abs = v;
+    }
+    // With non-zero weights and grad_output=1.0, gradients should be non-zero
+    try testing.expect(max_abs > 0.0);
 }
 
 test "Memory arena allocation" {

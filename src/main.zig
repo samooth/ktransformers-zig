@@ -514,10 +514,55 @@ export fn kt_moe_update_lora_weights(
     m.update_lora_weights(gate_lora_a, gate_lora_b, up_lora_a, up_lora_b, down_lora_a, down_lora_b);
 }
 
+export fn kt_moe_backward(
+    moe_ptr: *KT_MOE,
+    grad_output: [*]const f32,
+    grad_input: [*]f32,
+    grad_gate_lora_a: [*]f32,
+    grad_gate_lora_b: [*]f32,
+    grad_up_lora_a: [*]f32,
+    grad_up_lora_b: [*]f32,
+    grad_down_lora_a: [*]f32,
+    grad_down_lora_b: [*]f32,
+    grad_weights: [*]f32,
+    grad_gate_proj: ?*anyopaque,
+    grad_up_proj: ?*anyopaque,
+    grad_down_proj: ?*anyopaque,
+    accumulate_optimizer_grads: c_int,
+    optimizer_grad_scale: f32,
+) void {
+    const m: *moe_sft.TpMoeSft = @ptrCast(@alignCast(moe_ptr));
+    m.backward(
+        grad_output,
+        grad_input,
+        grad_gate_lora_a,
+        grad_gate_lora_b,
+        grad_up_lora_a,
+        grad_up_lora_b,
+        grad_down_lora_a,
+        grad_down_lora_b,
+        grad_weights,
+        if (grad_gate_proj) |p| @as(?[*]f32, @alignCast(@ptrCast(p))) else null,
+        if (grad_up_proj) |p| @as(?[*]f32, @alignCast(@ptrCast(p))) else null,
+        if (grad_down_proj) |p| @as(?[*]f32, @alignCast(@ptrCast(p))) else null,
+        accumulate_optimizer_grads != 0,
+        optimizer_grad_scale,
+    );
+}
+
 export fn kt_moe_free(moe_ptr: *KT_MOE) void {
     const m: *moe.TpMoe = @ptrCast(@alignCast(moe_ptr));
-    m.deinit();
-    std.heap.page_allocator.destroy(m);
+    switch (m.kind) {
+        .inference => {
+            m.deinit();
+            std.heap.page_allocator.destroy(m);
+        },
+        .sft => {
+            const sft: *moe_sft.TpMoeSft = @ptrCast(@alignCast(moe_ptr));
+            sft.deinit();
+            std.heap.page_allocator.destroy(sft);
+        },
+    }
 }
 
 export fn kt_moe_warm_up(moe_ptr: *KT_MOE) void {

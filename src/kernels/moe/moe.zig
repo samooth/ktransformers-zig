@@ -242,6 +242,10 @@ pub const TpMoe = struct {
     tp_count: usize,
     experts: []ExpertData,
     weights_loaded: bool = false,
+    kind: MoeKind = .inference,
+    allocator: std.mem.Allocator,
+
+    pub const MoeKind = enum { inference, sft };
 
     pub const ExpertData = struct {
         // Packed weight buffers
@@ -351,6 +355,7 @@ pub const TpMoe = struct {
             .tp_configs = tp_configs,
             .tp_count = tp_count,
             .experts = experts,
+            .allocator = allocator,
         };
     }
 
@@ -573,12 +578,13 @@ pub const TpMoe = struct {
         // allocator init received. The only caller is the C API wrapper
         // (kt_moe_free in main.zig), which passes std.heap.page_allocator to
         // both create() and TpMoe.init() — therefore page_allocator here.
-        const allocator = std.heap.page_allocator;
-        freeBf16Storage(allocator);
-        allocator.free(self.experts);
-        allocator.free(self.tp_configs);
-        self.* = undefined;
-    }
+    const allocator = self.allocator;
+    // BF16 storage is module-level global state — always allocated/freed with page_allocator.
+    freeBf16Storage(std.heap.page_allocator);
+    allocator.free(self.experts);
+    allocator.free(self.tp_configs);
+    self.* = undefined;
+}
 
     pub fn warmUp(self: *TpMoe) void {
         // Pre-touch weight pages to avoid first-forward page faults.

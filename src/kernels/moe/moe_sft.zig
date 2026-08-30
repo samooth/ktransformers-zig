@@ -52,8 +52,14 @@ pub const TpMoeSft = struct {
     down_lora_b: ?*anyopaque,
     forward_cache: ForwardCache,
 
+    // Backward scratch buffers (lazily allocated by prepare_bwd).
+    grad_inter: []f32 = &[_]f32{},
+    grad_up_scratch: []f32 = &[_]f32{},
+    buffer_len: usize = 0,
+
     pub fn init(base_config: moe.MoeConfig, allocator: std.mem.Allocator) !TpMoeSft {
-        const moe_inst = try moe.TpMoe.init(base_config, allocator);
+        var moe_inst = try moe.TpMoe.init(base_config, allocator);
+        moe_inst.kind = .sft;
         return TpMoeSft{
             .moe = moe_inst,
             .lora_rank = 0,
@@ -71,6 +77,11 @@ pub const TpMoeSft = struct {
     }
 
     pub fn deinit(self: *TpMoeSft) void {
+        if (self.buffer_len > 0) {
+            const allocator = std.heap.page_allocator;
+            allocator.free(self.grad_inter);
+            allocator.free(self.grad_up_scratch);
+        }
         self.moe.deinit();
     }
 
@@ -84,6 +95,11 @@ pub const TpMoeSft = struct {
         output: [*]bf16,
         save_for_backward: bool,
     ) void {
+        // Load base weights into expert buffers before computing. forward_sft is
+        // the entry point (weights arrive via config), so it must load them —
+        // the downstream moe.forwardGateUp/forwardDown read self.experts[].*_bf16.
+        self.moe.loadWeights();
+
         const cfg = self.moe.config;
         const expert_num = @as(usize, @intCast(cfg.expert_num));
         const hidden = @as(usize, @intCast(cfg.hidden_size));
@@ -391,6 +407,189 @@ pub const TpMoeSft = struct {
     }
 
     pub fn prepare_bwd(self: *TpMoeSft) void {
-        _ = self;
+        const cfg = self.moe.config;
+        const max_tokens = @as(usize, @intCast(cfg.max_len)) * @as(usize, @intCast(cfg.num_experts_per_tok));
+        const inter = @as(usize, @intCast(cfg.intermediate_size));
+        const needed = max_tokens * inter;
+        if (needed > self.buffer_len) {
+            const allocator = std.heap.page_allocator;
+            if (self.buffer_len > 0) {
+                allocator.free(self.grad_inter);
+                allocator.free(self.grad_up_scratch);
+            }
+            self.grad_inter = allocator.alloc(f32, needed) catch @panic("OOM");
+            self.grad_up_scratch = allocator.alloc(f32, needed) catch @panic("OOM");
+            self.buffer_len = needed;
+        }
+    }
+
+    pub fn backward(
+        self: *TpMoeSft,
+        grad_output: [*]const f32,
+        grad_input: [*]f32,
+        grad_gate_lora_a: [*]f32,
+        grad_gate_lora_b: [*]f32,
+        grad_up_lora_a: [*]f32,
+        grad_up_lora_b: [*]f32,
+        grad_down_lora_a: [*]f32,
+        grad_down_lora_b: [*]f32,
+        grad_weights: [*]f32,
+        grad_gate_proj: ?[*]f32,
+        grad_up_proj: ?[*]f32,
+        grad_down_proj: ?[*]f32,
+        full_weight_grad: bool,
+        optimizer_grad_scale: f32,
+    ) void {
+        const cache = self.forward_cache;
+        const cfg = self.moe.config;
+        const hidden = @as(usize, @intCast(cfg.hidden_size));
+        const inter = @as(usize, @intCast(cfg.intermediate_size));
+        const rank = self.lora_rank;
+        const scale = self.lora_scaling;
+
+        self.prepare_bwd();
+        const grad_inter = self.grad_inter;
+        const grad_up_scratch = self.grad_up_scratch;
+        @memset(grad_inter, 0);
+        @memset(grad_up_scratch, 0);
+        var z: usize = 0;
+        const gin_len = cache.qlen * hidden;
+        while (z < gin_len) : (z += 1) grad_input[z] = 0;
+        if (rank > 0) {
+            const gw_len = cache.qlen * cache.k;
+            const per_hidden = @as(usize, @intCast(cfg.expert_num)) * rank * hidden;
+            const per_inter = @as(usize, @intCast(cfg.expert_num)) * rank * inter;
+            var w: usize = 0;
+            while (w < gw_len) : (w += 1) grad_weights[w] = 0;
+            @memset(grad_gate_lora_a[0..per_hidden], 0);
+            @memset(grad_gate_lora_b[0..per_inter], 0);
+            @memset(grad_up_lora_a[0..per_hidden], 0);
+            @memset(grad_up_lora_b[0..per_inter], 0);
+            @memset(grad_down_lora_a[0..per_inter], 0);
+            @memset(grad_down_lora_b[0..per_hidden], 0);
+        }
+
+        const expert_num: usize = @intCast(cfg.expert_num);
+
+        // Inverse routing, computed without ArrayList to keep deps simple.
+        // First pass: count tokens per expert (counts[expert]).
+        var counts: [256]usize = undefined; // bounded by expert_num <= 256 for SFT test
+        @memset(&counts, 0);
+        var inv: [256][256]struct { global_tok: usize, ki: usize, weight: f32 } = undefined;
+        var inv_len: [256]usize = undefined;
+        @memset(&inv_len, 0);
+        for (0..cache.qlen) |qi| {
+            for (0..cache.k) |ki| {
+                const eid = cache.expert_ids[qi * cache.k + ki];
+                if (eid < 0 or eid >= cfg.expert_num) continue;
+                const e: usize = @intCast(eid);
+                const slot = inv_len[e];
+                inv[e][slot] = .{ .global_tok = qi, .ki = ki, .weight = cache.weights[qi * cache.k + ki] };
+                inv_len[e] += 1;
+            }
+        }
+
+        // Step 1 — backward_down: project grad_output through down_proj^T to
+        // get grad_intermediate. Accumulate LoRA-down grads and routing-weight
+        // grads. Uses inv[e][s] (s = local token index within expert e).
+        // ------------------------------------------------------------------
+        for (0..expert_num) |e| {
+            if (inv_len[e] == 0) continue;
+            const down_w = @as([*]const bf16, @ptrCast(@alignCast(self.moe.config.down_proj))) + e * hidden * inter;
+            for (0..inv_len[e]) |s| {
+                const rt = inv[e][s];
+                const go_base = rt.global_tok * hidden;
+                const gi_base = s * inter;
+                var ii: usize = 0;
+                while (ii < inter) : (ii += 1) {
+                    var sum: f32 = 0;
+                    var h: usize = 0;
+                    while (h < hidden) : (h += 1) { sum += grad_output[go_base + h] * amx.bf16_to_f32(down_w[h * inter + ii]); }
+                    grad_inter[gi_base + ii] += sum;
+                }
+                var h: usize = 0;
+                while (h < hidden) : (h += 1) {
+                    const eo = amx.bf16_to_f32(cache.down_output[s * hidden + h]);
+                    grad_weights[rt.global_tok * cache.k + 0] += eo * grad_output[go_base + h];
+                }
+                // Base-weight down-proj grad (optional).
+                if (full_weight_grad) {
+                    if (grad_down_proj) |gdp| {
+                        var i: usize = 0;
+                        while (i < inter) : (i += 1) {
+                            const inter_val = amx.bf16_to_f32(cache.intermediate[gi_base + i]);
+                            var hh: usize = 0;
+                            while (hh < hidden) : (hh += 1) {
+                                gdp[e * hidden * inter + hh * inter + i] += optimizer_grad_scale * inter_val * grad_output[go_base + hh];
+                            }
+                        }
+                    }
+                }
+                if (rank > 0) {
+                    const u_base = s * rank;
+                    var r: usize = 0;
+                    while (r < rank) : (r += 1) {
+                        const u_val = cache.down_lora_u[u_base + r];
+                        var hh: usize = 0;
+                        while (hh < hidden) : (hh += 1) { grad_down_lora_b[r * hidden + hh] += scale * u_val * grad_output[go_base + hh]; }
+                    }
+                    var r2: usize = 0;
+                    while (r2 < rank) : (r2 += 1) {
+                        const u_val = cache.down_lora_u[u_base + r2];
+                        var ii2: usize = 0;
+                        while (ii2 < inter) : (ii2 += 1) { grad_down_lora_a[r2 * inter + ii2] += scale * amx.bf16_to_f32(cache.intermediate[gi_base + ii2]) * u_val; }
+                    }
+                }
+            }
+        }
+
+        // Step 2 — backward_activation (SwiGLU).
+        {
+            var idx: usize = 0;
+            const total = cache.intermediate.len;
+            while (idx < total) : (idx += 1) {
+                const g = grad_inter[idx];
+                const gate_val = amx.bf16_to_f32(cache.gate_output[idx]);
+                const s = gate_val / (1.0 + @exp(-gate_val));
+                const ds = s * (1.0 + gate_val * (1.0 - s));
+                grad_inter[idx] = g * ds;
+                grad_up_scratch[idx] = g * s;
+            }
+        }
+
+        // Step 3 — backward_gate_up.
+        for (0..expert_num) |e| {
+            if (inv_len[e] == 0) continue;
+            const gate_w = @as([*]const bf16, @ptrCast(@alignCast(self.moe.config.gate_proj))) + e * inter * hidden;
+            const up_w = @as([*]const bf16, @ptrCast(@alignCast(self.moe.config.up_proj))) + e * inter * hidden;
+            for (0..inv_len[e]) |s| {
+                const rt = inv[e][s];
+                const gi_base = s * inter;
+                const input_base = rt.global_tok * hidden;
+                var h: usize = 0;
+                while (h < hidden) : (h += 1) {
+                    var sum: f32 = 0;
+                    var ii: usize = 0;
+                    while (ii < inter) : (ii += 1) { sum += grad_inter[gi_base + ii] * amx.bf16_to_f32(gate_w[ii * hidden + h]) + grad_up_scratch[gi_base + ii] * amx.bf16_to_f32(up_w[ii * hidden + h]); }
+                    grad_input[input_base + h] += sum;
+                }
+                if (full_weight_grad) {
+                    if (grad_gate_proj) |ggp| {
+                        var ii: usize = 0;
+                        while (ii < inter) : (ii += 1) {
+                            var h2: usize = 0;
+                            while (h2 < hidden) : (h2 += 1) { ggp[e * inter * hidden + ii * hidden + h2] += optimizer_grad_scale * grad_inter[gi_base + ii] * amx.bf16_to_f32(cache.input[input_base + h2]); }
+                        }
+                    }
+                    if (grad_up_proj) |gup| {
+                        var ii: usize = 0;
+                        while (ii < inter) : (ii += 1) {
+                            var h2: usize = 0;
+                            while (h2 < hidden) : (h2 += 1) { gup[e * inter * hidden + ii * hidden + h2] += optimizer_grad_scale * grad_up_scratch[gi_base + ii] * amx.bf16_to_f32(cache.input[input_base + h2]); }
+                        }
+                    }
+                }
+            }
+        }
     }
 };
