@@ -358,6 +358,15 @@ void kt_moe_load_weights_with_map(KT_MOE* moe, uint64_t* physical_to_logical_map
 void kt_moe_forward(KT_MOE* moe, int qlen, int k, const int64_t* expert_ids,
                      const float* weights, const void* input, void* output, int incremental);
 
+/// Backward (SFT/LoRA training). Computes grad_input, 6 LoRA grads (gate/up/down x A/B),
+/// optional base-weight grads (grad_gate/up/down_proj), and routing-weight grads.
+/// Matches C++ backward_binding at moe-sft-tp.hpp:1249.
+void kt_moe_backward(KT_MOE* moe, const void* grad_output, void* grad_input,
+                     void* grad_gate_lora_a, void* grad_gate_lora_b, void* grad_up_lora_a, void* grad_up_lora_b,
+                     void* grad_down_lora_a, void* grad_down_lora_b, void* grad_weights,
+                     void* grad_gate_proj, void* grad_up_proj, void* grad_down_proj,
+                     int accumulate_optimizer_grads, float optimizer_grad_scale);
+
 /// Get CPU variant string
 const char* kt_get_cpu_variant();
 

@@ -125,7 +125,7 @@ Last updated: 2026-08-30
 | MoE Orchestration | Forward path complete (gate+up+SwiGLU+down+routing); Gate C API wired; weight_ld OOB fixed | 95% |
 | C API | MLA + MoE + Gate + Linear + MLP complete; kt_get_cpu_variant fixed; FP8/Backward still placeholder | 85% |
 | Build System | Multi-variant (6 variants, distinct .so names) | 85% |
-| Tests | 26/27 kernels + 11 MLA pass; 1 known-failing test (vectorized SwiGLU tolerance — Dev B) | 95% |
+| Tests | 28/28 kernels + 11 MLA pass, 0 leaks, zig build test exits 0 | 100% |
 | Python Integration | Minimal ctypes wrapper working | 15% |
 
 ---
