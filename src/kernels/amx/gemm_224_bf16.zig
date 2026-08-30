@@ -204,28 +204,105 @@ pub const GemmKernel224BF = struct {
 
     /// Apply SwiGLU activation to gate and up outputs
     /// gate, up: [m, n] BF16, dst: [m, n] BF16
+    ///
+    /// Vectorized over `n` with `amx.VecF32` (8×f32 / 256-bit, matches AVX2 on
+    /// the host). Three variants (OAI / clamp / standard) are chosen once
+    /// outside the loops so the hot path has no per-element branching. The
+    /// tail (`n % VecF32.len`) is handled with a scalar loop.
     pub fn applySwiGLU(
         gate: [*]dt, up: [*]dt, dst: [*]dt,
         m: usize, n: usize,
         limit: f32, alpha: f32
     ) void {
-        for (0..m) |i| {
-            for (0..n) |j| {
-                const gate_val = amx.bf16_to_f32(gate[i * n + j]);
-                const up_val = amx.bf16_to_f32(up[i * n + j]);
+        const VEC_LEN: usize = amx.VEC_LEN;
+        const main_end: usize = n - (n % VEC_LEN);
 
-                var result: f32 = 0;
-                if (alpha > 0) {
-                    // SwiGLU-OAI
-                    result = amx.swiglu_oai(gate_val, up_val, alpha, limit);
-                } else if (limit > 0) {
-                    // SwiGLU with clamp
-                    result = amx.swiglu_clamp(gate_val, up_val, limit);
-                } else {
-                    // Standard SwiGLU
-                    result = amx.swiglu(gate_val, up_val);
+        if (alpha > 0) {
+            // SwiGLU-OAI (MiniMax M3)
+            const alpha_vec: amx.VecF32 = @splat(alpha);
+            const limit_vec: amx.VecF32 = @splat(limit);
+            for (0..m) |i| {
+                const gate_row: [*]dt = gate + i * n;
+                const up_row: [*]dt = up + i * n;
+                const dst_row: [*]dt = dst + i * n;
+                var j: usize = 0;
+                while (j < main_end) : (j += VEC_LEN) {
+                    var g_arr: [VEC_LEN]f32 = undefined;
+                    var u_arr: [VEC_LEN]f32 = undefined;
+                    for (0..VEC_LEN) |k| {
+                        g_arr[k] = amx.bf16_to_f32(gate_row[j + k]);
+                        u_arr[k] = amx.bf16_to_f32(up_row[j + k]);
+                    }
+                    const gv: amx.VecF32 = g_arr;
+                    const uv: amx.VecF32 = u_arr;
+                    const res: amx.VecF32 = amx.swigluOaiVec(gv, uv, alpha_vec, limit_vec);
+                    const res_arr: [VEC_LEN]f32 = res;
+                    for (0..VEC_LEN) |k| {
+                        dst_row[j + k] = amx.f32_to_bf16(res_arr[k]);
+                    }
                 }
-                dst[i * n + j] = amx.f32_to_bf16(result);
+                while (j < n) : (j += 1) {
+                    const g = amx.bf16_to_f32(gate_row[j]);
+                    const u = amx.bf16_to_f32(up_row[j]);
+                    dst_row[j] = amx.f32_to_bf16(amx.swiglu_oai(g, u, alpha, limit));
+                }
+            }
+        } else if (limit > 0) {
+            // SwiGLU with clamp (MXFP4 path)
+            const limit_vec: amx.VecF32 = @splat(limit);
+            for (0..m) |i| {
+                const gate_row: [*]dt = gate + i * n;
+                const up_row: [*]dt = up + i * n;
+                const dst_row: [*]dt = dst + i * n;
+                var j: usize = 0;
+                while (j < main_end) : (j += VEC_LEN) {
+                    var g_arr: [VEC_LEN]f32 = undefined;
+                    var u_arr: [VEC_LEN]f32 = undefined;
+                    for (0..VEC_LEN) |k| {
+                        g_arr[k] = amx.bf16_to_f32(gate_row[j + k]);
+                        u_arr[k] = amx.bf16_to_f32(up_row[j + k]);
+                    }
+                    const gv: amx.VecF32 = g_arr;
+                    const uv: amx.VecF32 = u_arr;
+                    const res: amx.VecF32 = amx.swigluClampVec(gv, uv, limit_vec);
+                    const res_arr: [VEC_LEN]f32 = res;
+                    for (0..VEC_LEN) |k| {
+                        dst_row[j + k] = amx.f32_to_bf16(res_arr[k]);
+                    }
+                }
+                while (j < n) : (j += 1) {
+                    const g = amx.bf16_to_f32(gate_row[j]);
+                    const u = amx.bf16_to_f32(up_row[j]);
+                    dst_row[j] = amx.f32_to_bf16(amx.swiglu_clamp(g, u, limit));
+                }
+            }
+        } else {
+            // Standard SwiGLU (the common case — linear, branch-free inner loop)
+            for (0..m) |i| {
+                const gate_row: [*]dt = gate + i * n;
+                const up_row: [*]dt = up + i * n;
+                const dst_row: [*]dt = dst + i * n;
+                var j: usize = 0;
+                while (j < main_end) : (j += VEC_LEN) {
+                    var g_arr: [VEC_LEN]f32 = undefined;
+                    var u_arr: [VEC_LEN]f32 = undefined;
+                    for (0..VEC_LEN) |k| {
+                        g_arr[k] = amx.bf16_to_f32(gate_row[j + k]);
+                        u_arr[k] = amx.bf16_to_f32(up_row[j + k]);
+                    }
+                    const gv: amx.VecF32 = g_arr;
+                    const uv: amx.VecF32 = u_arr;
+                    const res: amx.VecF32 = amx.swigluVec(gv, uv);
+                    const res_arr: [VEC_LEN]f32 = res;
+                    for (0..VEC_LEN) |k| {
+                        dst_row[j + k] = amx.f32_to_bf16(res_arr[k]);
+                    }
+                }
+                while (j < n) : (j += 1) {
+                    const g = amx.bf16_to_f32(gate_row[j]);
+                    const u = amx.bf16_to_f32(up_row[j]);
+                    dst_row[j] = amx.f32_to_bf16(amx.swiglu(g, u));
+                }
             }
         }
     }

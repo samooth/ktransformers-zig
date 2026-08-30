@@ -457,3 +457,32 @@ pub fn swiglu_oai(gate_param: f32, up_param: f32, alpha: f32, limit: f32) f32 {
     }
     return gate * (1.0 / (1.0 + @exp(-gate * alpha))) * (up + 1.0);
 }
+// ============================================================================
+// Vectorized Activation Functions (std.simd)
+// ============================================================================
+
+/// 8×f32 = 256-bit, matches AVX2 on the host. Tune to 16 (512-bit) once
+/// AVX512BF16 is the only target.
+pub const VecF32 = @Vector(8, f32);
+pub const VEC_LEN: usize = 8;
+
+/// SwiGLU: silu(gate) * up, vectorized.
+pub fn swigluVec(g: VecF32, u: VecF32) VecF32 {
+    const ones: VecF32 = @splat(1.0);
+    return g / (ones + @exp(-g)) * u;
+}
+
+/// SwiGLU with asymmetric clamp, vectorized.
+pub fn swigluClampVec(g: VecF32, u: VecF32, limit: VecF32) VecF32 {
+    const gc = @min(@max(g, -limit), limit);
+    const uc = @min(@max(u, -limit), limit);
+    return swigluVec(gc, uc);
+}
+
+/// SwiGLU-OAI (MiniMax M3): gate * sigmoid(gate * alpha) * (up + 1), vectorized.
+pub fn swigluOaiVec(g: VecF32, u: VecF32, alpha: VecF32, limit: VecF32) VecF32 {
+    const ones: VecF32 = @splat(1.0);
+    const gc = @min(@max(g, -limit), limit);
+    const uc = @min(@max(u, -limit), limit);
+    return gc * (ones / (ones + @exp(-gc * alpha))) * (uc + ones);
+}
