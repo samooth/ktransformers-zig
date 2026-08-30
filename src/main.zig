@@ -203,32 +203,45 @@ pub const kt_moe_config_t = extern struct {
 
 pub const kt_gate_config_t = extern struct {
     hidden_size: usize,
-    num_experts: usize,
     num_experts_per_tok: usize,
-    dtype: kt_type_t,
-    weight_ptr: *anyopaque,
+    n_routed_experts: usize,
+    n_group: usize,
+    topk_group: usize,
+    norm_topk_prob: c_int,
+    routed_scaling_factor: f32,
+    scoring_func: [*]u8,
+    topk_method: [*]u8,
+    layer_idx: c_int,
+    pool: *KT_WorkerPool,
+    weight: *anyopaque,
+    weight_type: kt_type_t,
+    e_score_correction_bias: *anyopaque,
+    e_score_correction_bias_type: kt_type_t,
+    max_seqlen: usize,
 };
 
 pub const kt_linear_config_t = extern struct {
-    in_features: usize,
-    out_features: usize,
-    bias: bool,
-    dtype: kt_type_t,
-    weight_ptr: *anyopaque,
-    bias_ptr: ?*anyopaque,
+    hidden_size: usize, // input dim
+    intermediate_size: usize, // output dim
+    stride: c_int,
+    group_max_len: c_int,
+    proj: *anyopaque,
+    proj_type: kt_type_t,
+    hidden_type: kt_type_t,
 };
 
 pub const kt_mlp_config_t = extern struct {
     hidden_size: usize,
     intermediate_size: usize,
-    gate_proj_ptr: *anyopaque,
-    up_proj_ptr: *anyopaque,
-    down_proj_ptr: *anyopaque,
-    gate_proj_type: kt_type_t,
-    up_proj_type: kt_type_t,
-    down_proj_type: kt_type_t,
-    swiglu_limit: f32,
-    swiglu_alpha: f32,
+    stride: c_int,
+    group_max_len: c_int,
+    gate_proj: *anyopaque,
+    up_proj: *anyopaque,
+    down_proj: *anyopaque,
+    gate_type: kt_type_t,
+    up_type: kt_type_t,
+    down_type: kt_type_t,
+    hidden_type: kt_type_t,
 };
 
 pub const kt_fp8_transport_config_t = extern struct {
@@ -670,51 +683,78 @@ export fn kt_mla_update_kv_cache(
 // Gate (Expert Routing)
 // ============================================================================
 
+/// GateContext wraps the gate weight matrix. Stored on the heap so we can
+/// return a stable pointer. Allocated once in kt_gate_new, freed in kt_gate_free.
+const GateContext = struct {
+    weight: [*]const amx.bf16, // [num_experts, hidden_size] BF16
+    hidden_size: usize,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+};
+
 export fn kt_gate_new(config: kt_gate_config_t) *KT_Gate {
-    const gate: *KT_Gate = @ptrCast(std.heap.page_allocator.create(u8) catch @panic("OOM"));
-    _ = config;
-    return gate;
+    if (config.weight_type != .KT_TYPE_BF16) @panic("Gate only supports BF16 weights");
+    const ctx = std.heap.page_allocator.create(GateContext) catch @panic("OOM");
+    ctx.* = .{
+        .weight = @ptrCast(@alignCast(config.weight)),
+        .hidden_size = config.hidden_size,
+        .num_experts = config.n_routed_experts,
+        .num_experts_per_tok = config.num_experts_per_tok,
+    };
+    return @ptrCast(ctx);
 }
 
 export fn kt_gate_free(gate: *KT_Gate) void {
-    std.heap.page_allocator.destroy(@as(*u8, @ptrCast(gate)));
+    std.heap.page_allocator.destroy(@as(*GateContext, @ptrCast(@alignCast(gate))));
 }
 
 export fn kt_gate_forward(
     _gate: *KT_Gate,
-    _input: [*]const amx.bf16,
-    _logits: [*]f32,
+    input: [*]const amx.bf16,
+    _logits: [*]f32, // unused; kept for API compat
     topk_ids: [*]i64,
     topk_weights: [*]f32,
     batch_size: c_int,
-    num_experts_per_tok: c_int
+    num_experts_per_tok: c_int,
 ) void {
-    _ = _gate;
-    _ = _input;
     _ = _logits;
-    // Simple linear projection + top-k selection
-    // In a real implementation, this would use the gate weight matrix
-    for (0..@as(usize, @intCast(batch_size))) |b| {
-        // Placeholder: just fill with dummy values
-        for (0..@as(usize, @intCast(num_experts_per_tok))) |k| {
-            topk_ids[b * @as(usize, @intCast(num_experts_per_tok)) + k] = @intCast(k);
-            topk_weights[b * @as(usize, @intCast(num_experts_per_tok)) + k] = 1.0 / @as(f32, @floatFromInt(num_experts_per_tok));
-        }
-    }
+    const ctx: *GateContext = @ptrCast(@alignCast(_gate));
+    const qlen: usize = @intCast(batch_size);
+    const k: usize = @intCast(num_experts_per_tok);
+    moe.routeExperts(
+        input, ctx.weight, qlen, ctx.hidden_size, ctx.num_experts, k,
+        topk_ids, topk_weights,
+        null, // no pool: C API doesn't expose a pool; sequential routing
+    );
 }
 
 // ============================================================================
 // Linear
 // ============================================================================
 
+/// LinearContext wraps the projection weight. `hidden_size` is the INPUT dim
+/// and `intermediate_size` is the OUTPUT dim (matches the C++ reference:
+/// `LinearConfig(hidden_size=input_size, intermediate_size=output_size, ...)`).
+const LinearContext = struct {
+    weight: [*]const amx.bf16, // [out_features, in_features] BF16
+    in_features: usize,
+    out_features: usize,
+};
+
 export fn kt_linear_new(config: kt_linear_config_t) *KT_Linear {
-    const linear: *KT_Linear = @ptrCast(std.heap.page_allocator.create(u8) catch @panic("OOM"));
-    _ = config;
-    return linear;
+    if (config.proj_type != .KT_TYPE_BF16) @panic("Linear only supports BF16 weights");
+    if (config.hidden_type != .KT_TYPE_BF16) @panic("Linear only supports BF16 input");
+    const ctx = std.heap.page_allocator.create(LinearContext) catch @panic("OOM");
+    ctx.* = .{
+        .weight = @ptrCast(@alignCast(config.proj)),
+        .in_features = config.hidden_size,
+        .out_features = config.intermediate_size,
+    };
+    return @ptrCast(ctx);
 }
 
 export fn kt_linear_free(linear: *KT_Linear) void {
-    std.heap.page_allocator.destroy(@as(*u8, @ptrCast(linear)));
+    std.heap.page_allocator.destroy(@as(*LinearContext, @ptrCast(@alignCast(linear))));
 }
 
 export fn kt_linear_forward(
@@ -722,17 +762,23 @@ export fn kt_linear_forward(
     input: [*]const amx.bf16,
     output: [*]amx.bf16,
     batch_size: c_int,
-    in_features: c_int,
-    out_features: c_int
 ) void {
-    _ = linear;
-    // Placeholder: identity mapping
-    const total = @as(usize, @intCast(batch_size)) * @as(usize, @intCast(out_features));
-    for (0..total) |i| {
-        output[i] = if (i < @as(usize, @intCast(batch_size)) * @as(usize, @intCast(in_features)))
-            input[i]
-        else
-            amx.f32_to_bf16(0);
+    const ctx: *LinearContext = @ptrCast(@alignCast(linear));
+    const m: usize = @intCast(batch_size);
+
+    const out_f32 = std.heap.page_allocator.alloc(f32, m * ctx.out_features) catch @panic("OOM");
+    defer std.heap.page_allocator.free(out_f32);
+
+    // out[m, out] = input[m, in] @ weight^T[out, in]
+    // gemmExpert reads weight as [n=out, k=in] row-major, weight_ld = k.
+    gemm_bf16.gemmExpert(
+        input, ctx.weight, out_f32.ptr,
+        m, ctx.out_features, ctx.in_features,
+        ctx.in_features, ctx.in_features, ctx.out_features,
+    );
+
+    for (0..m * ctx.out_features) |i| {
+        output[i] = amx.f32_to_bf16(out_f32[i]);
     }
 }
 
@@ -740,28 +786,97 @@ export fn kt_linear_forward(
 // MLP
 // ============================================================================
 
+/// MlpContext wraps the three MLP projections. Layout per projection:
+///   gate/up: [intermediate_size, hidden_size]
+///   down:    [hidden_size, intermediate_size]
+const MlpContext = struct {
+    gate_w: [*]const amx.bf16,
+    up_w: [*]const amx.bf16,
+    down_w: [*]const amx.bf16,
+    hidden_size: usize,
+    intermediate_size: usize,
+};
+
 export fn kt_mlp_new(config: kt_mlp_config_t) *KT_MLP {
-    const mlp_inst: *KT_MLP = @ptrCast(std.heap.page_allocator.create(u8) catch @panic("OOM"));
-    _ = config;
-    return mlp_inst;
+    if (config.gate_type != .KT_TYPE_BF16 or
+        config.up_type != .KT_TYPE_BF16 or
+        config.down_type != .KT_TYPE_BF16 or
+        config.hidden_type != .KT_TYPE_BF16)
+        @panic("MLP only supports BF16");
+    const ctx = std.heap.page_allocator.create(MlpContext) catch @panic("OOM");
+    ctx.* = .{
+        .gate_w = @ptrCast(@alignCast(config.gate_proj)),
+        .up_w = @ptrCast(@alignCast(config.up_proj)),
+        .down_w = @ptrCast(@alignCast(config.down_proj)),
+        .hidden_size = config.hidden_size,
+        .intermediate_size = config.intermediate_size,
+    };
+    return @ptrCast(ctx);
 }
 
 export fn kt_mlp_free(mlp_inst: *KT_MLP) void {
-    std.heap.page_allocator.destroy(@as(*u8, @ptrCast(mlp_inst)));
+    std.heap.page_allocator.destroy(@as(*MlpContext, @ptrCast(@alignCast(mlp_inst))));
 }
 
 export fn kt_mlp_forward(
-    _mlp_inst: *KT_MLP,
-    _input: [*]const amx.bf16,
+    mlp_inst: *KT_MLP,
+    input: [*]const amx.bf16,
     output: [*]amx.bf16,
-    batch_size: c_int
+    batch_size: c_int,
 ) void {
-    _ = _mlp_inst;
-    _ = _input;
-    _ = output;
-    _ = batch_size;
-    // Placeholder: copy input to output (disabled due to unknown length)
-    // @memcpy(output, input);
+    const ctx: *MlpContext = @ptrCast(@alignCast(mlp_inst));
+    const m: usize = @intCast(batch_size);
+    const h = ctx.hidden_size;
+    const i_dim = ctx.intermediate_size;
+
+    // F32 intermediate buffers. gemmExpert writes F32; using F32 buffers
+    // avoids the BF16/F32 size-mismatch that would happen if we tried to
+    // store F32 into a BF16-sized allocation. We round-trip through BF16
+    // for the down GEMM because gemmExpert's input is BF16.
+    const gate_buf = std.heap.page_allocator.alloc(f32, m * i_dim) catch @panic("OOM");
+    const up_buf = std.heap.page_allocator.alloc(f32, m * i_dim) catch @panic("OOM");
+    const down_buf = std.heap.page_allocator.alloc(f32, m * h) catch @panic("OOM");
+    defer {
+        std.heap.page_allocator.free(gate_buf);
+        std.heap.page_allocator.free(up_buf);
+        std.heap.page_allocator.free(down_buf);
+    }
+
+    // gate[m, i] = input[m, h] @ gate_w^T[i, h]
+    // gemmExpert reads weight as [n=i_dim, k=h] row-major, weight_ld = k = h.
+    gemm_bf16.gemmExpert(
+        input, ctx.gate_w, gate_buf.ptr,
+        m, i_dim, h,
+        h, h, i_dim,
+    );
+    // up[m, i] = input[m, h] @ up_w^T[i, h]
+    gemm_bf16.gemmExpert(
+        input, ctx.up_w, up_buf.ptr,
+        m, i_dim, h,
+        h, h, i_dim,
+    );
+    // gate_buf = swiglu(gate_buf, up_buf) — in place
+    for (0..m * i_dim) |idx| {
+        gate_buf[idx] = amx.swiglu(gate_buf[idx], up_buf[idx]);
+    }
+    // Convert gate_buf F32 -> BF16 view for the down GEMM input
+    var swiglu_bf16 = std.heap.page_allocator.alloc(amx.bf16, m * i_dim) catch @panic("OOM");
+    defer std.heap.page_allocator.free(swiglu_bf16);
+    for (0..m * i_dim) |idx| {
+        swiglu_bf16[idx] = amx.f32_to_bf16(gate_buf[idx]);
+    }
+    // down[m, h] = swiglu_out[m, i] @ down_w^T[h, i]
+    // down_w: [n=h, k=i_dim] row-major, weight_ld = k = i_dim.
+    gemm_bf16.gemmExpert(
+        swiglu_bf16.ptr, ctx.down_w, down_buf.ptr,
+        m, h, i_dim,
+        i_dim, i_dim, h,
+    );
+
+    // F32 -> BF16 conversion
+    for (0..m * h) |i| {
+        output[i] = amx.f32_to_bf16(down_buf[i]);
+    }
 }
 
 // ============================================================================

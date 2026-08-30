@@ -119,50 +119,56 @@ var bf16_storage_tp_count: usize = 0;
 // Expert Router
 // ============================================================================
 
+/// Gate context: holds the gate weight matrix and config.
+pub const GateContext = struct {
+    weight: [*]const amx.bf16, // [num_experts, hidden_size] BF16
+    hidden_size: usize,
+    num_experts: usize,
+    num_experts_per_tok: usize,
+};
+
 pub fn routeExperts(
-    input: [*]const amx.bf16,  // [qlen, hidden_size]
-    gate_proj: [*]const amx.bf16,  // [expert_num, hidden_size]
+    input: [*]const amx.bf16, // [qlen, hidden_size]
+    gate_proj: [*]const amx.bf16, // [expert_num, hidden_size]
     qlen: usize,
     hidden_size: usize,
     expert_num: usize,
     num_experts_per_tok: usize,
     topk_ids: [*]i64,
     topk_weights: [*]f32,
-    pool: *worker_pool.WorkerPool,
+    pool: ?*worker_pool.WorkerPool,
 ) void {
-    // Compute gate scores: input @ gate_proj^T
-    // Then select top-k experts per token
-
+    // Compute gate scores: input @ gate_proj^T via batched BF16 GEMM, then
+    // select top-k experts per token. The matmul reuses gemm_bf16.gemmExpert
+    // (the same kernel the MLA engine uses for projectQ). pool is optional:
+    // the C API (kt_gate_forward) passes null; the MoE forward path passes a
+    // real pool. Sequential matmul today; future: parallelize the M dim.
     const total_work = qlen;
-    _ = @max(1, total_work / pool.getTotalThreads());
+    const thread_count = if (pool) |p| p.getTotalThreads() else 1;
+    _ = @max(1, total_work / thread_count);
 
-    // Simple sequential implementation for now
-    for (0..qlen)  | i |  {
-        var scores = std.heap.page_allocator.alloc(f32, expert_num) catch @panic("OOM");
-        defer std.heap.page_allocator.free(scores);
+    var logits = std.heap.page_allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
+    defer std.heap.page_allocator.free(logits);
 
-        for (0..expert_num)  | e |  {
-            var sum: f32 = 0;
-            for (0..hidden_size)  | h |  {
-                sum += amx.bf16_to_f32(input[i * hidden_size + h]) *
-                       amx.bf16_to_f32(gate_proj[e * hidden_size + h]);
-            }
-            scores[e] = sum;
-        }
+    gemm_bf16.gemmExpert(
+        input, gate_proj, logits.ptr,
+        qlen, expert_num, hidden_size,
+        hidden_size, hidden_size, expert_num,
+    );
 
-        // Find top-k
-        for (0..num_experts_per_tok)  | k |  {
+    for (0..qlen) |i| {
+        for (0..num_experts_per_tok) |k| {
             var best_idx: i64 = -1;
             var best_val: f32 = -std.math.inf(f32);
-            for (0..expert_num)  | e |  {
-                if (scores[e] > best_val) {
-                    best_val = scores[e];
+            for (0..expert_num) |e| {
+                if (logits[i * expert_num + e] > best_val) {
+                    best_val = logits[i * expert_num + e];
                     best_idx = @intCast(e);
                 }
             }
             topk_ids[i * num_experts_per_tok + k] = best_idx;
             topk_weights[i * num_experts_per_tok + k] = best_val;
-            if (best_idx >= 0) scores[@intCast(best_idx)] = -std.math.inf(f32);
+            if (best_idx >= 0) logits[i * expert_num + @as(usize, @intCast(best_idx))] = -std.math.inf(f32);
         }
     }
 }
@@ -201,20 +207,22 @@ pub fn computeExpert(
     }
 
     // Gate projection: input @ gate_proj^T -> [m, intermediate_size]
+    // gemmExpert: weight is [n=intermediate, k=hidden] row-major, weight_ld=k=hidden.
     gemm_bf16.gemmExpert(input, gate_proj, gate_output, m, intermediate_size, hidden_size,
-        hidden_size, intermediate_size, intermediate_size);
+        hidden_size, hidden_size, intermediate_size);
 
     // Up projection: input @ up_proj^T -> [m, intermediate_size]
     gemm_bf16.gemmExpert(input, up_proj, up_output, m, intermediate_size, hidden_size,
-        hidden_size, intermediate_size, intermediate_size);
+        hidden_size, hidden_size, intermediate_size);
 
     // SwiGLU activation
     gemm_bf16.GemmKernel224BF.applySwiGLU(gate_output, up_output, gate_output, m, intermediate_size,
         swiglu_limit, swiglu_alpha);
 
     // Down projection: gate_output @ down_proj^T -> [m, hidden_size]
+    // gemmExpert: weight is [n=hidden, k=intermediate] row-major, weight_ld=k=intermediate.
     gemm_bf16.gemmExpert(gate_output, down_proj, down_output, m, hidden_size, intermediate_size,
-        intermediate_size, hidden_size, hidden_size);
+        intermediate_size, intermediate_size, hidden_size);
 
     // Accumulate to output (FP32)
     for (0..m)  | i |  {
@@ -638,18 +646,19 @@ pub const TpMoe = struct {
             const weight_off = (expert_idx * self.tp_count + t) * n * k;
             const out_off_t = t * m * n;
             // Gate projection: input [m, k] @ gate_weight [n, k]^T -> gate_f32 [m, n]
+            // gemmExpert: weight is [n, k] row-major, weight_ld=k.
             gemm_bf16.gemmExpert(
                 input,
                 gate_bf16_storage + weight_off,
                 gate_f32.ptr,
-                m, n, k, k, n, ldc
+                m, n, k, k, k, ldc
             );
             // Up projection: input [m, k] @ up_weight [n, k]^T -> up_f32 [m, n]
             gemm_bf16.gemmExpert(
                 input,
                 up_bf16_storage + weight_off,
                 up_f32.ptr,
-                m, n, k, k, n, ldc
+                m, n, k, k, k, ldc
             );
             // Convert FP32 -> BF16 and store into the per-rank output slice
             for (0..m * n) |idx| {
@@ -680,11 +689,13 @@ pub const TpMoe = struct {
         for (0..self.tp_count) |t| {
             const weight_off = (expert_idx * self.tp_count + t) * n * k;
             const in_off_t = t * m * k;
+            // Down projection: gate [m, k] @ down_weight [n, k]^T -> down_f32 [m, n]
+            // gemmExpert: weight is [n=hidden, k=intermediate/tp] row-major, weight_ld=k.
             gemm_bf16.gemmExpert(
                 input + in_off_t,
                 down_bf16_storage + weight_off,
                 down_buf.ptr,
-                m, n, k, k, n, n
+                m, n, k, k, k, n
             );
         }
 
