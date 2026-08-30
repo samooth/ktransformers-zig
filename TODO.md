@@ -2,10 +2,10 @@
 
 ## Status: Alpha (Build + Tests Working)
 
-Last updated: 2026-08-29
+Last updated: 2026-08-30
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
-**Tests: WORKING** - `zig build test` compiles successfully
+**Tests: WORKING** - `zig build test` RUNS all suites: 22 kernels + 11 MLA pass, 0 leaks, exit 0
 
 ---
 
@@ -37,6 +37,17 @@ Last updated: 2026-08-29
 
 ## 🟡 High Priority (Next Steps)
 
+### Task assignments (2026-08-30, two agents working concurrently)
+
+**Dev A — MLA C API wiring + warmUp** (files: `src/main.zig`, `src/kernels/moe/moe.zig` warmUp only):
+- [ ] **Wire `kt_mla_*` C API to the real MLA engine** — replace the 5 placeholder bodies in `main.zig` (kt_mla_new/free/forward/prefill/decode, ~lines 493-560) with `MlaEngine` construction/forward/decode/resetCache calls. Pattern is proven (kt_moe_* + comptime fn-refs already in root.zig for mla_core). Map `kt_mla_config_t` → `MlaConfig`; note kt_mla_new takes `*KT_CPUInfer` (ignored by engine, sequential heads).
+- [ ] **Upgrade `TpMoe.warmUp` to real pre-touch** — blocker resolved (loadWeights now populates ptrs); replace the no-op (moe.zig:~576, grep TODO(warm-up)) with the first-byte touch loop from the comment. Keep the weights_loaded guard.
+
+**Dev B — MXFP4/MXFP8 kernels** (files: `gemm_224_mxfp{4,8}.zig`, `src/root.zig` re-exports, `tests` append-only, docs):
+- [ ] **Complete MXFP4/MXFP8 kernels** — both files exist but are NOT in root.zig's import graph (never compiled; mxfp4 has a bogus `unpackMXFP4(block, &sum)` line that will fail analysis). Steps: standalone `zig test` each file; wire re-exports + comptime fn-refs into root.zig (verify `nm | grep -i mxfp`); scalar exact-value tests; AMX tile path via on-the-fly block dequant (pattern: the INT4/FP8 sections in LESSONS_ZIG.md; reference: `operators/amx/mxfp8-moe.hpp`, `fp4-moe.hpp`, `avx2/mxfp4-moe.hpp`).
+
+**Exclusivity notes**: Dev A owns main.zig + moe.zig(warmUp); Dev B owns mxfp files + root.zig. Shared files only by the stated constraints (tests append-only, docs append/mark). `zig build test` currently exits 0 with 0 leaks (33/33) — keep it that way.
+
 ### Runtime
 - [ ] Verify `worker_pool.zig` compiles and works with NUMA subpools (basic version works)
 - [ ] Verify `task_queue.zig` lock-free SPSC/MPMC queues
@@ -46,7 +57,7 @@ Last updated: 2026-08-29
 ### Kernels
 - [x] **Complete INT4 GPTQ kernel (`gemm_224_int4.zig`)** — replaced scalar fallback with AMX tile path (`tileint8dpd` + on-the-fly INT4→INT8 dequantization). Lo/hi nibble pattern from C++ `GemmKernel224Int4` (amx_kernels.hpp:1559-1848). Per-group scales applied at K-block boundary via `applyScales` (INT32 → FP32). Correctness test added to `tests/kernels/test_kernels.zig`. Non-AMX hosts fall back to the preserved scalar implementation.
 - [x] **Complete FP8 E4M3 kernel (`gemm_224_fp8.zig`)** — replaced scalar fallback with AMX tile path that reuses the BF16 GEMM tiles (`tilebf16dpd` accumulates into FP32, no INT32 scratch). On-the-fly FP8→BF16 dequantization in `loadB` (byte-level, 1:1: each FP8 byte becomes one BF16 short). Per-row scale applied at end of each `(m, n)` block (not per K-step). Tile config matches BF16 (TILE_M=16, TILE_K=32, TILE_N=16, VNNI_BLK=2). Correctness test added (skips on non-AMX). Non-AMX hosts fall back to scalar.
-- [ ] Complete MXFP4/MXFP8 kernels
+- [ ] Complete MXFP4/MXFP8 kernels (assigned Dev B — see Task assignments above)
 - [ ] Implement `applySwiGLU` vectorized version using `std.simd`
 - [x] **Add actual AMX inline assembly (previously placeholder)** — `ldtilecfg`, `tilerelease`, `tileloadd`, `tilestored`, `tilezero`, `tilebf16dpd`, `tileint8dpd` all wired in `src/kernels/arch/amx.zig` with proper comptime tile-register immediates. Includes XFEATURE_XTILEDATA permission request via `arch_prctl`. Correctness tests added to `tests/kernels/test_kernels.zig` (skip on non-AMX hardware).
 
@@ -58,7 +69,7 @@ Last updated: 2026-08-29
 - [x] **Replace 5 placeholder TpMoe methods** — `deinit` (frees the two init-allocated slices, page_allocator convention; buffer structs are non-owning POD views), `warmUp` (no-op + TODO until loadWeights populates ptrs), `loadWeightsWithMap` (double-load + logical-slot remap), `forwardGateUp`/`forwardDown` (guarded no-ops with real bodies in comments, blocked on the loadWeights BF16 bug). End-to-end test with zero inputs passes; 5 TpMoe placeholder methods now safe.
 
 ### C API Completeness
-- [x] **MLA attention — code complete in `src/mla/`, re-exported from `root.zig`** (config, cache, core modules wired into the library; 11/11 standalone tests passing). C API integration (`kt_mla_*` in `main.zig` still placeholder) tracked as separate plan.
+- [x] **MLA attention — code complete in `src/mla/`, re-exported from `root.zig`** (config, cache, core modules wired into the library; 11/11 standalone tests passing). C API integration (`kt_mla_*` in `main.zig`) assigned Dev A — see Task assignments above.
 - [ ] Gate (`kt_gate_*` functions)
 - [ ] Linear/MLP (`kt_linear_*`, `kt_mlp_*`)
 - [ ] FP8 layerwise transport (`kt_fp8_*` functions)
