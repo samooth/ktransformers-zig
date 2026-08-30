@@ -285,6 +285,10 @@ fn detect_cpu_variant() void {
     g_cpu_variant_len = variant.len;
 }
 
+fn ensure_cpu_variant_detected() void {
+    if (g_cpu_variant_len == 0) detect_cpu_variant();
+}
+
 // ============================================================================
 // Core C API Functions
 // ============================================================================
@@ -294,6 +298,7 @@ export fn kt_version() [*]const u8 {
 }
 
 export fn kt_get_cpu_variant() [*]const u8 {
+    ensure_cpu_variant_detected();
     return g_cpu_variant_ptr;
 }
 
