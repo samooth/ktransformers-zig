@@ -394,7 +394,7 @@ pub const TpMoe = struct {
                 // Uses page_allocator (C API convention: init allocates with
                 // the passed allocator, deinit frees with page_allocator).
                 if (e == 0) {
-                    ensureBf16Storage(std.heap.page_allocator, expert_count, self.tp_count, hidden_size, inter);
+                    ensureBf16Storage(self.allocator, expert_count, self.tp_count, hidden_size, inter);
                 }
 
                 // Load BF16 weights: allocate per-expert per-TP-rank slices
