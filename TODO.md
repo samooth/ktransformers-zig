@@ -2,7 +2,7 @@
 
 ## Status: Alpha (Build + Tests Working)
 
-Last updated: 2026-08-30
+Last updated: 2026-08-31
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
 **Tests: WORKING** - `zig build test` RUNS all suites: 34 kernels + 11 MLA = 45 total pass, 0 leaks, exit 0
@@ -88,6 +88,7 @@ Last updated: 2026-08-30
 - [x] **NUMA topology** — `numaNodeOfCpu()` reads `/sys/devices/system/cpu/cpu{N}/topology/physical_package_id`; `getCpuCountPerNuma()` parses `/proc/cpuinfo` (correctly returns 16 CPUs on 1 NUMA for Ryzen 5800H).
 - [x] **Verify worker_pool.zig** — work-stealing pool with NUMA subpools compiles and runs.
 - [x] **Wire work-stealing into MoE kernels** (Dev A+b, commit b762a2e) — `TpMoe.forward` now gates on `config.pool`: parallel path uses `doWorkStealingJob` with per-expert private BF16 scratch (zeroed, sequential reduction); sequential fallback unchanged. 44/44 tests pass including pool-vs-sequential equivalence. Review gate (data-race-free reduction, allocator symmetry, sequential fallback, BF16-scratch semantics) confirmed.
+- [x] **Wire work-stealing into SFT/LoRA path** (Dev A+b, commit d1e0adb, reviewed 2026-08-30) — `TpMoeSft.forward_sft` mirrors the MoE pattern: branches on `self.moe.config.pool`, dispatches per-expert tasks via `doWorkStealingJob` on `subpool[0]`, each task owns its BF16 scratch (`[][]amx.bf16`), writes a disjoint `save_for_backward` cache slice via precomputed `expert_token_offset[e]`, sequential reduction after join (BF16 → F32 via `bf16_to_f32`, weighted by routing w). SFT-specific `g_parallel` (moe_sft.zig:67) is module-scoped — decoupled from moe.zig's context. Review gate (a–e + backward-cache) confirmed: 6 variants build, 45/45 tests pass (34 kernels incl. new "SFT forward_sft: work-stealing pool matches sequential (equivalence)" + 11 MLA), 0 leaks. ABI verifier PASS on all non-FP8 symbols (10 `kt_fp8_transport_*` + `kt_mla_load_weights` missing are pre-existing #4 carve-outs, not #5 defects).
 
 ---
 
@@ -121,7 +122,7 @@ Last updated: 2026-08-30
 | INT8 GEMM | Working | 70% |
 | INT4/FP8/MXFP4/8 GEMM | INT4, FP8, MXFP4, MXFP8 all done (AMX + scalar fallback) | 100% |
 | MoE Orchestration | Forward + work-stealing parallel path complete (per-expert parallelism, sequential reduction); Gate C API wired; weight_ld OOB fixed | 100% |
-| SFT/LoRA Training | Forward + backward complete + work-stealing parallel forward (pool equivalence + backward round-trip tests); 4 C API exports (new_sft/forward_sft/backward/update_lora) | 90% |
+| SFT/LoRA Training | Forward + backward complete + work-stealing parallel forward (d1e0adb: pool-vs-sequential equivalence + backward round-trip); 4 C API exports (new_sft/forward_sft/backward/update_lora) | 100% |
 | C API | MLA + MoE + Gate + Linear + MLP + SFT backward complete; kt_get_cpu_variant fixed; FP8 still placeholder | 90% |
 | Build System | Multi-variant (6 variants, distinct .so names) | 85% |
 | Tests | 34/34 kernels + 11 MLA = 45 total pass, 0 leaks, zig build test exits 0 | 100% |
