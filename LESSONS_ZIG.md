@@ -1324,3 +1324,89 @@ changes" constraint.
 must be scaled by the routing weight `weights[token * k + j]` before
 accumulating into the output. The C++ does this in `apply_weight`. The
 Zig port's forward method must do the same to match C++ behavior.
+
+## Leak sweep: making `zig build test` exit 0
+
+Even when all tests pass, `zig build test` exits 1 if the `DebugAllocator`
+detects any memory leaks. CI scripts that gate on exit code will see failure
+despite 100% test pass rate. Here are the patterns that leaked in this
+project and how to fix them.
+
+### Pattern 1: Config struct allocates slices, never frees them
+
+```zig
+// WRONG: subpool_numa_map and subpool_thread_count leak
+pub fn default(allocator: Allocator) !WorkerPoolConfig {
+    return .{
+        .subpool_numa_map = try allocator.alloc(usize, 1),
+        .subpool_thread_count = try allocator.alloc(usize, 1),
+    };
+}
+```
+
+**Fix**: Add a `deinit` method to the config struct, track ownership
+(who allocated the slices), and call `deinit` from the owner's destructor.
+
+```zig
+pub fn deinit(self: *WorkerPoolConfig) void {
+    if (self.subpool_numa_map.len > 0) self.allocator.free(self.subpool_numa_map);
+    if (self.subpool_thread_count.len > 0) self.allocator.free(self.subpool_thread_count);
+    self.* = undefined;
+}
+```
+
+For structs that are copied (e.g., `WorkerPool.config` is a copy of the
+caller's config), use an `owns_config: bool` flag set by the constructor
+that allocates the config (`initSimple` sets it to `true`; `init` sets
+it to `false` because the caller owns the slices).
+
+### Pattern 2: `[]const u8` can't be freed
+
+The `model_name` field in `CpuInfo` was `[]const u8` but was sometimes
+set to a heap-allocated `dupe` result. You can't `free` a `[]const u8`
+without a `@constCast`, and the cast is a code smell.
+
+**Fix**: Change to `[]u8` (mutable) and use a content-based sentinel to
+distinguish heap-allocated from string-literal values. The "unknown"
+sentinel is a string literal; all other values are heap-allocated.
+
+```zig
+model_name: []u8,  // owned, freed by deinit
+
+pub fn deinit(self: *CpuInfo, allocator: Allocator) void {
+    if (!std.mem.eql(u8, self.model_name, "unknown")) {
+        allocator.free(self.model_name);
+    }
+    self.* = undefined;
+}
+```
+
+### Pattern 3: `defer` order matters for cross-object cleanup
+
+When two objects share a dependency (e.g., a pool's config holds slices
+that the pool doesn't own), the `defer` order matters. `defer` runs LIFO,
+so the second `defer` runs first. If pool cleanup must run before config
+cleanup, you need explicit ordering, not `defer`:
+
+```zig
+// WRONG: config.deinit() runs first (LIFO), then pool.deinit() may crash
+defer config.deinit();
+defer pool.deinit();
+
+// CORRECT: pool.deinit() must run first to join threads
+pool.deinit();
+config.deinit();
+```
+
+Or allocate the shared arrays at the test scope (not inside the config)
+so the test owns them and can free them after the pool:
+
+```zig
+const numa_map = try allocator.alloc(usize, 2);
+defer allocator.free(numa_map);
+const thread_counts = try allocator.alloc(usize, 2);
+defer allocator.free(thread_counts);
+const config = WorkerPoolConfig{ .subpool_numa_map = numa_map, ... };
+const pool = try WorkerPool.init(allocator, config);
+defer pool.deinit();
+```

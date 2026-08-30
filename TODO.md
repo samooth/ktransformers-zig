@@ -112,7 +112,7 @@ Last updated: 2026-08-29
 | MoE Orchestration | Forward path complete (gate+up+SwiGLU+down+routing) | 75% |
 | C API | Basic functions only | 50% |
 | Build System | Single variant | 60% |
-| Tests | Running and passing (11/11 MLA, 8/21 kernels before pre-existing worker pool hang) | 75% |
+| Tests | All 22 kernels + 11 MLA pass, 0 leaks, `zig build test` exits 0 | 100% |
 | Python Integration | Not started | 0% |
 
 ---

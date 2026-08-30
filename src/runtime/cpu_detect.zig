@@ -47,12 +47,23 @@ pub const CpuInfo = struct {
     arch: []const u8,
     features: Features,
     flags: [16]u8,
-    model_name: []const u8,
+    model_name: []u8,  // owned, freed by deinit
     cpu_family: u32,
     model: u32,
     stepping: u32,
     cache_line_size: usize = 64,
     numa_nodes: usize = 1,
+
+    /// Free the model_name slice if it was heap-allocated.
+    /// The "unknown" sentinel is the string literal "unknown" which must
+    /// not be freed. All other values are heap-allocated by detectCpuLinux.
+    pub fn deinit(self: *CpuInfo, allocator: Allocator) void {
+        // "unknown" is the only string-literal value. Check by content.
+        if (!std.mem.eql(u8, self.model_name, "unknown")) {
+            allocator.free(self.model_name);
+        }
+        self.* = undefined;
+    }
 };
 
 
@@ -70,7 +81,7 @@ pub fn detectCpu(allocator: Allocator) !CpuInfo {
             .arch = @tagName(builtin.target.cpu.arch) orelse "unknown",
             .features = Features{},
             .flags = .{0} ** 16,
-            .model_name = "unknown",
+            .model_name = @constCast("unknown"),
             .cpu_family = 0,
             .model = 0,
             .stepping = 0,
@@ -93,7 +104,7 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
     var lines = std.mem.splitScalar(u8, content, 10);
 
     var vendor: Vendor = .unknown;
-    var model_name: []const u8 = "unknown";
+    var model_name: []u8 = @constCast("unknown");
     var cpu_family: u32 = 0;
     var model: u32 = 0;
     var stepping: u32 = 0;
@@ -120,7 +131,7 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
             var parts = std.mem.splitScalar(u8, line, 58);
             if (parts.next()) |_| {
                 if (parts.next()) |value| {
-                    model_name = std.mem.trim(u8, value, " \t");
+                    model_name = @constCast(std.mem.trim(u8, value, " \t"));
                 }
             }
         } else if (std.mem.startsWith(u8, line, "cpu family")) {
@@ -221,7 +232,7 @@ fn detectCpuDarwin(_allocator: Allocator, _io: std.Io) !CpuInfo { _ = _io; _ = _
         .arch = arch,
         .features = features,
         .flags = .{0} ** 16,
-        .model_name = "Apple Silicon",
+        .model_name = @constCast("Apple Silicon"),
         .cpu_family = 0,
         .model = 0,
         .stepping = 0,
@@ -245,7 +256,7 @@ fn detectCpuWindows(_allocator: Allocator, _io: anytype) !CpuInfo { _ = _io; _ =
         .arch = arch,
         .features = features,
         .flags = .{0} ** 16,
-        .model_name = "Windows CPU",
+        .model_name = @constCast("Windows CPU"),
         .cpu_family = 0,
         .model = 0,
         .stepping = 0,

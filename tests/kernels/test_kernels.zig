@@ -65,7 +65,8 @@ test "GEMM INT8 config" {
 
 test "CPU detection" {
     const allocator = testing.allocator;
-    const cpu = cpu_detect.detectCpu(allocator) catch @panic("CPU detect failed");
+    var cpu = cpu_detect.detectCpu(allocator) catch @panic("CPU detect failed");
+    defer cpu.deinit(allocator);
 
     try testing.expect(cpu.vendor != cpu_detect.Vendor.unknown);
     try testing.expect(cpu.arch.len > 0);
@@ -85,19 +86,24 @@ test "Worker pool creation" {
 
 test "Worker pool with config" {
     const allocator = testing.allocator;
+    const numa_map = try allocator.alloc(usize, 2);
+    const thread_counts = try allocator.alloc(usize, 2);
+    defer allocator.free(numa_map);
+    defer allocator.free(thread_counts);
+
+    numa_map[0] = 0;
+    numa_map[1] = 1;
+    thread_counts[0] = 2;
+    thread_counts[1] = 2;
+
     const config = worker_pool.WorkerPoolConfig{
         .subpool_count = 2,
-        .subpool_numa_map = try allocator.alloc(usize, 2),
-        .subpool_thread_count = try allocator.alloc(usize, 2),
+        .subpool_numa_map = numa_map,
+        .subpool_thread_count = thread_counts,
     };
-    config.subpool_numa_map[0] = 0;
-    config.subpool_numa_map[1] = 1;
-    config.subpool_thread_count[0] = 2;
-    config.subpool_thread_count[1] = 2;
 
-    const pool = try worker_pool.WorkerPool.init(allocator, config);
-    var pool_mut = pool;
-    defer pool_mut.deinit();
+    var pool = try worker_pool.WorkerPool.init(allocator, config);
+    defer pool.deinit();
 
     try testing.expect(pool.config.subpool_count == 2);
     try testing.expect(pool.config.subpool_thread_count[0] == 2);

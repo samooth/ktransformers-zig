@@ -7,9 +7,10 @@ const Allocator = std.mem.Allocator;
 /// Worker pool configuration
 pub const WorkerPoolConfig = struct {
     subpool_count: usize = 1,
-    subpool_numa_map: []usize = &.{},
-    subpool_thread_count: []usize = &.{},
+    subpool_numa_map: []usize = &.{},  // owned, freed by deinit
+    subpool_thread_count: []usize = &.{},  // owned, freed by deinit
     enable_work_stealing: bool = true,
+    allocator: Allocator = std.heap.page_allocator,  // tracks who owns the slices
 
     pub fn default(allocator: Allocator) !WorkerPoolConfig {
         const cpu_count = std.Thread.getCpuCount() catch 1;
@@ -17,10 +18,25 @@ pub const WorkerPoolConfig = struct {
             .subpool_count = 1,
             .subpool_numa_map = try allocator.alloc(usize, 1),
             .subpool_thread_count = try allocator.alloc(usize, 1),
+            .allocator = allocator,
         };
         config.subpool_numa_map[0] = 0;
         config.subpool_thread_count[0] = cpu_count;
         return config;
+    }
+
+    /// Free the owned subpool_numa_map and subpool_thread_count slices.
+    /// Must be called exactly once for configs created by `default()` or
+    /// where the caller manually allocated the subpool_* fields.
+    /// For configs with default empty slices (`&.{}`), this is a no-op.
+    pub fn deinit(self: *WorkerPoolConfig) void {
+        if (self.subpool_numa_map.len > 0) {
+            self.allocator.free(self.subpool_numa_map);
+        }
+        if (self.subpool_thread_count.len > 0) {
+            self.allocator.free(self.subpool_thread_count);
+        }
+        self.* = undefined;
     }
 };
 
@@ -108,6 +124,7 @@ pub const WorkerPool = struct {
     subpools: []*Subpool,
     allocator: Allocator,
     backend: u32, // placeholder for thread pool backend (std.Thread.Pool removed in Zig 0.16)
+    owns_config: bool,  // true if deinit should free the config's subpool_* slices
 
     pub fn init(allocator: Allocator, config: WorkerPoolConfig) !WorkerPool {
         const subpools = try allocator.alloc(*Subpool, config.subpool_count);
@@ -127,13 +144,18 @@ pub const WorkerPool = struct {
             .subpools = subpools,
             .allocator = allocator,
             .backend = @intCast(config.subpool_thread_count[0]),
+            .owns_config = false,  // caller owns the config
         };
     }
 
     pub fn initSimple(allocator: Allocator, thread_count: usize) !WorkerPool {
         const config = try WorkerPoolConfig.default(allocator);
         config.subpool_thread_count[0] = thread_count;
-        return @This().init(allocator, config);
+        const pool = try @This().init(allocator, config);
+        // We allocated the config, so we own it and must free it in deinit.
+        var pool_mut = pool;
+        pool_mut.owns_config = true;
+        return pool_mut;
     }
 
     /// Get subpool for specific NUMA node
@@ -228,6 +250,13 @@ pub const WorkerPool = struct {
             subpool.deinit(self.allocator);
         }
         self.allocator.free(self.subpools);
+        // Free the config's owned subpool_numa_map and subpool_thread_count.
+        // Only do this if we own the config (i.e., it was not passed in by
+        // the caller with pre-existing slices). We track ownership via a
+        // flag set during init.
+        if (self.owns_config) {
+            self.config.deinit();
+        }
         _ = self.backend; // backend is a placeholder
     }
 };
