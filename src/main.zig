@@ -17,6 +17,7 @@ const gemm_fp8 = root.gemm_fp8;
 const gemm_mxfp4 = root.gemm_mxfp4;
 const gemm_mxfp8 = root.gemm_mxfp8;
 const moe = root.moe;
+const moe_sft = root.moe_sft;
 const mla_config = root.mla_config;
 const mla_cache = root.mla_cache;
 const mla_core = root.mla_core;
@@ -199,6 +200,24 @@ pub const kt_moe_config_t = extern struct {
     max_cache_depth: c_int,
     swiglu_limit: f32,
     swiglu_alpha: f32,
+};
+
+pub const kt_moe_sft_config_t = extern struct {
+    base: kt_moe_config_t,
+    lora_rank: c_int,
+    lora_alpha: f32,
+    lora_dropout: f32,
+    gate_lora_a: ?*anyopaque,
+    gate_lora_b: ?*anyopaque,
+    up_lora_a: ?*anyopaque,
+    up_lora_b: ?*anyopaque,
+    down_lora_a: ?*anyopaque,
+    down_lora_b: ?*anyopaque,
+    full_weight_grad: c_int,
+    authoritative_optimizer_grads: c_int,
+    grad_gate_proj: ?*anyopaque,
+    grad_up_proj: ?*anyopaque,
+    grad_down_proj: ?*anyopaque,
 };
 
 pub const kt_gate_config_t = extern struct {
@@ -439,6 +458,60 @@ export fn kt_moe_new(cpuinfer: *KT_CPUInfer, config: kt_moe_config_t) *KT_MOE {
     const moe_inst = std.heap.page_allocator.create(moe.TpMoe) catch @panic("OOM");
     moe_inst.* = moe.TpMoe.init(cfg, std.heap.page_allocator) catch @panic("Failed to init MoE");
     return @ptrCast(moe_inst);
+}
+
+export fn kt_moe_new_sft(cpuinfer: *KT_CPUInfer, config: kt_moe_sft_config_t) *KT_MOE {
+    const pool: *worker_pool.WorkerPool = @ptrCast(@alignCast(cpuinfer));
+    var base_cfg = toMoeConfig(config.base);
+    base_cfg.pool = pool;
+    const sft_inst = std.heap.page_allocator.create(moe_sft.TpMoeSft) catch @panic("OOM");
+    sft_inst.* = moe_sft.TpMoeSft.init(base_cfg, std.heap.page_allocator) catch @panic("Failed to init SFT MoE");
+    sft_inst.lora_rank = @intCast(config.lora_rank);
+    sft_inst.lora_alpha = config.lora_alpha;
+    sft_inst.lora_scaling = if (config.lora_rank > 0) config.lora_alpha / @as(f32, @floatFromInt(@as(c_int, config.lora_rank))) else 0.0;
+    sft_inst.lora_dropout = config.lora_dropout;
+    sft_inst.gate_lora_a = config.gate_lora_a;
+    sft_inst.gate_lora_b = config.gate_lora_b;
+    sft_inst.up_lora_a = config.up_lora_a;
+    sft_inst.up_lora_b = config.up_lora_b;
+    sft_inst.down_lora_a = config.down_lora_a;
+    sft_inst.down_lora_b = config.down_lora_b;
+    return @ptrCast(sft_inst);
+}
+
+export fn kt_moe_forward_sft(
+    moe_ptr: *KT_MOE,
+    qlen: c_int,
+    k: c_int,
+    expert_ids: [*]const i64,
+    weights: [*]const f32,
+    input: [*]const amx.bf16,
+    output: [*]const amx.bf16,
+    save_for_backward: c_int,
+) void {
+    const m: *moe_sft.TpMoeSft = @ptrCast(@alignCast(moe_ptr));
+    m.forward_sft(
+        @intCast(qlen),
+        @intCast(k),
+        expert_ids,
+        weights,
+        input,
+        @constCast(@ptrCast(output)),
+        save_for_backward != 0,
+    );
+}
+
+export fn kt_moe_update_lora_weights(
+    moe_ptr: *KT_MOE,
+    gate_lora_a: ?*anyopaque,
+    gate_lora_b: ?*anyopaque,
+    up_lora_a: ?*anyopaque,
+    up_lora_b: ?*anyopaque,
+    down_lora_a: ?*anyopaque,
+    down_lora_b: ?*anyopaque,
+) void {
+    const m: *moe_sft.TpMoeSft = @ptrCast(@alignCast(moe_ptr));
+    m.update_lora_weights(gate_lora_a, gate_lora_b, up_lora_a, up_lora_b, down_lora_a, down_lora_b);
 }
 
 export fn kt_moe_free(moe_ptr: *KT_MOE) void {
@@ -1108,53 +1181,6 @@ export fn kt_dequantize_fp8_e4m3(
             }
         }
     }
-}
-
-// ============================================================================
-// Backward Pass (for SFT/LoRA training)
-// ============================================================================
-
-export fn kt_moe_backward(
-    moe_ptr: *KT_MOE,
-    grad_output: [*]const f32,
-    grad_input: [*]f32,
-    qlen: c_int,
-    expert_ids: [*]const i64,
-    weights: [*]const f32
-) void {
-    _ = moe_ptr;
-    _ = grad_output;
-    _ = grad_input;
-    _ = qlen;
-    _ = expert_ids;
-    _ = weights;
-    // Backward pass placeholder
-}
-
-export fn kt_linear_backward(
-    linear: *KT_Linear,
-    grad_output: [*]const f32,
-    grad_input: [*]f32,
-    batch_size: c_int
-) void {
-    _ = linear;
-    _ = grad_output;
-    _ = grad_input;
-    _ = batch_size;
-    // Linear backward placeholder
-}
-
-export fn kt_mlp_backward(
-    mlp_inst: *KT_MLP,
-    grad_output: [*]const f32,
-    grad_input: [*]f32,
-    batch_size: c_int
-) void {
-    _ = mlp_inst;
-    _ = grad_output;
-    _ = grad_input;
-    _ = batch_size;
-    // MLP backward placeholder
 }
 
 // ============================================================================

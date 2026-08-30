@@ -13,9 +13,11 @@ pub const gemm_int4 = @import("kernels/amx/gemm_224_int4.zig");
 pub const gemm_fp8 = @import("kernels/amx/gemm_224_fp8.zig");
 pub const gemm_int8 = @import("kernels/amx/gemm_224_int8.zig");
 pub const moe = @import("kernels/moe/moe.zig");
+pub const moe_sft = @import("kernels/moe/moe_sft.zig");
 pub const mla_config = @import("mla/mla_config.zig");
 pub const mla_cache = @import("mla/mla_cache.zig");
 pub const mla_core = @import("mla/mla_core.zig");
+pub const lora_kernels = @import("kernels/amx/lora_kernels.zig");
 
 // MXFP4/MXFP8 kernels: re-exports alone are not enough — without a
 // `comptime { _ = &fn; }` block the .so contains zero MXFP code (lazy

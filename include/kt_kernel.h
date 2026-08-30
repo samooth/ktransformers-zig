@@ -347,6 +347,14 @@ KT_MOE* kt_moe_new(KT_CPUInfer* cpuinfer, kt_moe_config_t config);
 KT_MOE* kt_moe_new_sft(KT_CPUInfer* cpuinfer, kt_moe_sft_config_t config);
 void kt_moe_free(KT_MOE* moe);
 
+/// SFT forward (with optional backward cache)
+void kt_moe_forward_sft(KT_MOE* moe, int qlen, int k, const int64_t* expert_ids,
+                        const float* weights, const void* input, void* output, int save_for_backward);
+
+/// Update LoRA weight pointers (call after LoRA weights change)
+void kt_moe_update_lora_weights(KT_MOE* moe, void* gate_lora_a, void* gate_lora_b,
+                                void* up_lora_a, void* up_lora_b, void* down_lora_a, void* down_lora_b);
+
 /// Warm up
 void kt_moe_warm_up(KT_MOE* moe);
 
