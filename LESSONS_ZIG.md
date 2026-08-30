@@ -1410,3 +1410,74 @@ const config = WorkerPoolConfig{ .subpool_numa_map = numa_map, ... };
 const pool = try WorkerPool.init(allocator, config);
 defer pool.deinit();
 ```
+
+## C API integration for opaque types
+
+When wiring a C API to an internal Zig module, the C config struct often
+uses `*anyopaque` for pointer fields (so it can be compiled as `extern struct`).
+The internal module uses concrete pointer types like `[*]const u16` (BF16).
+The mapping at the C API boundary is the tricky part.
+
+### Pattern: context wrapper struct
+
+When the C API needs to own multiple related Zig objects (e.g., engine +
+cache), create a private context struct that holds all of them:
+
+```zig
+const MlaContext = struct {
+    engine: *mla_core.MlaEngine,
+    cache: *mla_cache.MlaKvCache,
+    allocator: std.mem.Allocator,
+};
+```
+
+The `*KT_MLA` opaque type is actually `*MlaContext`. Allocate the context
+via `page_allocator.create(MlaContext)`. Free all owned objects in the
+`free` function, in reverse order of allocation.
+
+### Pattern: `*anyopaque` to concrete pointer cast
+
+```zig
+.q_a_proj = @ptrCast(@alignCast(config.q_a_proj)),
+```
+
+This works for BF16 data when the C caller passes correctly-typed pointers.
+Document the assumption in a comment. Quantized weight types (INT8/INT4)
+require checking the `_type` field and routing to a different dequant path.
+
+### Pattern: BF16 ↔ F32 conversion at the C/Zig boundary
+
+When the internal module operates on F32 (for matmul precision) but the C
+API uses BF16, convert at the boundary. Allocate scratch F32 buffers per
+call on `page_allocator` (matching the rest of the C API's OOM policy):
+
+```zig
+const input_f32 = std.heap.page_allocator.alloc(f32, qlen * cfg.hidden_size) catch @panic("OOM");
+defer std.heap.page_allocator.free(input_f32);
+for (0..qlen * cfg.hidden_size) |i| {
+    input_f32[i] = amx.bf16_to_f32(input[i]);
+}
+```
+
+After the internal call, convert back:
+```zig
+for (0..qlen * cfg.hidden_size) |i| {
+    output[i] = amx.f32_to_bf16(output_f32[i]);
+}
+```
+
+### Pattern: external "cache" parameter is the internal cache
+
+When the C API takes a `*anyopaque` for a cache-like object but the
+internal module already owns a cache, document the external parameter
+as ignored and use the internal one. This avoids the complexity of
+synchronizing two cache instances. Future plans can add external cache
+support if needed.
+
+```zig
+export fn kt_mla_update_kv_cache(mla: *KT_MLA, kv_cache: *anyopaque, ...) void {
+    _ = kv_cache; // external cache not yet supported; engine uses internal cache
+    const ctx: *MlaContext = @ptrCast(@alignCast(mla));
+    ctx.cache.appendToken(...);
+}
+```

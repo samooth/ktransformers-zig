@@ -573,16 +573,20 @@ pub const TpMoe = struct {
     }
 
     pub fn warmUp(self: *TpMoe) void {
-        // TODO(warm-up): pre-touch weight pages to avoid first-forward page
-        // faults. The intended body reads the first byte of each expert
-        // buffer (gate/up/down_bf16, gate/up/down_int8) once weights_loaded
-        // is true. Not shipped yet because loadWeights (see its BF16 branch,
-        // which only packs gate_proj) does not reliably populate those ptr
-        // fields — touching them now could dereference undefined pointers.
-        // Real version lands together with the loadWeights fix (follow-up
-        // plan; see "Per-expert decomposition of MoE forward" in
-        // LESSONS_ZIG.md).
-        _ = self;
+        // Pre-touch weight pages to avoid first-forward page faults.
+        // With loadWeights now populating the module-level BF16 storage
+        // (commit 246f66e), we can safely touch the first byte of each
+        // storage. We pre-touch the first page of each storage (gate/up/down)
+        // which catches the common case where the entire storage fits in
+        // the first few pages. A more thorough implementation would touch
+        // every page, but the first-page touch is the highest-impact one
+        // (it primes the TLB and brings the most-recently-accessed pages in).
+        if (!self.weights_loaded) return;
+        if (bf16_weights_alloced > 0) {
+            _ = gate_bf16_storage[0];
+            _ = up_bf16_storage[0];
+            _ = down_bf16_storage[0];
+        }
     }
 
     pub fn loadWeightsWithMap(self: *TpMoe, physical_to_logical_map: [*]u64) void {

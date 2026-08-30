@@ -17,6 +17,9 @@ const gemm_fp8 = root.gemm_fp8;
 const gemm_mxfp4 = root.gemm_mxfp4;
 const gemm_mxfp8 = root.gemm_mxfp8;
 const moe = root.moe;
+const mla_config = root.mla_config;
+const mla_cache = root.mla_cache;
+const mla_core = root.mla_core;
 
 // ============================================================================
 // C API Types
@@ -487,19 +490,114 @@ export fn kt_moe_forward_down(
 }
 
 // ============================================================================
-// MLA (Multi-Head Latent Attention)
+// MLA (Multi-Head Latent Attention) - C API implementation
 // ============================================================================
+//
+// Each *KT_MLA is actually a *MlaContext that holds the MlaEngine and its
+// associated MlaKvCache. Both must outlive any forward/decode call but are
+// freed together in kt_mla_free.
+//
+// Weight pointers in kt_mla_config_t are passed as *anyopaque. We cast them
+// to [*]const u16 (BF16). The C caller is responsible for passing BF16 data
+// (the convention for non-quantized MLA). Quantized weight support (INT8/INT4)
+// is tracked as a follow-up.
+//
+// The engine's internal KV cache is the source of truth. The external
+// `kv_cache` parameter in kt_mla_update_kv_cache is accepted for API
+// compatibility with the C++ reference but is currently ignored.
+//
+// BF16 <-> F32 conversion happens at the C/Zig boundary. The engine operates
+// on F32 internally (for matmul precision), but the C API uses BF16. We
+// allocate scratch F32 buffers per call on page_allocator.
+
+const MlaContext = struct {
+    engine: *mla_core.MlaEngine,
+    cache: *mla_cache.MlaKvCache,
+    allocator: std.mem.Allocator,
+};
 
 export fn kt_mla_new(cpuinfer: *KT_CPUInfer, config: kt_mla_config_t) *KT_MLA {
-    _ = cpuinfer;
-    _ = config;
-    // MLA implementation placeholder
-    const mla: *KT_MLA = @ptrCast(std.heap.page_allocator.create(u8) catch @panic("OOM"));
-    return mla;
+    _ = cpuinfer; // engine is sequential-heads, no NUMA dispatch yet
+
+    // 1. Map C config -> internal MlaConfig
+    const mla_cfg = mla_config.MlaConfig{
+        .hidden_size = config.hidden_size,
+        .q_lora_rank = config.q_lora_rank,
+        .num_heads = config.num_heads,
+        .nope_size = config.nope_size,
+        .rope_size = config.rope_size,
+        .kv_lora_rank = config.kv_lora_rank,
+        .max_qlen = config.max_qlen,
+        .max_kvlen = config.max_kvlen,
+        .token_count_in_page = config.token_count_in_page,
+        .rope_theta = config.rope_theta,
+        .rope_scaling_factor = config.rope_scaling_factor,
+        .rope_scaling_mscale = config.rope_scaling_mscale,
+        .q_a_proj = @ptrCast(@alignCast(config.q_a_proj)),
+        .q_a_norm = @ptrCast(@alignCast(config.q_a_norm)),
+        .q_b_proj = @ptrCast(@alignCast(config.q_b_proj)),
+        .kv_a_proj_with_mqa = @ptrCast(@alignCast(config.kv_a_proj_with_mqa)),
+        .kv_a_norm = @ptrCast(@alignCast(config.kv_a_norm)),
+        .kv_b_proj = @ptrCast(@alignCast(config.kv_b_proj)),
+        .o_proj = @ptrCast(@alignCast(config.o_proj)),
+    };
+
+    // 2. Estimate max_pages and create KV cache
+    const max_pages = (config.max_kvlen / config.token_count_in_page) + 1;
+    const cache = std.heap.page_allocator.create(mla_cache.MlaKvCache) catch @panic("OOM");
+    cache.* = mla_cache.MlaKvCache.init(std.heap.page_allocator, mla_cfg, max_pages) catch @panic("OOM");
+
+    // 3. Create MlaEngine (allocates 11 aligned f32 scratch buffers internally)
+    const engine = std.heap.page_allocator.create(mla_core.MlaEngine) catch @panic("OOM");
+    engine.* = mla_core.MlaEngine.init(std.heap.page_allocator, mla_cfg, cache) catch @panic("OOM");
+
+    // 4. Create context wrapper
+    const ctx = std.heap.page_allocator.create(MlaContext) catch @panic("OOM");
+    ctx.* = .{ .engine = engine, .cache = cache, .allocator = std.heap.page_allocator };
+    return @ptrCast(ctx);
 }
 
 export fn kt_mla_free(mla: *KT_MLA) void {
-    std.heap.page_allocator.destroy(@as(*u8, @ptrCast(mla)));
+    const ctx: *MlaContext = @ptrCast(@alignCast(mla));
+    ctx.engine.deinit();
+    ctx.cache.deinit();
+    std.heap.page_allocator.destroy(ctx.engine);
+    std.heap.page_allocator.destroy(ctx.cache);
+    std.heap.page_allocator.destroy(ctx);
+}
+
+/// Shared implementation for forward and prefill.
+/// Converts BF16 input -> F32, calls engine.forward, converts F32 output -> BF16.
+/// `position_ids` is unused (the engine uses kv_start_pos for absolute positioning,
+/// matching the math fix documented in src/mla/mla_core.zig).
+fn mlaForwardImpl(
+    ctx: *MlaContext,
+    input: [*]const amx.bf16,
+    output: [*]amx.bf16,
+    qlen: usize,
+    kvlen: usize,
+) void {
+    const cfg = ctx.engine.config;
+
+    // BF16 -> F32 input conversion
+    const input_f32 = std.heap.page_allocator.alloc(f32, qlen * cfg.hidden_size) catch @panic("OOM");
+    defer std.heap.page_allocator.free(input_f32);
+    for (0..qlen * cfg.hidden_size) |i| {
+        input_f32[i] = amx.bf16_to_f32(input[i]);
+    }
+
+    // Allocate F32 output
+    const output_f32 = std.heap.page_allocator.alloc(f32, qlen * cfg.hidden_size) catch @panic("OOM");
+    defer std.heap.page_allocator.free(output_f32);
+
+    // Call engine.forward (kv_start_pos = kvlen - qlen for prefill)
+    const kv_start_pos = kvlen - qlen;
+    ctx.engine.forward(input_f32.ptr, output_f32.ptr, qlen, kv_start_pos) catch @panic("forward failed");
+
+    // F32 -> BF16 output conversion
+    for (0..qlen * cfg.hidden_size) |i| {
+        output[i] = amx.f32_to_bf16(output_f32[i]);
+    }
 }
 
 export fn kt_mla_forward(
@@ -508,15 +606,11 @@ export fn kt_mla_forward(
     output: [*]amx.bf16,
     qlen: c_int,
     kvlen: c_int,
-    position_ids: [*]const i64
+    position_ids: [*]const i64,
 ) void {
-    _ = mla;
-    _ = input;
-    _ = output;
-    _ = qlen;
-    _ = kvlen;
-    _ = position_ids;
-    // MLA forward pass - placeholder
+    _ = position_ids; // engine uses kvlen - qlen for kv_start_pos
+    const ctx: *MlaContext = @ptrCast(@alignCast(mla));
+    mlaForwardImpl(ctx, input, output, @intCast(qlen), @intCast(kvlen));
 }
 
 export fn kt_mla_prefill(
@@ -524,40 +618,52 @@ export fn kt_mla_prefill(
     input: [*]const amx.bf16,
     output: [*]amx.bf16,
     qlen: c_int,
-    position_ids: [*]const i64
+    position_ids: [*]const i64,
 ) void {
-    _ = mla;
-    _ = input;
-    _ = output;
-    _ = qlen;
-    _ = position_ids;
-    // MLA prefill - placeholder
+    // Prefill: kvlen = position_ids[qlen-1] + 1 (the last position's abs position + 1)
+    const last_pos = position_ids[@as(usize, @intCast(qlen)) - 1];
+    const kvlen = @as(usize, @intCast(last_pos)) + 1;
+    const ctx: *MlaContext = @ptrCast(@alignCast(mla));
+    mlaForwardImpl(ctx, input, output, @intCast(qlen), kvlen);
 }
 
 export fn kt_mla_decode(
     mla: *KT_MLA,
     input: [*]const amx.bf16,
     output: [*]amx.bf16,
-    position_id: i64
+    position_id: i64,
 ) void {
-    _ = mla;
-    _ = input;
-    _ = output;
-    _ = position_id;
-    // MLA decode - placeholder
+    // Decode: single token, kvlen = position_id + 1
+    const ctx: *MlaContext = @ptrCast(@alignCast(mla));
+    mlaForwardImpl(ctx, input, output, 1, @as(usize, @intCast(position_id)) + 1);
 }
 
 export fn kt_mla_update_kv_cache(
     mla: *KT_MLA,
     kv_cache: *anyopaque,
     new_kv: [*]const amx.bf16,
-    position: i64
+    position: i64,
 ) void {
-    _ = mla;
-    _ = kv_cache;
-    _ = new_kv;
-    _ = position;
-    // Update KV cache - placeholder
+    _ = kv_cache; // external cache not yet supported; engine uses internal cache
+    const ctx: *MlaContext = @ptrCast(@alignCast(mla));
+    const cfg = ctx.engine.config;
+    _ = position; // appendToken appends sequentially; position is implicit
+
+    // new_kv has shape [hidden_size] = [kv_lora_rank + rope_size] for the compressed KV
+    // Split into compressed_kv (nope) and k_pe (rope), convert BF16 -> F32
+    const nope_f32 = std.heap.page_allocator.alloc(f32, cfg.kv_lora_rank) catch @panic("OOM");
+    defer std.heap.page_allocator.free(nope_f32);
+    const rope_f32 = std.heap.page_allocator.alloc(f32, cfg.rope_size) catch @panic("OOM");
+    defer std.heap.page_allocator.free(rope_f32);
+
+    for (0..cfg.kv_lora_rank) |i| {
+        nope_f32[i] = amx.bf16_to_f32(new_kv[i]);
+    }
+    for (0..cfg.rope_size) |i| {
+        rope_f32[i] = amx.bf16_to_f32(new_kv[cfg.kv_lora_rank + i]);
+    }
+
+    ctx.cache.appendToken(nope_f32.ptr, rope_f32.ptr) catch @panic("appendToken failed");
 }
 
 // ============================================================================

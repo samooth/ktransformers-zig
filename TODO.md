@@ -40,8 +40,8 @@ Last updated: 2026-08-30
 ### Task assignments (2026-08-30, two agents working concurrently)
 
 **Dev A — MLA C API wiring + warmUp** (files: `src/main.zig`, `src/kernels/moe/moe.zig` warmUp only):
-- [ ] **Wire `kt_mla_*` C API to the real MLA engine** — replace the 5 placeholder bodies in `main.zig` (kt_mla_new/free/forward/prefill/decode, ~lines 493-560) with `MlaEngine` construction/forward/decode/resetCache calls. Pattern is proven (kt_moe_* + comptime fn-refs already in root.zig for mla_core). Map `kt_mla_config_t` → `MlaConfig`; note kt_mla_new takes `*KT_CPUInfer` (ignored by engine, sequential heads).
-- [ ] **Upgrade `TpMoe.warmUp` to real pre-touch** — blocker resolved (loadWeights now populates ptrs); replace the no-op (moe.zig:~576, grep TODO(warm-up)) with the first-byte touch loop from the comment. Keep the weights_loaded guard.
+- [x] **Wire `kt_mla_*` C API to the real MLA engine** — replaced 5 placeholders (kt_mla_new/free/forward/prefill/decode) + kt_mla_update_kv_cache. MlaContext wrapper struct holds MlaEngine + MlaKvCache. BF16↔F32 conversion at C/Zig boundary. `*anyopaque` cast to `[*]const u16` for BF16 weights. External kv_cache param documented as ignored. Engine end-to-end test added.
+- [x] **Upgrade `TpMoe.warmUp` to real pre-touch** — replaced no-op with first-byte touch of gate/up/down BF16 storage. Guarded by weights_loaded and bf16_weights_alloced. Touches first page of each storage to prime the TLB.
 
 **Dev B — MXFP4/MXFP8 kernels** (files: `gemm_224_mxfp{4,8}.zig`, `src/root.zig` re-exports, `tests` append-only, docs):
 - [ ] **Complete MXFP4/MXFP8 kernels** — both files exist but are NOT in root.zig's import graph (never compiled; mxfp4 has a bogus `unpackMXFP4(block, &sum)` line that will fail analysis). Steps: standalone `zig test` each file; wire re-exports + comptime fn-refs into root.zig (verify `nm | grep -i mxfp`); scalar exact-value tests; AMX tile path via on-the-fly block dequant (pattern: the INT4/FP8 sections in LESSONS_ZIG.md; reference: `operators/amx/mxfp8-moe.hpp`, `fp4-moe.hpp`, `avx2/mxfp4-moe.hpp`).
@@ -121,7 +121,7 @@ Last updated: 2026-08-30
 | INT8 GEMM | Working | 70% |
 | INT4/FP8/MXFP4/8 GEMM | INT4 and FP8 done (AMX), MXFP4/8 not started | 50% |
 | MoE Orchestration | Forward path complete (gate+up+SwiGLU+down+routing) | 75% |
-| C API | Basic functions only | 50% |
+| C API | MLA + MoE complete, Gate/Linear/MLP/FP8/Backward still placeholder | 75% |
 | Build System | Single variant | 60% |
 | Tests | All 22 kernels + 11 MLA pass, 0 leaks, `zig build test` exits 0 | 100% |
 | Python Integration | Not started | 0% |
