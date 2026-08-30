@@ -76,8 +76,8 @@ Last updated: 2026-08-30
 - [x] **MLA attention — code complete in `src/mla/`, re-exported from `root.zig`** (config, cache, core modules wired into the library; 11/11 standalone tests passing). C API integration (`kt_mla_*` in `main.zig`) assigned Dev A — see Task assignments above.
 - [x] **Gate (`kt_gate_*` functions)** — `kt_gate_new` allocates a `GateContext` (BF16 weight pointer + dims); `kt_gate_free` destroys it; `kt_gate_forward` calls `moe.routeExperts` with the stored weights and `null` pool. BF16-only (`@panic` on other dtypes, matching the rest of the C API).
 - [x] **Linear/MLP (`kt_linear_*`, `kt_mlp_*`)** — both wrap a real GEMM (BF16 weight + BF16 input → F32 output → BF16 output). Linear = 1 GEMM; MLP = gate GEMM + up GEMM + F32 SwiGLU + BF16 round-trip + down GEMM. Also fixed `kt_linear_config_t` / `kt_mlp_config_t` / `kt_gate_config_t` to match the C header field names (was: `weight_ptr`/`dtype`; now: `weight`/`weight_type` for Gate, `proj`/`proj_type`/`hidden_type` for Linear, `gate_proj`/`up_proj`/`down_proj`/`*_type`/`hidden_type` for MLP). Linear+MLP end-to-end test in test_kernels.zig exercises the same pipeline via `gemm_bf16` directly. 25/25 tests pass.
+- [x] **SFT/LoRA backward pass** (Dev B) — `TpMoeSft.backward` computes grad_input, 6 LoRA grads (gate/up/down × A/B), base-weight grads, routing-weight grads. `kt_moe_backward` C API export. Smoke test passes (43/43 total).
 - [ ] FP8 layerwise transport (`kt_fp8_*` functions)
-- [ ] Backward pass functions (currently removed from main.zig)
 
 ---
 
@@ -91,6 +91,7 @@ Last updated: 2026-08-30
 ### Runtime
 - [x] **Worker pool work-stealing** — replaced busy-wait spin + broken queue with atomic-counter work-stealing via `std.c.pthread_mutex_t`/`pthread_cond_t`. Workers block on a condvar when idle (no CPU burn). `doWorkStealingJob(count, fn)` distributes `count` tasks across all subpool threads. Verified: 1000 tasks across 4 threads complete correctly.
 - [x] **NUMA topology** — `numaNodeOfCpu()` reads `/sys/devices/system/cpu/cpu{N}/topology/physical_package_id`; `getCpuCountPerNuma()` parses `/proc/cpuinfo` (correctly returns 16 CPUs on 1 NUMA for Ryzen 5800H).
+- [x] **Verify worker_pool.zig** — work-stealing pool with NUMA subpools compiles and runs.
 - [ ] Wire work-stealing into MoE/MLA kernels (currently single-threaded via page_allocator)
 
 ---
@@ -104,7 +105,7 @@ Last updated: 2026-08-30
 - [ ] CI/CD for multi-variant wheel building
 
 ### Advanced Features
-- [ ] SFT/LoRA backward pass kernels
+- [x] **SFT/LoRA backward pass** — forward_sft (Dev A) + backward (Dev B) complete with LoRA kernels; kt_moe_forward_sft/kt_moe_backward/kt_moe_update_lora_weights C API exports. 43/43 tests pass.
 - [ ] Speculative decoding (MTP head)
 - [ ] ARM/KML backend (NEON/SVE)
 - [ ] GGML quantization types compatibility
@@ -125,9 +126,10 @@ Last updated: 2026-08-30
 | INT8 GEMM | Working | 70% |
 | INT4/FP8/MXFP4/8 GEMM | INT4, FP8, MXFP4, MXFP8 all done (AMX + scalar fallback) | 100% |
 | MoE Orchestration | Forward path complete (gate+up+SwiGLU+down+routing); Gate C API wired; weight_ld OOB fixed | 95% |
-| C API | MLA + MoE + Gate + Linear + MLP complete; kt_get_cpu_variant fixed; FP8/Backward still placeholder | 85% |
+| SFT/LoRA Training | Forward + backward complete; 3 C API exports (forward_sft/backward/update_lora) | 70% |
+| C API | MLA + MoE + Gate + Linear + MLP + SFT backward complete; kt_get_cpu_variant fixed; FP8 still placeholder | 90% |
 | Build System | Multi-variant (6 variants, distinct .so names) | 85% |
-| Tests | 28/28 kernels + 11 MLA pass, 0 leaks, zig build test exits 0 | 100% |
+| Tests | 32/32 kernels + 11 MLA = 43 total pass, 0 leaks, zig build test exits 0 | 100% |
 | Python Integration | Minimal ctypes wrapper working | 15% |
 
 ---
@@ -181,8 +183,9 @@ Last updated: 2026-08-30
   multi-variant build (`zig build all-variants` → 6 .so); minimal Python
   ctypes wrapper; kt_get_cpu_variant lazy-init fixed; SFT/LoRA forward half
   (LoRA kernels, TpMoeSft, forward_sft, C API); runtime hardening (work-stealing
-  worker pool, NUMA topology).
+  worker pool, NUMA topology); allocator safety fix (TpMoe stores allocator).
 - **Dev B (concurrent)**: MXFP4/MXFP8 kernels complete; vectorized applySwiGLU
-  complete (bit-exact vs scalar). **Currently implementing SFT/LoRA backward half.**
-- **Last fully-green**: 31/31 kernels + 11/11 MLA = 42/42 total pass, 0 leaks,
+  complete (bit-exact vs scalar); SFT/LoRA backward half complete (backward
+  method, kt_moe_backward export).
+- **Last fully-green**: 32/32 kernels + 11/11 MLA = 43/43 total pass, 0 leaks,
   `zig build test` exits 0.
