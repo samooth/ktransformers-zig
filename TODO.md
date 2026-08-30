@@ -5,7 +5,7 @@
 Last updated: 2026-08-30
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
-**Tests: WORKING** - `zig build test` RUNS all suites: 22 kernels + 11 MLA pass, 0 leaks, exit 0
+**Tests: WORKING** - `zig build test` RUNS all suites: 27 kernels + 11 MLA = 38 total pass, 0 leaks, exit 0
 
 ---
 
@@ -57,7 +57,7 @@ Last updated: 2026-08-30
 ### Kernels
 - [x] **Complete INT4 GPTQ kernel (`gemm_224_int4.zig`)** — replaced scalar fallback with AMX tile path (`tileint8dpd` + on-the-fly INT4→INT8 dequantization). Lo/hi nibble pattern from C++ `GemmKernel224Int4` (amx_kernels.hpp:1559-1848). Per-group scales applied at K-block boundary via `applyScales` (INT32 → FP32). Correctness test added to `tests/kernels/test_kernels.zig`. Non-AMX hosts fall back to the preserved scalar implementation.
 - [x] **Complete FP8 E4M3 kernel (`gemm_224_fp8.zig`)** — replaced scalar fallback with AMX tile path that reuses the BF16 GEMM tiles (`tilebf16dpd` accumulates into FP32, no INT32 scratch). On-the-fly FP8→BF16 dequantization in `loadB` (byte-level, 1:1: each FP8 byte becomes one BF16 short). Per-row scale applied at end of each `(m, n)` block (not per K-step). Tile config matches BF16 (TILE_M=16, TILE_K=32, TILE_N=16, VNNI_BLK=2). Correctness test added (skips on non-AMX). Non-AMX hosts fall back to scalar.
-- [ ] Complete MXFP4/MXFP8 kernels (assigned Dev B — see Task assignments above)
+- [x] **Complete MXFP4/MXFP8 kernels** — both wired into root.zig's import graph; AMX tile path + scalar fallback. 2 exact-value tests; 27 kernels + 11 MLA = 38 total pass, 0 leaks.
 - [ ] Implement `applySwiGLU` vectorized version using `std.simd`
 - [x] **Add actual AMX inline assembly (previously placeholder)** — `ldtilecfg`, `tilerelease`, `tileloadd`, `tilestored`, `tilezero`, `tilebf16dpd`, `tileint8dpd` all wired in `src/kernels/arch/amx.zig` with proper comptime tile-register immediates. Includes XFEATURE_XTILEDATA permission request via `arch_prctl`. Correctness tests added to `tests/kernels/test_kernels.zig` (skip on non-AMX hardware).
 
@@ -119,21 +119,12 @@ Last updated: 2026-08-30
 | Buffer Packing | Working | 80% |
 | BF16 GEMM | Working | 70% |
 | INT8 GEMM | Working | 70% |
-| INT4/FP8/MXFP4/8 GEMM | INT4 and FP8 done (AMX), MXFP4/8 in progress (Dev B) | 50% |
+| INT4/FP8/MXFP4/8 GEMM | INT4, FP8, MXFP4, MXFP8 all done (AMX + scalar fallback) | 100% |
 | MoE Orchestration | Forward path complete (gate+up+SwiGLU+down+routing); Gate C API wired; weight_ld OOB fixed | 95% |
 | C API | MLA + MoE + Gate + Linear + MLP complete; FP8/Backward still placeholder | 85% |
 | Build System | Single variant | 60% |
-| Tests | All 25 kernels pass (incl. Gate+MoE and Linear+MLP end-to-end), 0 leaks, `zig build test` exits 0 | 100% |
+| Tests | All 27 kernels + 11 MLA = 38 total pass, 0 leaks, `zig build test` exits 0 | 100% |
 | Python Integration | Not started | 0% |
-
-> **2026-08-30 status note**: Build is currently broken by Dev B's
-> uncommitted MXFP4/MXFP8 WIP in `src/root.zig` and
-> `src/kernels/amx/gemm_224_mxfp8.zig` (two issues: `fromMatBF16`
-> referenced as a free fn but it's a struct method, and a u8/u32 cast
-> at gemm_224_mxfp8.zig:51). Per AGENTS.md coordination guidance, Dev A
-> does not touch Dev B's WIP. The moe.zig weight_ld OOB fix and the
-> Linear+MLP C API work are in place and will be testable once Dev B's
-> work compiles. Last known good: 25/25 kernels + 11/11 MLA, exit 0.
 
 ---
 
@@ -183,7 +174,7 @@ Last updated: 2026-08-30
 ### Current Status (2026-08-30)
 - **Dev A (this session)**: Linear/MLP C API wired; kt_*_config_t structs
   synced with C header; MoE gemmExpert weight_ld OOB fixed (6 sites).
-  25/25 kernels + 11/11 MLA passed before Dev B's WIP broke the build.
-- **Dev B (concurrent)**: MXFP4/MXFP8 kernel work in progress; build
-  currently broken in their files. See status note above.
-- **Last fully-green**: 25/25 kernels + 11/11 MLA, exit 0.
+  Committed separately from Dev B.
+- **Dev B (concurrent)**: MXFP4/MXFP8 kernels complete; wired into
+  root.zig; 2 exact-value tests. Build is GREEN.
+- **Last fully-green**: 27/27 kernels + 11/11 MLA = 38 total, exit 0.
