@@ -1684,3 +1684,58 @@ Any test comparing vectorized output against scalar must account for the bf16
 round-trip quantization if the vectorized path stores to bf16 — bf16 round-trip
 alone introduces up to 0.025 error, so a 1e-5 tolerance is impossible there.
 Compare in pure f32, or apply the same bf16 round-trip to the scalar reference.
+
+## Worker pool: Zig 0.16 blocking synchronization
+
+The worker pool (`src/runtime/worker_pool.zig`) needs blocking mutex +
+condition-variable so worker threads sleep when idle. Zig 0.16 has NO
+`std.Thread.Mutex` or `std.Thread.Condition` (those are 0.17+). Options:
+
+- `std.atomic.Mutex` — a spinlock only (`tryLock`/`unlock`), no blocking `lock()`.
+  Fine for short critical sections, terrible for idle/wake (burns CPU).
+- `std.Io.Mutex` / `std.Io.Condition` — exist but require an `Io` parameter
+  (async-aware). Overkill for a thread pool.
+- **`std.c.pthread_mutex_t` / `std.c.pthread_cond_t`** — the right tool.
+  Blocking, kernel-level sleep/wake. Requires `mod.link_libc = true` in build.zig.
+
+Pattern (verified working):
+```zig
+// Initialization (static initializer, no runtime init needed)
+mutex: c.PTHREAD_MUTEX_INITIALIZER,
+work_cv: c.PTHREAD_COND_INITIALIZER,
+done_cv: c.PTHREAD_COND_INITIALIZER,
+
+// Worker waits for work
+c.pthread_mutex_lock(&self.mutex);
+while (!self.shutdown.load(.acquire) and !self.active.load(.acquire)) {
+    c.pthread_cond_wait(&self.work_cv, &self.mutex);  // atomically unlocks+sleeps
+}
+c.pthread_mutex_unlock(&self.mutex);
+
+// Main wakes workers
+c.pthread_mutex_lock(&self.mutex);
+self.active.store(true, .release);
+c.pthread_cond_broadcast(&self.work_cv);
+c.pthread_mutex_unlock(&self.mutex);
+
+// Destroy BEFORE freeing the struct (they live inside it!)
+c.pthread_mutex_destroy(&self.mutex);
+c.pthread_cond_destroy(&self.work_cv);
+c.pthread_cond_destroy(&self.done_cv);
+```
+
+Gotchas (verified the hard way):
+- `pthread_cond_wait` ATOMICALLY releases the mutex and sleeps — no missed-wakeup
+  if the waiter holds the mutex while checking the condition.
+- `pthread_cond_signal` from the worker must happen while holding the mutex
+  (or use broadcast) to avoid a missed-wakeup race with the main thread's wait.
+- **Destroy order**: `pthread_mutex_destroy` must be called BEFORE
+  `allocator.destroy(self)` — the mutex lives inside the struct, so destroying
+  after free is a use-after-free segfault.
+- `fopen`/`fread` (for reading /proc/cpuinfo, /sys topology) need `link_libc`.
+  `fread` wants `buf[0..].ptr` (a `[*]u8` many-item pointer), not `&buf[0]`.
+- `std.fmt.bufPrintZ` produces null-terminated `[*:0]u8` for C APIs like `fopen`.
+- `std.mem.trimRight` was renamed to `trimEnd` in 0.16.
+- `std.Thread.getCpuCount()` returns an error union (`catch`, not `orelse`).
+- `AutoHashMap.getOrPut` does NOT zero-initialize new entries — set to 0
+  explicitly before `+= 1` or you add to uninitialized memory.

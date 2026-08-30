@@ -5,7 +5,9 @@
 Last updated: 2026-08-30
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
-**Tests: WORKING** - `zig build test` RUNS all suites: 28 kernels + 11 MLA pass, 0 leaks, exit 0
+**Tests: WORKING** - `zig build test` RUNS all suites: 31 kernels + 11 MLA = 42 total pass, 0 leaks, exit 0
+**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so`, each exporting 59 C API symbols.
+**Runtime: WORKING** - work-stealing worker pool (pthread mutex/cond, threads block when idle); NUMA topology via /sys and /proc/cpuinfo.
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` (avx2, avx512_base, avx512_vnni, avx512_vbmi, avx512_bf16, amx), each exporting 59 C API symbols.
 
 ---
@@ -86,10 +88,10 @@ Last updated: 2026-08-30
 - [x] **Multi-variant build** — `zig build all-variants` builds all 6 variants with distinct names (`libkt_kernel_ext_{variant}.so`). Per-variant C macros preserved; single-variant `-Dvariant=` path kept for dev.
 - [x] **Variant-specific library names** — each variant installs as `libkt_kernel_ext_{suffix}.so`.
 
-### Testing
-- [ ] Run actual tests and verify all pass (compilation works, execution untested)
-- [ ] Integration tests vs C++ reference outputs
-- [ ] Benchmark harness comparing Zig vs C++ performance
+### Runtime
+- [x] **Worker pool work-stealing** — replaced busy-wait spin + broken queue with atomic-counter work-stealing via `std.c.pthread_mutex_t`/`pthread_cond_t`. Workers block on a condvar when idle (no CPU burn). `doWorkStealingJob(count, fn)` distributes `count` tasks across all subpool threads. Verified: 1000 tasks across 4 threads complete correctly.
+- [x] **NUMA topology** — `numaNodeOfCpu()` reads `/sys/devices/system/cpu/cpu{N}/topology/physical_package_id`; `getCpuCountPerNuma()` parses `/proc/cpuinfo` (correctly returns 16 CPUs on 1 NUMA for Ryzen 5800H).
+- [ ] Wire work-stealing into MoE/MLA kernels (currently single-threaded via page_allocator)
 
 ---
 
@@ -116,7 +118,7 @@ Last updated: 2026-08-30
 ## 📊 Progress Tracking
 | Component | Status | % |
 |-----------|--------|---|
-| Runtime (pool/queue/memory/cpu) | Working, basic impl | 75% |
+| Runtime (pool/queue/memory/cpu) | Work-stealing pool + NUMA topology done; kernels still single-threaded | 85% |
 | AMX Intrinsics | Real inline asm (tile_loadconfig/loadd/stored/zero/dpbf16ps/dpbssd) | 90% |
 | Buffer Packing | Working | 80% |
 | BF16 GEMM | Working | 70% |
@@ -177,10 +179,10 @@ Last updated: 2026-08-30
 - **Dev A (this session)**: Linear/MLP C API wired; kt_*_config_t structs
   synced with C header; MoE gemmExpert weight_ld OOB fixed (6 sites);
   multi-variant build (`zig build all-variants` → 6 .so); minimal Python
-  ctypes wrapper; kt_get_cpu_variant lazy-init fixed.
-- **Dev B (concurrent)**: MXFP4/MXFP8 kernels complete (wired into root.zig,
-  AMX tile path + scalar fallback, 2 exact-value tests); vectorized applySwiGLU
-  complete (bit-exact vs scalar, 1 correctness test). Both landed in commits
-  `5a2b6f6` (MXFP) and the vectorized-SwiGLU commit.
-- **Last fully-green**: 28/28 kernels + 11/11 MLA = 39/39 total pass, 0 leaks,
+  ctypes wrapper; kt_get_cpu_variant lazy-init fixed; SFT/LoRA forward half
+  (LoRA kernels, TpMoeSft, forward_sft, C API); runtime hardening (work-stealing
+  worker pool, NUMA topology).
+- **Dev B (concurrent)**: MXFP4/MXFP8 kernels complete; vectorized applySwiGLU
+  complete (bit-exact vs scalar). **Currently implementing SFT/LoRA backward half.**
+- **Last fully-green**: 31/31 kernels + 11/11 MLA = 42/42 total pass, 0 leaks,
   `zig build test` exits 0.

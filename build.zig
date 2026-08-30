@@ -41,6 +41,7 @@ pub fn build(b: *std.Build) void {
                 .target = tgt,
                 .optimize = opt,
             });
+            mod.link_libc = true;
 
             mod.addCMacro("std=c++17", "");
             mod.addCMacro("fPIC", "");
@@ -56,11 +57,12 @@ pub fn build(b: *std.Build) void {
             mod.addCMacro("LLAMA_AVX512_VBMI", if (variant_kind == .avx512_vbmi or variant_kind == .avx512_bf16 or variant_kind == .amx) "1" else "0");
             mod.addCMacro("HAVE_AMX", if (variant_kind == .amx) "1" else "0");
 
-            return builder.addLibrary(.{
+            const lib = builder.addLibrary(.{
                 .name = lib_name,
                 .linkage = .dynamic,
                 .root_module = mod,
             });
+            return lib;
         }
     }.build;
 
@@ -90,7 +92,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    test_mod.addImport("kt", b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize }));
+    const kt_test_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    kt_test_mod.link_libc = true;
+    test_mod.addImport("kt", kt_test_mod);
 
     const test_obj = b.addTest(.{ .root_module = test_mod });
     test_step.dependOn(&b.addRunArtifact(test_obj).step);
@@ -102,7 +106,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    mla_test_mod.addImport("kt", b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize }));
+    const kt_mla_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    kt_mla_mod.link_libc = true;
+    mla_test_mod.addImport("kt", kt_mla_mod);
     const mla_test_obj = b.addTest(.{ .root_module = mla_test_mod });
     test_step.dependOn(&b.addRunArtifact(mla_test_obj).step);
 }

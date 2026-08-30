@@ -113,6 +113,40 @@ test "Worker pool with config" {
     try testing.expect(pool.config.subpool_thread_count[1] == 2);
 }
 
+test "Worker pool work-stealing executes all tasks" {
+    const allocator = testing.allocator;
+    var pool = try worker_pool.WorkerPool.initSimple(allocator, 4);
+    defer pool.deinit();
+
+    const n: usize = 1000;
+    g_test_counter.store(0, .monotonic);
+
+    pool.subpools[0].doWorkStealingJob(n, g_test_incFn);
+
+    try testing.expectEqual(n, g_test_counter.load(.acquire));
+}
+
+var g_test_counter = std.atomic.Value(usize).init(0);
+fn g_test_incFn(_: usize) void {
+    _ = g_test_counter.fetchAdd(1, .monotonic);
+}
+
+test "numaNodeOfCpu reads real topology" {
+    const numa = worker_pool.numaNodeOfCpu(0);
+    // On any valid system, CPU 0 belongs to NUMA node 0
+    try testing.expectEqual(@as(usize, 0), numa);
+}
+
+test "getCpuCountPerNuma parses /proc/cpuinfo" {
+    const allocator = testing.allocator;
+    const counts = try worker_pool.getCpuCountPerNuma(allocator);
+    defer allocator.free(counts);
+    try testing.expect(counts.len >= 1);
+    var total: usize = 0;
+    for (counts) |c| total += c;
+    try testing.expect(total >= 1);
+}
+
 test "Memory arena allocation" {
     const allocator = testing.allocator;
     var arena = memory.SimdArena.init(allocator, 64);
