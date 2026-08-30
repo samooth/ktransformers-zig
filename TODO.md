@@ -5,7 +5,8 @@
 Last updated: 2026-08-30
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
-**Tests: WORKING** - `zig build test` RUNS all suites: 27 kernels + 11 MLA = 38 total pass, 0 leaks, exit 0
+**Tests: MOSTLY WORKING** - `zig build test` RUNS all suites: 27 kernels (26 pass, 1 fail) + 11 MLA pass. 1 known-failing test (see High Priority).
+**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` (avx2, avx512_base, avx512_vnni, avx512_vbmi, avx512_bf16, amx), each exporting 59 C API symbols.
 
 ---
 
@@ -58,7 +59,7 @@ Last updated: 2026-08-30
 - [x] **Complete INT4 GPTQ kernel (`gemm_224_int4.zig`)** — replaced scalar fallback with AMX tile path (`tileint8dpd` + on-the-fly INT4→INT8 dequantization). Lo/hi nibble pattern from C++ `GemmKernel224Int4` (amx_kernels.hpp:1559-1848). Per-group scales applied at K-block boundary via `applyScales` (INT32 → FP32). Correctness test added to `tests/kernels/test_kernels.zig`. Non-AMX hosts fall back to the preserved scalar implementation.
 - [x] **Complete FP8 E4M3 kernel (`gemm_224_fp8.zig`)** — replaced scalar fallback with AMX tile path that reuses the BF16 GEMM tiles (`tilebf16dpd` accumulates into FP32, no INT32 scratch). On-the-fly FP8→BF16 dequantization in `loadB` (byte-level, 1:1: each FP8 byte becomes one BF16 short). Per-row scale applied at end of each `(m, n)` block (not per K-step). Tile config matches BF16 (TILE_M=16, TILE_K=32, TILE_N=16, VNNI_BLK=2). Correctness test added (skips on non-AMX). Non-AMX hosts fall back to scalar.
 - [x] **Complete MXFP4/MXFP8 kernels** — both wired into root.zig's import graph; AMX tile path + scalar fallback. 2 exact-value tests; 27 kernels + 11 MLA = 38 total pass, 0 leaks.
-- [ ] Implement `applySwiGLU` vectorized version using `std.simd`
+- [ ] **Vectorize `applySwiGLU` with `std.simd`** (Dev B) — VecF32=8 vectorized helpers added to `arch/amx.zig`; `applySwiGLU` refactored to branch-once + vector inner loop + scalar tail. Implementation is bit-exact vs scalar in pure f32. **BLOCKED: Dev B's correctness test fails** — not an impl bug, but a test-design issue: it compares bf16-round-tripped output against a pure-f32 scalar reference with 1e-5 tolerance; bf16 round-trip alone introduces up to 0.025 error. Flagged to Dev B.
 - [x] **Add actual AMX inline assembly (previously placeholder)** — `ldtilecfg`, `tilerelease`, `tileloadd`, `tilestored`, `tilezero`, `tilebf16dpd`, `tileint8dpd` all wired in `src/kernels/arch/amx.zig` with proper comptime tile-register immediates. Includes XFEATURE_XTILEDATA permission request via `arch_prctl`. Correctness tests added to `tests/kernels/test_kernels.zig` (skip on non-AMX hardware).
 
 ### MoE Layer
@@ -82,8 +83,8 @@ Last updated: 2026-08-30
 
 ### Build System
 - [x] **Test runner actually runs tests** — replaced `test_step.dependOn(&test_obj.step)` with `test_step.dependOn(&b.addRunArtifact(test_obj).step)` in build.zig for both test modules. Fixed use-after-free in `src/runtime/cpu_detect.zig::detectCpuLinux` (model_name pointed into a soon-to-be-freed buffer). Fixed 3 `.flags = std.ArrayList(u8).init(allocator)` type mismatches.
-- [ ] Re-enable multi-variant build (AVX2, AVX512_base, AVX512_VNNI, AVX512_VBMI, AVX512_BF16, AMX)
-- [ ] Add variant-specific library names (currently all build as `kt_kernel_ext`)
+- [x] **Multi-variant build** — `zig build all-variants` builds all 6 variants with distinct names (`libkt_kernel_ext_{variant}.so`). Per-variant C macros preserved; single-variant `-Dvariant=` path kept for dev.
+- [x] **Variant-specific library names** — each variant installs as `libkt_kernel_ext_{suffix}.so`.
 
 ### Testing
 - [ ] Run actual tests and verify all pass (compilation works, execution untested)
@@ -95,6 +96,7 @@ Last updated: 2026-08-30
 ## 🔵 Low Priority / Nice to Have
 
 ### Python Packaging
+- [x] **Minimal ctypes wrapper** (`python/kt_kernel/__init__.py`) — pure-Python `ctypes` wrapper that `dlopen`s the variant `.so` (auto-detected from `/proc/cpuinfo`), exposes `kt_version`, `kt_get_cpu_variant`, worker pool, CPUInfer, Linear, Gate, MLP, and bf16 conversion functions. Smoke-tested: `import kt_kernel; print(kt_kernel.kt_version())` works.
 - [ ] `pyproject.toml` for `kt-kernel` wheel
 - [ ] Minimal pybind11 wrapper in C++ that loads Zig `.so`
 - [ ] CI/CD for multi-variant wheel building
@@ -121,10 +123,10 @@ Last updated: 2026-08-30
 | INT8 GEMM | Working | 70% |
 | INT4/FP8/MXFP4/8 GEMM | INT4, FP8, MXFP4, MXFP8 all done (AMX + scalar fallback) | 100% |
 | MoE Orchestration | Forward path complete (gate+up+SwiGLU+down+routing); Gate C API wired; weight_ld OOB fixed | 95% |
-| C API | MLA + MoE + Gate + Linear + MLP complete; FP8/Backward still placeholder | 85% |
-| Build System | Single variant | 60% |
-| Tests | All 27 kernels + 11 MLA = 38 total pass, 0 leaks, `zig build test` exits 0 | 100% |
-| Python Integration | Not started | 0% |
+| C API | MLA + MoE + Gate + Linear + MLP complete; kt_get_cpu_variant fixed; FP8/Backward still placeholder | 85% |
+| Build System | Multi-variant (6 variants, distinct .so names) | 85% |
+| Tests | 26/27 kernels + 11 MLA pass; 1 known-failing test (vectorized SwiGLU tolerance — Dev B) | 95% |
+| Python Integration | Minimal ctypes wrapper working | 15% |
 
 ---
 
@@ -173,8 +175,13 @@ Last updated: 2026-08-30
 
 ### Current Status (2026-08-30)
 - **Dev A (this session)**: Linear/MLP C API wired; kt_*_config_t structs
-  synced with C header; MoE gemmExpert weight_ld OOB fixed (6 sites).
-  Committed separately from Dev B.
-- **Dev B (concurrent)**: MXFP4/MXFP8 kernels complete; wired into
-  root.zig; 2 exact-value tests. Build is GREEN.
-- **Last fully-green**: 27/27 kernels + 11/11 MLA = 38 total, exit 0.
+  synced with C header; MoE gemmExpert weight_ld OOB fixed (6 sites);
+  multi-variant build (`zig build all-variants` → 6 .so); minimal Python
+  ctypes wrapper; kt_get_cpu_variant lazy-init fixed.
+- **Dev B (concurrent)**: MXFP4/MXFP8 kernels complete; vectorized
+  applySwiGLU implementation done (bit-exact in f32). Compilation fixes
+  applied by Dev A (@splat, VecF32.len, vector indexing). **His
+  correctness test still fails** — test-design issue (bf16 round-trip
+  vs pure-f32 scalar reference, tolerance 1e-5 too tight). Flagged.
+- **Last fully-green**: 26/27 kernels + 11/11 MLA = 37 total pass,
+  1 known-failing test (Dev B's vectorized SwiGLU).
