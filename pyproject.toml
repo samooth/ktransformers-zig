@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kt-kernel"
+version = "0.6.1"
+description = "ktransformers CPU kernels (Zig port) — drop-in replacement for kt_kernel_ext.so"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.8"
+authors = [{ name = "ktransformers-zig contributors" }]
+keywords = ["ktransformers", "llama", "cpu", "amx", "avx512", "inference"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+
+[project.urls]
+Homepage = "https://github.com/Kilo-Org/kilocode"
+
+[tool.setuptools.packages.find]
+include = ["kt_kernel*"]
+where = ["python"]
+
+[tool.setuptools.package-data]
+kt_kernel = ["libkt_kernel_ext_*.so"]
+
+[tool.setuptools.exclude-package-data]
+kt_kernel = ["*.pyc", "__pycache__"]

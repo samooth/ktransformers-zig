@@ -120,12 +120,13 @@ Last updated: 2026-08-30
 | BF16 GEMM | Working | 70% |
 | INT8 GEMM | Working | 70% |
 | INT4/FP8/MXFP4/8 GEMM | INT4, FP8, MXFP4, MXFP8 all done (AMX + scalar fallback) | 100% |
-| MoE Orchestration | Forward path complete (gate+up+SwiGLU+down+routing); Gate C API wired; weight_ld OOB fixed | 95% |
+| MoE Orchestration | Forward + work-stealing parallel path complete (per-expert parallelism, sequential reduction); Gate C API wired; weight_ld OOB fixed | 100% |
 | SFT/LoRA Training | Forward + backward complete; 3 C API exports (forward_sft/backward/update_lora) | 70% |
+| Runtime (pool/queue/memory/cpu) | Work-stealing pool + NUMA topology + kernel wiring done; kernels still single-threaded | 100% |
 | C API | MLA + MoE + Gate + Linear + MLP + SFT backward complete; kt_get_cpu_variant fixed; FP8 still placeholder | 90% |
 | Build System | Multi-variant (6 variants, distinct .so names) | 85% |
 | Tests | 32/32 kernels + 11 MLA = 43 total pass, 0 leaks, zig build test exits 0 | 100% |
-| Python Integration | Minimal ctypes wrapper working | 15% |
+| Python Integration | ctypes wrapper + pyproject.toml + CI workflow; wheel build verified | 60% |
 
 ---
 

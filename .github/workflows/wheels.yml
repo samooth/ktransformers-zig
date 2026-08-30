@@ -1,0 +1,87 @@
+name: Build and Test Multi-Variant Wheels
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build-variants:
+    name: "Build ${{ matrix.variant }}"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - avx2
+          - avx512_base
+          - avx512_vnni
+          - avx512_vbmi
+          - avx512_bf16
+          - amx
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0-dev
+
+      - name: Build ${{ matrix.variant }}
+        run: zig build -Dvariant=${{ matrix.variant }}
+
+      - name: Upload ${{ matrix.variant }} .so
+        uses: actions/upload-artifact@v4
+        with:
+          name: libkt_kernel_ext_${{ matrix.variant }}
+          path: zig-out/lib/libkt_kernel_ext_*.so
+
+  build-wheel:
+    name: Build Python Wheel
+    needs: build-variants
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0-dev
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build deps
+        run: python -m pip install --upgrade pip setuptools wheel
+
+      - name: Build all variants
+        run: zig build all-variants
+
+      - name: Build wheel
+        run: python setup.py build_ext --inplace
+
+      - name: Install wheel
+        run: |
+          cd python && python -m pip install -e .
+
+      - name: Smoke test
+        run: |
+          python -c "
+          import kt_kernel as kt
+          print('version:', kt.kt_version())
+          print('variant:', kt.kt_get_cpu_variant())
+          assert kt.kt_version() == b'0.6.1-zig'
+          print('OK: import + version + variant auto-detect')
+          "
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: kt-kernel-wheel
+          path: python/kt_kernel/libkt_kernel_ext_*.so
