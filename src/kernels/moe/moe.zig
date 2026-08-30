@@ -320,8 +320,9 @@ pub const TpMoe = struct {
     };
 
     pub fn init(config: MoeConfig, allocator: std.mem.Allocator) !TpMoe {
-        const pool = config.pool orelse return error.NoWorkerPool;
-        const tp_count = pool.config.subpool_count;
+        // Pool is optional: when null, TpMoe runs fully sequential (tp_count=1).
+        // The forward path gates its parallel branch on config.pool != null.
+        const tp_count = if (config.pool) |p| p.config.subpool_count else 1;
 
         // Validate intermediate_size divisible by tp_count
         if (@as(usize, @intCast(config.intermediate_size)) % tp_count != 0) {
@@ -548,46 +549,55 @@ pub const TpMoe = struct {
         const inter = @as(usize, @intCast(self.config.intermediate_size));
         const hidden = @as(usize, @intCast(self.config.hidden_size));
         const expert_num = @as(usize, @intCast(self.config.expert_num));
-        for (0..expert_num) |e| {
-            const count = expert_tokens[e];
-            if (count == 0) continue;
-            const expert_input = std.heap.page_allocator.alloc(amx.bf16, count * hidden) catch @panic("OOM");
-            defer std.heap.page_allocator.free(expert_input);
-            var token_idx: usize = 0;
-            for (0..qlen) |i| {
-                for (0..@as(usize, @intCast(k))) |j| {
-                    const eid = expert_ids[i * @as(usize, @intCast(k)) + j];
-                    if (eid == @as(i64, @intCast(e))){
-                        @memcpy(expert_input[token_idx * hidden ..][0..hidden], input[i * hidden ..][0..hidden]);
-                        token_idx += 1;
+        if (self.config.pool) |pool| {
+            const route_len = qlen * @as(usize, @intCast(k));
+            self.forwardParallel(
+                expert_num, qlen, k, expert_tokens,
+                expert_ids[0..route_len], weights[0..route_len],
+                input[0..qlen * hidden], output_f32, hidden, inter, pool,
+            );
+        } else {
+            for (0..expert_num) |e| {
+                const count = expert_tokens[e];
+                if (count == 0) continue;
+                const expert_input = std.heap.page_allocator.alloc(amx.bf16, count * hidden) catch @panic("OOM");
+                defer std.heap.page_allocator.free(expert_input);
+                var token_idx: usize = 0;
+                for (0..qlen) |i| {
+                    for (0..@as(usize, @intCast(k))) |j| {
+                        const eid = expert_ids[i * @as(usize, @intCast(k)) + j];
+                        if (eid == @as(i64, @intCast(e))){
+                            @memcpy(expert_input[token_idx * hidden ..][0..hidden], input[i * hidden ..][0..hidden]);
+                            token_idx += 1;
+                        }
                     }
                 }
-            }
-            const gate_output = std.heap.page_allocator.alloc(amx.bf16, count * inter) catch @panic("OOM");
-            defer std.heap.page_allocator.free(gate_output);
-            const up_output = std.heap.page_allocator.alloc(amx.bf16, count * inter) catch @panic("OOM");
-            defer std.heap.page_allocator.free(up_output);
-            self.forwardGateUp(e, count, expert_input.ptr, gate_output.ptr, up_output.ptr);
-            for (0..count * inter) |idx| {
-                const g = amx.bf16_to_f32(gate_output[idx]);
-                const u = amx.bf16_to_f32(up_output[idx]);
-                gate_output[idx] = amx.f32_to_bf16(amx.swiglu(g, u));
-            }
-            token_idx = 0;
-            for (0..qlen) |i| {
-                for (0..@as(usize, @intCast(k))) |j| {
-                    const eid = expert_ids[i * @as(usize, @intCast(k)) + j];
-                    if (eid == @as(i64, @intCast(e))) {
-                        const expert_down_out = std.heap.page_allocator.alloc(amx.bf16, hidden) catch @panic("OOM");
-                        defer std.heap.page_allocator.free(expert_down_out);
-                        @memset(expert_down_out, 0);
-                        self.forwardDown(e, count, gate_output.ptr, expert_down_out.ptr);
-                        const w = weights[i * @as(usize, @intCast(k)) + j];
-                        for (0..hidden) |h| {
-                            const val = amx.bf16_to_f32(expert_down_out[h]);
-                            output_f32[i * hidden + h] += val * w;
+                const gate_output = std.heap.page_allocator.alloc(amx.bf16, count * inter) catch @panic("OOM");
+                defer std.heap.page_allocator.free(gate_output);
+                const up_output = std.heap.page_allocator.alloc(amx.bf16, count * inter) catch @panic("OOM");
+                defer std.heap.page_allocator.free(up_output);
+                self.forwardGateUp(e, count, expert_input.ptr, gate_output.ptr, up_output.ptr);
+                for (0..count * inter) |idx| {
+                    const g = amx.bf16_to_f32(gate_output[idx]);
+                    const u = amx.bf16_to_f32(up_output[idx]);
+                    gate_output[idx] = amx.f32_to_bf16(amx.swiglu(g, u));
+                }
+                token_idx = 0;
+                for (0..qlen) |i| {
+                    for (0..@as(usize, @intCast(k))) |j| {
+                        const eid = expert_ids[i * @as(usize, @intCast(k)) + j];
+                        if (eid == @as(i64, @intCast(e))) {
+                            const expert_down_out = std.heap.page_allocator.alloc(amx.bf16, hidden) catch @panic("OOM");
+                            defer std.heap.page_allocator.free(expert_down_out);
+                            @memset(expert_down_out, 0);
+                            self.forwardDown(e, count, gate_output.ptr, expert_down_out.ptr);
+                            const w = weights[i * @as(usize, @intCast(k)) + j];
+                            for (0..hidden) |h| {
+                                const val = amx.bf16_to_f32(expert_down_out[h]);
+                                output_f32[i * hidden + h] += val * w;
+                            }
+                            token_idx += 1;
                         }
-                        token_idx += 1;
                     }
                 }
             }

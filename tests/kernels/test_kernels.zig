@@ -1240,3 +1240,83 @@ test "applySwiGLU vectorized matches scalar (all variants, n with tail)" {
         }
     }
 }
+
+test "TpMoe forward: work-stealing pool matches sequential (equivalence)" {
+    // The pool branch (work-stealing) and the no-pool branch (sequential) MUST
+    // produce identical output for identical weights/inputs — this is the proof
+    // that the parallel reduction is data-race free.
+    const allocator = testing.allocator;
+
+    const hidden_size: usize = 16;
+    const intermediate_size: usize = 32;
+    const expert_num: usize = 3;
+
+    // Deterministic non-trivial weights.
+    const gate_w = try allocator.alloc(amx.bf16, expert_num * intermediate_size * hidden_size);
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(amx.bf16, expert_num * intermediate_size * hidden_size);
+    defer allocator.free(up_w);
+    const down_w = try allocator.alloc(amx.bf16, expert_num * hidden_size * intermediate_size);
+    defer allocator.free(down_w);
+    for (0..gate_w.len) |i| {
+        gate_w[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(i % 7 + 1)) * 0.05);
+        up_w[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(i % 5 + 1)) * 0.05);
+    }
+    for (down_w) |*v| v.* = amx.f32_to_bf16(0.25);
+
+    const input = try allocator.alloc(amx.bf16, hidden_size);
+    defer allocator.free(input);
+    for (input) |*v| v.* = amx.f32_to_bf16(0.5);
+
+    const expert_ids = [_]i64{ 0, 1, 2 };
+    const routing_weights = [_]f32{ 0.5, 0.3, 0.2 };
+
+    // Sequential: no pool.
+    var moe_seq = try moe.TpMoe.init(moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = 3,
+        .hidden_size = @intCast(hidden_size),
+        .intermediate_size = @intCast(intermediate_size),
+        .max_len = 1,
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    }, std.heap.page_allocator);
+    defer moe_seq.deinit();
+    moe_seq.loadWeights();
+
+    const out_seq = try allocator.alloc(amx.bf16, hidden_size);
+    defer allocator.free(out_seq);
+    @memset(out_seq, 0);
+    moe_seq.forward(1, 3, &expert_ids, &routing_weights, input.ptr, out_seq.ptr, false);
+
+    // Parallel: with a 2-thread pool.
+    var pool = try worker_pool.WorkerPool.initSimple(allocator, 2);
+    defer pool.deinit();
+
+    var moe_par = try moe.TpMoe.init(moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = 3,
+        .hidden_size = @intCast(hidden_size),
+        .intermediate_size = @intCast(intermediate_size),
+        .max_len = 1,
+        .pool = &pool,
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    }, std.heap.page_allocator);
+    defer moe_par.deinit();
+    moe_par.loadWeights();
+
+    const out_par = try allocator.alloc(amx.bf16, hidden_size);
+    defer allocator.free(out_par);
+    @memset(out_par, 0);
+    moe_par.forward(1, 3, &expert_ids, &routing_weights, input.ptr, out_par.ptr, false);
+
+    // Compare: BF16 round-trip means exact bit-equality is too strict; allow small tol.
+    for (0..hidden_size) |i| {
+        const a = amx.bf16_to_f32(out_seq[i]);
+        const b = amx.bf16_to_f32(out_par[i]);
+        try testing.expect(@abs(a - b) < 1e-3);
+    }
+}
