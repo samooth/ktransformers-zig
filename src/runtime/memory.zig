@@ -26,8 +26,7 @@ pub const SimdArena = struct {
 
     /// Allocate with alignment (default 64 bytes for cache lines)
     pub fn alignedAlloc(self: *SimdArena, comptime T: type, count: usize, comptime alignment_val: usize) ![]T {
-        const bytes = count * @sizeOf(T);
-        const ptr = self.arena.allocator().alignedAlloc(T, @as(std.mem.Alignment, @enumFromInt(std.math.log2(alignment_val))), bytes);
+        const ptr = self.arena.allocator().alignedAlloc(T, @as(std.mem.Alignment, @enumFromInt(std.math.log2(alignment_val))), count);
         return ptr;
     }
 

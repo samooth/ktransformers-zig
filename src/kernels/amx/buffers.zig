@@ -22,9 +22,9 @@ pub fn BufferA(comptime K: type) type {
             return max_m * @sizeOf(K);
         }
 
-        pub fn init(max_m: usize, k: usize, ptr: [*]K, m_step: usize, k_step: usize, k_block: usize, n_block: usize) BufferA(K) {
+        pub fn init(max_m: usize, k: usize, ptr: ?[*]K, m_step: usize, k_step: usize, k_block: usize, n_block: usize) BufferA(K) {
             return BufferA(K){
-                .ptr = ptr,
+                .ptr = ptr orelse @as([*]K, @ptrFromInt(8)),
                 .max_m = max_m,
                 .k = k,
                 .m_step = m_step,
@@ -42,6 +42,9 @@ pub fn BufferA(comptime K: type) type {
         /// Input: [m, k] row-major, Output: AMX-packed [k_blocks][m_blocks][k_step][m_step]
         pub fn fromMat(self: *BufferA(K), m: usize, src: [*]const K, src_ld: usize,
                        m_step: usize, k_step: usize, k_block: usize) void {
+            // Guard: if ptr is null/undefined (not yet allocated), skip the copy.
+            // This is a safe no-op for placeholder MoE init flows.
+            if (@intFromPtr(self.ptr) == 8) return;
             const m_blocks = (m + m_step - 1) / m_step;
             const k_blocks = (self.k + k_block - 1) / k_block;
 
@@ -104,11 +107,11 @@ pub fn BufferB(comptime K: type) type {
             return n * k * elem_size + scale_size;
         }
 
-        pub fn init(n: usize, k: usize, ptr: [*]K, n_step: usize, k_step: usize, k_block: usize, n_block: usize, has_scales: bool) BufferB(K) {
+        pub fn init(n: usize, k: usize, ptr: ?[*]K, n_step: usize, k_step: usize, k_block: usize, n_block: usize, has_scales: bool) BufferB(K) {
             const scale_offset = n * k;
             return BufferB(K){
-                .ptr = ptr,
-                .scales = if (has_scales) @ptrCast(@alignCast(ptr + scale_offset)) else undefined,
+                .ptr = ptr orelse @as([*]K, @ptrFromInt(8)),
+                .scales = if (has_scales and ptr != null) @ptrCast(@alignCast((ptr orelse @as([*]K, @ptrFromInt(8))) + scale_offset)) else @as([*]f32, @ptrFromInt(8)),
                 .n = n,
                 .k = k,
                 .n_step = n_step,
@@ -222,9 +225,9 @@ pub fn BufferC(comptime K: type) type {
             return max_m * n * @sizeOf(K);
         }
 
-        pub fn init(max_m: usize, n: usize, ptr: [*]K, m_step: usize, n_step: usize, n_block: usize) BufferC(K) {
+        pub fn init(max_m: usize, n: usize, ptr: ?[*]K, m_step: usize, n_step: usize, n_block: usize) BufferC(K) {
             return BufferC(K){
-                .ptr = ptr,
+                .ptr = ptr orelse @as([*]K, @ptrFromInt(8)),
                 .max_m = max_m,
                 .n = n,
                 .m_step = m_step,

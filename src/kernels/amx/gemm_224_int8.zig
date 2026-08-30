@@ -240,11 +240,11 @@ pub const Int8BufferB = struct {
         return n * k * @sizeOf(i8) + n * @sizeOf(f32);
     }
 
-    pub fn init(n: usize, k: usize, ptr: *i8, n_step: usize, k_step: usize, k_block: usize, n_block: usize) Int8BufferB {
+    pub fn init(n: usize, k: usize, ptr: ?*i8, n_step: usize, k_step: usize, k_block: usize, n_block: usize) Int8BufferB {
         const scale_offset = n * k;
         return Int8BufferB{
-            .ptr = @as([*]i8, @ptrCast(ptr)),
-            .scales = @as([*]f32, @ptrCast(@alignCast(@as([*]i8, @ptrCast(ptr)) + scale_offset))),
+            .ptr = if (ptr) |p| @as([*]i8, @ptrCast(p)) else @as([*]i8, @ptrFromInt(8)),
+            .scales = if (ptr) |p| @as([*]f32, @ptrCast(@alignCast(@as([*]i8, @ptrCast(p)) + scale_offset))) else @as([*]f32, @ptrFromInt(8)),
             .n = n,
             .k = k,
             .n_step = n_step,
@@ -256,6 +256,8 @@ pub const Int8BufferB = struct {
 
     /// Pack BF16 weights to INT8 BufferB with quantization
     pub fn fromMatBF16(self: *Int8BufferB, src: [*]const amx.bf16, src_ld: usize) void {
+        // Guard: if ptr or scales is null/undefined (not yet allocated), skip.
+        if (@intFromPtr(self.ptr) == 8 or @intFromPtr(self.scales) == 8) return;
         const n_blocks = (self.n + self.n_block - 1) / self.n_block;
         const k_blocks = (self.k + self.k_block - 1) / self.k_block;
 

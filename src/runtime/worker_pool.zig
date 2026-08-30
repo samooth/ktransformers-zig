@@ -50,13 +50,14 @@ pub const Subpool = struct {
         numa_id: usize,
         thread_count: usize,
         _enable_work_stealing: bool,
-    ) !Subpool {
+    ) !*Subpool {
         _ = _enable_work_stealing;
         const queue: std.ArrayList(WorkItem) = .{};
         const queue_mutex: std.Io.Mutex = .init;
-        var threads = try allocator.alloc(std.Thread, thread_count);
+        const threads = try allocator.alloc(std.Thread, thread_count);
 
-        var subpool = Subpool{
+        const subpool = try allocator.create(Subpool);
+        subpool.* = Subpool{
             .threads = threads,
             .queue = queue,
             .queue_mutex = queue_mutex,
@@ -67,7 +68,7 @@ pub const Subpool = struct {
         };
 
         for (0..thread_count)  | i |  {
-            threads[i] = try std.Thread.spawn(.{}, Subpool.workerLoop, .{ &subpool, i });
+            threads[i] = try std.Thread.spawn(.{}, Subpool.workerLoop, .{ subpool, i });
         }
 
         return subpool;
@@ -77,10 +78,10 @@ pub const Subpool = struct {
         _ = thread_idx;
         // Placeholder worker loop - real implementation would process work items
         while (true) {
-            // Spin-wait to avoid sleep API complexity in Zig 0.16
-            var spin: u32 = 0;
-            while (spin < 1000000) : (spin += 1) {}
             if (self.shutdown.load(.acquire)) break;
+            // Brief spin to avoid sleeping on the hot path; short enough
+            // that shutdown is observed within ~1ms even under contention.
+            std.atomic.spinLoopHint();
         }
     }
 
@@ -97,18 +98,19 @@ pub const Subpool = struct {
             thread.join();
         }
         allocator.free(self.threads);
+        allocator.destroy(self);
     }
 };
 
 /// Main worker pool with NUMA-aware subpools
 pub const WorkerPool = struct {
     config: WorkerPoolConfig,
-    subpools: []Subpool,
+    subpools: []*Subpool,
     allocator: Allocator,
     backend: u32, // placeholder for thread pool backend (std.Thread.Pool removed in Zig 0.16)
 
     pub fn init(allocator: Allocator, config: WorkerPoolConfig) !WorkerPool {
-        var subpools = try allocator.alloc(Subpool, config.subpool_count);
+        const subpools = try allocator.alloc(*Subpool, config.subpool_count);
 
         for (0..config.subpool_count)  | i |  {
             subpools[i] = try Subpool.init(
@@ -218,7 +220,7 @@ pub const WorkerPool = struct {
     }
 
     pub fn deinit(self: *WorkerPool) void {
-        for (self.subpools) |*subpool| {
+        for (self.subpools) |subpool| {
             subpool.deinit(self.allocator);
         }
         self.allocator.free(self.subpools);

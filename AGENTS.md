@@ -1,171 +1,130 @@
 # AGENTS.md - ktransformers-zig
 
-Guidance for AI agents working on this project.
+Guidance for AI agents working on this repo. **Read `LESSONS_ZIG.md` before
+writing any Zig code** — this toolchain (0.16.0-dev) differs significantly
+from what you likely remember, and the lessons file contains dozens of
+verified gotchas.
 
 ## Project Context
 
-Porting ktransformers CPU kernels (C++/AMX/AVX2/AVX512) to Zig for drop-in replacement of `kt_kernel_ext.so`.
+Port of ktransformers CPU kernels (C++/AMX/AVX2/AVX512) to Zig, as a drop-in
+replacement for `kt_kernel_ext.so` (C API in `include/kt_kernel.h`, loaded
+from Python via pybind11).
 
-**Target**: 6 CPU variants (AVX2, AVX512_base, AVX512_VNNI, AVX512_VBMI, AVX512_BF16, AMX) with Python pybind11 compatibility.
+- **Zig version**: 0.16.0-dev.2535+ (APIs verified against this build; see LESSONS_ZIG.md)
+- **C++ reference**: `/ai/repos/2026/ktransformers/ktransformers/kt-kernel/`
+  - `operators/amx/la/amx_kernels.hpp` — GemmKernel224 BF16/INT8/INT4
+  - `operators/amx/moe_base.hpp`, `operators/amx/moe.hpp` — AMX MoE
+  - `operators/moe-tp.hpp` — TP_MOE_Common (monolithic forward)
+  - `operators/llamafile/mla.hpp`, `operators/mla-tp.hpp` — MLA attention
+  - `operators/rope.hpp` — RoPE/YaRN reference
+  - `cpu_backend/worker_pool.h`, `ext_bindings.cpp`
+- **External kernels** (optional, from `/home/t0m4s/repos/2026/zig-ai`):
+  `src/moe/cpu_gemv.zig` (quantized GEMV), `src/moe/cpu_executor.zig` — add to
+  `build.zig.zon` when needed.
 
-**Reference**: Original C++ at `/ai/repos/2026/ktransformers/ktransformers/kt-kernel/`
-
-## Build System
+## Build & Test
 
 ```bash
-# Build (default AVX2)
-zig build
-
-# Specific variant
-zig build -Dvariant=amx
-
-# Test
-zig build test
-
-# Install
-zig build install
+zig build                 # default AVX2 -> zig-out/lib/libkt_kernel_ext.so
+zig build -Dvariant=amx   # avx2|avx512_base|avx512_vnni|avx512_vbmi|avx512_bf16|amx
+zig build test            # runs both suites (kernels + MLA) — tests EXECUTE now
+zig test src/mla/mla_tests.zig   # standalone MLA suite
 ```
 
-Output: `zig-out/lib/kt_kernel_ext_<variant>.so`
-
-**Zig version**: 0.16.0-dev.2535+
+Caveats (verified the hard way — see LESSONS_ZIG.md for details):
+- All variants currently install the SAME name `libkt_kernel_ext.so`.
+- Tests only run because build.zig uses `addRunArtifact`; `test_step.dependOn(&test_obj.step)` alone only compiles.
+- If a build error survives a no-op rebuild, suspect stale `.zig-cache`: `rm -rf .zig-cache zig-out`.
 
 ## Code Structure
 
+Imported (reachable from `src/root.zig`, compiled into the .so):
 ```
 src/
-├── main.zig              # C API exports (kt_version, kt_moe_*, etc.)
-├── runtime/
-│   ├── memory.zig        # SimdArena, NumaAllocator, SharedBuffer, BufferPool
-│   ├── worker_pool.zig   # NUMA subpools, work stealing
-│   ├── task_queue.zig    # SPSC + MPMC lock-free queues
-│   └── cpu_detect.zig    # CPU vendor/features, variant selection
-└── kernels/
-    ├── arch/amx.zig      # AMX tile intrinsics (ldtilecfg, tdpbf16ps, etc.)
-    ├── amx/
-    │   ├── buffers.zig   # BufferA/B/C packing, quantization
-    │   ├── gemm_224_bf16.zig
-    │   └── gemm_224_int8.zig
-    └── moe/moe.zig       # TpMoe: expert routing, computeExpert, loadWeights
+├── root.zig                    # module re-exports + comptime fn-refs forcing analysis
+├── main.zig                    # C API exports (kt_*) — mirrors include/kt_kernel.h
+├── runtime/{memory,worker_pool,task_queue,cpu_detect}.zig
+├── numa/                       # NUMA topology/memory/worker (not yet in root.zig)
+├── kernels/
+│   ├── arch/amx.zig            # AMX inline asm (ldtilecfg, tilebf16dpd, ...) + XFEATURE enable
+│   ├── amx/{buffers,gemm_224_{bf16,int8,int4,fp8}}.zig
+│   └── moe/moe.zig             # TpMoe: routing, loadWeights, 5 per-expert methods
+└── mla/                        # MLA attention (DeepSeek-V2/V3): config/cache/core
 ```
+
+NOT imported (dead code — excluded by Zig's lazy analysis; don't assume they compile):
+`kernels/amx/gemm_224_{bf16,int8,int4,fp8}_avx512.zig` (also imports a
+nonexistent `arch/amx_intrinsics.zig`), `gemm_224_mxfp{4,8}.zig`,
+`numa/`. Also: `main.zig.backup*` are stale snapshots.
+
+## Status (see TODO.md for details)
+
+- Build: working; all 6 variants compile (default AVX2 installed).
+- C API: `kt_moe_*`, `kt_mla_*` (placeholder bodies), plus conversions exported.
+- MoE: `loadWeights` BF16 branch only packs `gate_proj` (known bug);
+  `forwardGateUp`/`forwardDown` are documented no-ops pending that fix;
+  `forward`'s expert GEMM is disabled (placeholder).
+- MLA: complete in `src/mla/` (absorbed attention, latent KV cache);
+  `kt_mla_*` C API still placeholder.
+- Tests: kernels 21 + MLA 11, run for real via addRunArtifact; known
+  failures tracked in TODO.md.
 
 ## Key Patterns
 
-### Zig 0.16 Specifics
-- `@import("relative/path.zig")` for modules (not `addIncludePath`)
-- `std.meta.stringToEnum(T, str)` not `EnumVariant`
-- Unused params/locals are errors → prefix with `_`
-- `@round()` takes 1 arg; use `@intCast(x + 0.5)` for rounding
-- `f32_MAX` → `std.math.max(f32)`
+### Zig 0.16 quick rules (full list in LESSONS_ZIG.md)
+- `std.ArrayList(T)` is UNMANAGED: `.empty` init, `list.append(allocator, x)`, `list.deinit(allocator)`.
+- `allocator.alignedAlloc(T, .@"64", n)` — alignment is a comptime enum, `n` is ELEMENT count.
+- Unused params are errors (`_ = param;` or rename `_param`); `&&`→`and`; no `@intToFloat`; `std.mem.eql` for strings.
+- Vector element writes need comptime index — stage through an array (`const v: Vec16 = arr;` coerces both ways).
+- Test/entrypoint signatures: `test "x" {}` unchanged; `pub fn main(init: std.process.Init) !void`.
 
-### AMX Intrinsics
+### AMX inline asm (verified working, see arch/amx.zig)
 ```zig
 asm volatile (
-    "ldtilecfg [%0]"
+    "ldtilecfg (%[cfg])"
     :
-    : "r" (cfg)
+    : [cfg] "r" (cfg),
     : "memory"
 );
+// Tile reg must be an immediate: pass as u8 with "n" constraint,
+// splice with %%tmm%[tmm]; memory operands look like (%[base],%[stride],1)
 ```
-Tile regs: `TileReg.tmm0` through `TileReg.tmm7`
+Requires one-time `arch_prctl` XFEATURE_XTILEDATA enable (done in `tile_loadconfig`).
 
-### CRTP Pattern (from C++)
-```zig
-// Base holds common logic, derived provides kernel config
-const Kernel = struct {
-    pub const TILE_M = 16;
-    pub fn config() void { ... }
-};
+### Library wiring (the lazy-analysis trap)
+A `pub const mod = @import(...)` re-export in root.zig does NOT emit the
+module's code. Reference the functions in a `comptime { _ = &mod.fn; }` block,
+and verify with `nm zig-out/lib/libkt_kernel_ext.so | grep <symbol>`
+(plain `nm` shows internal `t` symbols; `nm -D` only shows `export fn` C API).
 
-const MoE = struct {
-    fn computeExpert(...) void { Kernel.config(); ... }
-};
-```
-
-### C API Export
+### C API export
 ```zig
 export fn kt_moe_forward(moe_ptr: *KT_MOE, ...) void {
-    const m = @ptrCast(moe.TpMoe, moe_ptr);
+    const m: *moe.TpMoe = @ptrCast(@alignCast(moe_ptr));
     m.forward(...);
 }
 ```
+Opaque handles (`KT_MOE` etc.) are `opaque {}`; wrappers cast to the real type.
+`kt_moe_new` allocates with `std.heap.page_allocator` — `deinit` methods must
+free with the same (they take no allocator param).
 
-## Current Status
-
-**Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
-
-See `TODO.md` for remaining work and `LESSONS_ZIG.md` for Zig 0.16 syntax gotchas.
-
-### Immediate Fixes Needed
-1. Module imports: `@import("arch/amx.zig")` fails - need `src/root.zig` re-exports
-2. `buffers.zig`: unused params, `@truncate` → `@intCast`, `f32_MAX` → `std.math.max(f32)`
-3. `gemm_224_int8.zig`: missing `}`
-4. `arch/amx.zig:69`: inline asm syntax
-5. `moe.zig:426`: ternary in arg needs parens
-6. `main.zig:295`: `@ptrCast` single arg
-
-## Testing
-
-```bash
-zig build test
-```
-Tests in `tests/kernels/test_kernels.zig` cover: BF16 conversion, buffer sizes, CPU detection, worker pool, memory arena, SwiGLU, quantization.
-
-## Python Integration
-
-C API in `include/kt_kernel.h` matches ktransformers. Python loads via pybind11 wrapper:
-```python
-# In ktransformers Python package
-from kt_kernel import MOE  # loads kt_kernel_ext.so
-```
-
-## Reference Implementation
-
-Original C++ at `/ai/repos/2026/ktransformers/ktransformers/kt-kernel/`:
-- `operators/amx/la/amx_kernels.hpp` - GemmKernel224BF/INT8/INT4
-- `operators/amx/moe_base.hpp` - AMX_MOE_BASE
-- `operators/amx/moe.hpp` - AMX_MOE_TP
-- `operators/moe-tp.hpp` - TP_MOE_Common
-- `cpu_backend/worker_pool.h` - WorkerPool
-- `ext_bindings.cpp` - pybind11 exports
-
-## Zig-AI Dependency
-
-Some CPU kernels from `/home/t0m4s/repos/2026/zig-ai`:
-- `src/moe/cpu_gemv.zig` - Quantized GEMV
-- `src/moe/cpu_executor.zig` - Worker pool
-- `kernels/dequant_*.cu` - GGUF dequant CUDA
-
-Add to `build.zig.zon` when needed.
+### TpMoe per-expert decomposition (Zig-port design; C++ forward is monolithic)
+`forwardGateUp`/`forwardDown` split the expert pass so Python can interleave
+custom ops (e.g. alternate SwiGLU variants). Pattern: iterate `tp_count`
+ranks, slice per-rank output offsets, accumulate down-proj in FP32 -> BF16.
+Currently shipped as guarded no-ops with the real version in comments —
+enabled by the loadWeights fix.
 
 ## Documentation
 
-- `README.md` - Project overview
-- `TODO.md` - Task tracking with priorities
-- `PLAN.md` - Full porting plan (20 weeks)
-- `LESSONS_ZIG.md` - Zig 0.16 lessons learned (READ THIS FIRST for Zig syntax/idioms)
-- `LESSONS_KTRANSFORMERS.md` - ktransformers architecture notes
+- `README.md` — project overview
+- `TODO.md` — task tracking (source of truth for current status)
+- `LESSONS_ZIG.md` — Zig 0.16 gotchas, verified AMX asm patterns, lazy-analysis/integration lessons (**read first**)
+- `include/kt_kernel.h` — C API contract (do not change without coordinating: Python/pybind11 depends on it)
 
-## Critical: Zig 0.16 Gotchas (from LESSONS_ZIG.md)
+## Coordination notes
 
-**READ `LESSONS_ZIG.md` BEFORE WRITING ANY ZIG CODE** - the syntax differs significantly from older versions:
-
-1. **Module imports**: Use `src/root.zig` as root, re-export submodules with `pub const x = @import("...");`. Do NOT use `addIncludePath()` for Zig modules.
-
-2. **Unused parameters**: Prefix with `_` AND add explicit `_ = param;` if still flagged.
-
-3. **`&&` is ambiguous** - use `and` instead.
-
-4. **String comparison**: Use `std.mem.eql(u8, a, b)` not `==`.
-
-5. **Struct declarations at top level**: Use `pub const X = struct { ... };` not `pub struct X { ... };`.
-
-6. **Single-line if/else**: Wrap in braces: `if (cond) { ... } else { ... }`.
-
-7. **Alignment** is a reserved keyword - use `alignment`.
-
-8. **AMX inline asm syntax**: Use `asm (...)` not `asm volatile (...)` in Zig 0.16.
-
-9. **`std.StringArray`** doesn't exist - use `std.ArrayList([]const u8)`.
-
-10. **`@intToFloat`/`@intToInt`** don't exist - use `@as(T, @intCast(val))`.
+- `PLAN.md`, `LESSONS_KTRANSFORMERS.md` referenced by older docs do not exist.
+- Multiple agents have worked in this tree concurrently: before running
+  `git stash`/`git checkout`, check `git status` for live WIP that isn't yours.

@@ -253,61 +253,61 @@ pub const TpMoe = struct {
             experts[e] = ExpertData{
                 .gate_bf16 = buffers.BufferA(amx.bf16).init(
                     @as(usize, @intCast(config.maxPossibleQlen())), @as(usize, @intCast(config.hidden_size)),
-                    undefined, gemm_bf16.GemmKernel224BF.M_STEP,
+                    null, gemm_bf16.GemmKernel224BF.M_STEP,
                     gemm_bf16.GemmKernel224BF.K_STEP,
                     gemm_bf16.GemmKernel224BF.K_BLOCK,
                     gemm_bf16.GemmKernel224BF.N_BLOCK
                 ),
                 .up_bf16 = buffers.BufferA(amx.bf16).init(
                     @as(usize, @intCast(config.maxPossibleQlen())), @as(usize, @intCast(config.hidden_size)),
-                    undefined, gemm_bf16.GemmKernel224BF.M_STEP,
+                    null, gemm_bf16.GemmKernel224BF.M_STEP,
                     gemm_bf16.GemmKernel224BF.K_STEP,
                     gemm_bf16.GemmKernel224BF.K_BLOCK,
                     gemm_bf16.GemmKernel224BF.N_BLOCK
                 ),
                 .down_bf16 = buffers.BufferA(amx.bf16).init(
                     @as(usize, @intCast(config.maxPossibleQlen())), @as(usize, @intCast(expert_config.intermediate_size)),
-                    undefined, gemm_bf16.GemmKernel224BF.M_STEP,
+                    null, gemm_bf16.GemmKernel224BF.M_STEP,
                     gemm_bf16.GemmKernel224BF.K_STEP,
                     gemm_bf16.GemmKernel224BF.K_BLOCK,
                     gemm_bf16.GemmKernel224BF.N_BLOCK
                 ),
                 .gate_int8 = gemm_int8.Int8BufferB.init(
                     @as(usize, @intCast(expert_config.intermediate_size)), @as(usize, @intCast(config.hidden_size)),
-                    undefined, gemm_int8.GemmKernel224Int8.N_STEP,
+                    null, gemm_int8.GemmKernel224Int8.N_STEP,
                     gemm_int8.GemmKernel224Int8.K_STEP,
                     gemm_int8.GemmKernel224Int8.K_BLOCK,
                     gemm_int8.GemmKernel224Int8.N_BLOCK
                 ),
                 .up_int8 = gemm_int8.Int8BufferB.init(
                     @as(usize, @intCast(expert_config.intermediate_size)), @as(usize, @intCast(config.hidden_size)),
-                    undefined, gemm_int8.GemmKernel224Int8.N_STEP,
+                    null, gemm_int8.GemmKernel224Int8.N_STEP,
                     gemm_int8.GemmKernel224Int8.K_STEP,
                     gemm_int8.GemmKernel224Int8.K_BLOCK,
                     gemm_int8.GemmKernel224Int8.N_BLOCK
                 ),
                 .down_int8 = gemm_int8.Int8BufferB.init(
                     @as(usize, @intCast(config.hidden_size)), @as(usize, @intCast(expert_config.intermediate_size)),
-                    undefined, gemm_int8.GemmKernel224Int8.N_STEP,
+                    null, gemm_int8.GemmKernel224Int8.N_STEP,
                     gemm_int8.GemmKernel224Int8.K_STEP,
                     gemm_int8.GemmKernel224Int8.K_BLOCK,
                     gemm_int8.GemmKernel224Int8.N_BLOCK
                 ),
                 .gate_buf = buffers.BufferC(f32).init(
                     @as(usize, @intCast(config.maxPossibleQlen())), @as(usize, @intCast(expert_config.intermediate_size)),
-                    undefined, gemm_bf16.GemmKernel224BF.M_STEP,
+                    null, gemm_bf16.GemmKernel224BF.M_STEP,
                     gemm_bf16.GemmKernel224BF.N_STEP,
                     gemm_bf16.GemmKernel224BF.N_BLOCK
                 ),
                 .up_buf = buffers.BufferC(f32).init(
                     @as(usize, @intCast(config.maxPossibleQlen())), @as(usize, @intCast(expert_config.intermediate_size)),
-                    undefined, gemm_bf16.GemmKernel224BF.M_STEP,
+                    null, gemm_bf16.GemmKernel224BF.M_STEP,
                     gemm_bf16.GemmKernel224BF.N_STEP,
                     gemm_bf16.GemmKernel224BF.N_BLOCK
                 ),
                 .down_buf = buffers.BufferC(f32).init(
                     @as(usize, @intCast(config.maxPossibleQlen())), @as(usize, @intCast(config.hidden_size)),
-                    undefined, gemm_bf16.GemmKernel224BF.M_STEP,
+                    null, gemm_bf16.GemmKernel224BF.M_STEP,
                     gemm_bf16.GemmKernel224BF.N_STEP,
                     gemm_bf16.GemmKernel224BF.N_BLOCK
                 ),
