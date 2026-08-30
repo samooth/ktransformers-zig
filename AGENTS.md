@@ -45,7 +45,8 @@ src/
 ├── root.zig                    # module re-exports + comptime fn-refs forcing analysis
 ├── main.zig                    # C API exports (kt_*) — mirrors include/kt_kernel.h
 ├── runtime/{memory,worker_pool,task_queue,cpu_detect}.zig
-├── numa/                       # NUMA topology/memory/worker (not yet in root.zig)
+├── numa/                       # NUMA topology/memory/worker (re-exported, but no
+│                               # comptime fn-refs yet -> not emitted into the .so)
 ├── kernels/
 │   ├── arch/amx.zig            # AMX inline asm (ldtilecfg, tilebf16dpd, ...) + XFEATURE enable
 │   ├── amx/{buffers,gemm_224_{bf16,int8,int4,fp8}}.zig
@@ -55,8 +56,10 @@ src/
 
 NOT imported (dead code — excluded by Zig's lazy analysis; don't assume they compile):
 `kernels/amx/gemm_224_{bf16,int8,int4,fp8}_avx512.zig` (also imports a
-nonexistent `arch/amx_intrinsics.zig`), `gemm_224_mxfp{4,8}.zig`,
-`numa/`. Also: `main.zig.backup*` are stale snapshots.
+nonexistent `arch/amx_intrinsics.zig`), `gemm_224_mxfp{4,8}.zig`. Note
+`numa/` IS re-exported from root.zig but has no comptime fn-refs, so its
+functions are not emitted into the .so yet. Also: `main.zig.backup*` are
+stale snapshots.
 
 ## Status (see TODO.md for details)
 

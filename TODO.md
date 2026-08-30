@@ -54,6 +54,7 @@ Last updated: 2026-08-29
 - [ ] Implement `TpMoe.loadWeights()` with online quantization (BF16 → INT8/INT4)
 - [ ] Implement `merge_results()` with AVX512 FP32 add + BF16 convert
 - [ ] Expert routing with top-k selection (SIMD optimized)
+- [x] **Replace 5 placeholder TpMoe methods** — `deinit` (frees the two init-allocated slices, page_allocator convention; buffer structs are non-owning POD views), `warmUp` (no-op + TODO until loadWeights populates ptrs), `loadWeightsWithMap` (double-load + logical-slot remap), `forwardGateUp`/`forwardDown` (guarded no-ops with real bodies in comments, blocked on the loadWeights BF16 bug). End-to-end test with zero inputs passes; 5 TpMoe placeholder methods now safe.
 
 ### C API Completeness
 - [x] **MLA attention — code complete in `src/mla/`, re-exported from `root.zig`** (config, cache, core modules wired into the library; 11/11 standalone tests passing). C API integration (`kt_mla_*` in `main.zig` still placeholder) tracked as separate plan.

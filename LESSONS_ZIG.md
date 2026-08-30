@@ -1205,3 +1205,76 @@ The `flags` field is declared as `[16]u8` (fixed-size array). The ArrayList assi
 ```
 
 Always match the field type exactly. If the field is a fixed-size array, the value must be a fixed-size array or anonymous array literal, not a heap-allocated container.
+
+## Per-expert decomposition of MoE forward
+
+### Why split the monolithic forward
+
+The C++ reference (`operators/moe-tp.hpp`) computes one expert in a single
+monolithic `forward`: gate GEMM → up GEMM → SwiGLU → down GEMM → merge. The
+Zig port deliberately splits the per-expert pass into two C API entry points:
+
+- `kt_moe_forward_gate_up` — gate + up projections only (no SwiGLU)
+- `kt_moe_forward_down` — down projection + FP32→BF16 accumulate
+
+Reason: Python callers want to interleave custom ops between the projections
+(e.g. alternate/quantized SwiGLU variants, fusing activation with the next
+layer) without re-implementing the GEMMs. The split costs nothing when
+unused — the monolithic `TpMoe.forward` remains for callers that don't need
+the hooks.
+
+### The TP-loop pattern
+
+Both split methods iterate over `tp_count` NUMA ranks and slice the output
+buffer per rank. For gate/up (row-split of the intermediate dim):
+
+```zig
+const n = intermediate_size / tp_count;        // per-rank output columns
+for (0..tp_count) |t| {
+    const out_off_t = t * m * n;               // per-rank output slice
+    gemm(input, weights + t * n * k, out + out_off_t, ...);
+}
+```
+
+For down (rank owns a K-slice of the intermediate dim), each rank's GEMM
+contributes a partial `[m, hidden]` result — accumulate in an FP32 scratch,
+then one final FP32→BF16 pass. Never accumulate in BF16 (precision loss per
+add is real at 8 mantissa bits).
+
+### The "real version in comments" pattern
+
+`forwardGateUp`/`forwardDown` shipped as guarded no-ops with the full real
+body in comments (grep `TODO(gate-up)` / `TODO(down)`). Why ship a no-op
+instead of a half-working implementation:
+
+1. The blocker is upstream (`loadWeights` BF16 branch packs only
+   `gate_proj` — `up_bf16`/`down_bf16` ptrs stay sentinelized), so there is
+   nothing valid to call GEMM on. Calling it anyway is a guaranteed segfault
+   or garbage.
+2. A no-op with a documented contract ("outputs untouched, no panic") is
+   testable and honest; a partial implementation that "sometimes works"
+   silently corrupts outputs.
+3. The commented real version documents the intended semantics better than
+   prose, and upgrades to code with a copy-paste once the blocker is fixed
+   (that fix is the designated next plan).
+
+Rule of thumb: when a method is blocked by an upstream bug, ship the no-op +
+TODO + reference body, and make the no-op's contract a test.
+
+### deinit and the page_allocator convention
+
+`TpMoe.deinit` takes no allocator parameter, so it must free with the SAME
+allocator `init` received. The only caller is the C API (`kt_moe_free`),
+which passes `std.heap.page_allocator` to both `create()` and `TpMoe.init()`
+— so `deinit` frees with `page_allocator` unconditionally. Any test that
+constructs a `TpMoe` directly must therefore pass `page_allocator` to `init`,
+even when using `std.testing.allocator` for everything else (the testing
+allocator still leak-checks the surrounding pool/weight buffers).
+
+The 9 per-expert buffer structs (BufferA/BufferC/Int8BufferB) are non-owning
+POD views — a `ptr` into externally-owned weight memory plus layout metadata,
+no `deinit()` and nothing heap-allocated to free. `deinit` therefore only
+frees the two outer slices (`experts`, `tp_configs`). When buffers are
+constructed without backing memory (placeholder flow), their ptrs hold the
+checkable `@ptrFromInt(8)` sentinel and `fromMat*` early-returns — see the
+"buffer sentinel" fix in git history.
