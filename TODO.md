@@ -51,7 +51,8 @@ Last updated: 2026-08-29
 - [x] **Add actual AMX inline assembly (previously placeholder)** — `ldtilecfg`, `tilerelease`, `tileloadd`, `tilestored`, `tilezero`, `tilebf16dpd`, `tileint8dpd` all wired in `src/kernels/arch/amx.zig` with proper comptime tile-register immediates. Includes XFEATURE_XTILEDATA permission request via `arch_prctl`. Correctness tests added to `tests/kernels/test_kernels.zig` (skip on non-AMX hardware).
 
 ### MoE Layer
-- [ ] Implement `TpMoe.loadWeights()` with online quantization (BF16 → INT8/INT4)
+- [x] **Implement `TpMoe.loadWeights()` with online quantization (BF16 → INT8/INT4)** — BF16 path now packs all 3 projections (gate, up, down) with per-TP-rank slicing. INT8 path unchanged. Module-level BF16 weight storage used to avoid struct field changes.
+- [x] **Complete the MoE compute path** — `loadWeights` BF16 packing (all 3 projections), `forwardGateUp`/`forwardDown` real bodies (was no-ops with TODOs), `forward` expert GEMM enabled (gates, SwiGLU, down, routing weight accumulation). Forward equivalence test passes.
 - [ ] Implement `merge_results()` with AVX512 FP32 add + BF16 convert
 - [ ] Expert routing with top-k selection (SIMD optimized)
 - [x] **Replace 5 placeholder TpMoe methods** — `deinit` (frees the two init-allocated slices, page_allocator convention; buffer structs are non-owning POD views), `warmUp` (no-op + TODO until loadWeights populates ptrs), `loadWeightsWithMap` (double-load + logical-slot remap), `forwardGateUp`/`forwardDown` (guarded no-ops with real bodies in comments, blocked on the loadWeights BF16 bug). End-to-end test with zero inputs passes; 5 TpMoe placeholder methods now safe.
@@ -108,7 +109,7 @@ Last updated: 2026-08-29
 | BF16 GEMM | Working | 70% |
 | INT8 GEMM | Working | 70% |
 | INT4/FP8/MXFP4/8 GEMM | INT4 and FP8 done (AMX), MXFP4/8 not started | 50% |
-| MoE Orchestration | Partial | 40% |
+| MoE Orchestration | Forward path complete (gate+up+SwiGLU+down+routing) | 75% |
 | C API | Basic functions only | 50% |
 | Build System | Single variant | 60% |
 | Tests | Running and passing (11/11 MLA, 8/21 kernels before pre-existing worker pool hang) | 75% |

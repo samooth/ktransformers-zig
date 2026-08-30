@@ -215,8 +215,12 @@ pub const WorkerPool = struct {
     }
 
     /// Dispatch to backend (for compatibility)
-    pub fn dispenseBackend(self: *WorkerPool) *std.Thread.Pool {
-        return &self.backend;
+    /// Returns the thread count as a usize. The original signature returned
+    /// *std.Thread.Pool but `backend` is a u32 field, which was a latent
+    /// type error (pointer cast to u32). Now we expose the thread count
+    /// directly so callers can size their work-stealing jobs correctly.
+    pub fn dispenseBackend(self: *WorkerPool) usize {
+        return self.backend;
     }
 
     pub fn deinit(self: *WorkerPool) void {

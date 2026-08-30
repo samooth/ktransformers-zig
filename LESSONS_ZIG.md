@@ -1278,3 +1278,49 @@ frees the two outer slices (`experts`, `tp_configs`). When buffers are
 constructed without backing memory (placeholder flow), their ptrs hold the
 checkable `@ptrFromInt(8)` sentinel and `fromMat*` early-returns — see the
 "buffer sentinel" fix in git history.
+
+## Weight packing for MoE TP (Tensor Parallel)
+
+The MoE forward pass has three projections per expert: gate, up, and down.
+In tensor-parallel (TP) mode, each rank gets a slice of the intermediate
+dimension. The layout depends on the projection:
+
+**Gate/Up projection** (input @ weight → [m, intermediate_size]):
+- Config stores as [expert_num, intermediate_size, hidden_size] row-major
+- TP rank t gets rows [t * (intermediate_size/tp_count), (t+1) * (intermediate_size/tp_count))
+- Each rank's slice is [intermediate_size/tp_count, hidden_size]
+- Slice starts at offset: `expert_id * intermediate_size * hidden_size + t * (intermediate_size/tp_count) * hidden_size`
+
+**Down projection** (input @ weight → [hidden_size, intermediate_size]):
+- Config stores as [expert_num, hidden_size, intermediate_size] row-major (transposed!)
+- TP rank t gets a column-split: columns [t * (intermediate_size/tp_count), (t+1) * (intermediate_size/tp_count))
+- Each rank's slice is [intermediate_size/tp_count, hidden_size] (we re-transpose to row-major)
+- For each hidden column h: copy `intermediate_size/tp_count` elements from
+  `dp[expert_id * hidden_size * intermediate_size + h * intermediate_size + t * (intermediate_size/tp_count)]`
+
+**The @ptrFromInt(offset) anti-pattern**: Never fabricate a pointer from an
+integer offset:
+```zig
+// WRONG: crashes or returns garbage
+self.config.gate_proj orelse @as([*]amx.bf16, @ptrFromInt(_gate_start))
+
+// CORRECT: use the base pointer + offset arithmetic
+self.config.gate_proj orelse @as([*]amx.bf16, @ptrFromInt(0)) + _gate_start
+```
+The `orelse` branch is only safe if the base pointer is non-null. If you
+need a null-safe offset, use a dummy base pointer (`@ptrFromInt(0)` or
+similar) and add the offset to it.
+
+**The weight-vs-activation BufferA sizing trap**: BufferA is sized for
+activations (M × K), not weights (N × K). In the C++ reference, weights
+are stored in pool memory and the buffers point to slices of that pool.
+In the Zig port, the ExpertData struct has BufferA fields sized for
+activations (max_m × hidden_size), not for weight matrices. To store BF16
+weights without changing the struct, use module-level arrays indexed by
+(expert_idx, tp_rank). This is ugly but works within the "no struct field
+changes" constraint.
+
+**Routing weight application**: Each token's contribution from each expert
+must be scaled by the routing weight `weights[token * k + j]` before
+accumulating into the output. The C++ does this in `apply_weight`. The
+Zig port's forward method must do the same to match C++ behavior.
