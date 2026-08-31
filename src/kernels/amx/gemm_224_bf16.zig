@@ -23,8 +23,36 @@ pub const GemmKernel224BF = struct {
     pub const N_STEP = 32;  // TILE_N * 2
     pub const K_STEP = 32;  // TILE_K
 
-    pub const N_BLOCK = 256;
-    pub const K_BLOCK = 1792;
+    // A4: runtime-overridable block sizes. Defaults preserve the
+    // historical constants exactly (1792/256 — a generic-server profile
+    // assuming >=1 MiB L2). On hosts with a smaller measured L2 (e.g.
+    // Ryzen 5800H: 512K), `setTileParams` swaps K_BLOCK so a block-step's
+    // A+B+C working set stays inside 50% of L2 (see
+    // runtime/cpu_detect.selectTileParams). Must be called BEFORE any
+    // BufferA/expert-buffer allocation (TpMoe.init reads these).
+    pub var N_BLOCK: usize = 256;
+    pub var K_BLOCK: usize = 1792;
+
+    pub const DEFAULT_N_BLOCK: usize = 256;
+    pub const DEFAULT_K_BLOCK: usize = 1792;
+
+    /// Override the block sizes from measured cache hierarchy. Invalid
+    /// or out-of-range values keep the defaults (never a bad-config
+    /// crash). Tile alignment is enforced (multiples of K_STEP/N_STEP).
+    pub fn setTileParams(n_block_in: usize, k_block_in: usize) void {
+        if (n_block_in >= N_STEP and n_block_in % N_STEP == 0) {
+            N_BLOCK = n_block_in;
+        }
+        if (k_block_in >= K_STEP and k_block_in % K_STEP == 0) {
+            K_BLOCK = k_block_in;
+        }
+    }
+
+    /// Restore the compiled-in defaults.
+    pub fn resetTileParams() void {
+        N_BLOCK = DEFAULT_N_BLOCK;
+        K_BLOCK = DEFAULT_K_BLOCK;
+    }
 
     pub fn name() []const u8 { return "BF16"; }
 

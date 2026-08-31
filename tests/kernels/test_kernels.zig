@@ -2746,3 +2746,46 @@ test "DeepseekV3DecoderLayer: init -> 2 decode steps -> deinit (no leaks)" {
         try testing.expectApproxEqAbs(@as(f32, 0.5), v, 0.01);
     }
 }
+
+// ============================================================================
+// A4 wiring regression: runtime tile-param override (K_BLOCK/N_BLOCK)
+// ============================================================================
+
+test "GemmKernel224BF tile params: override + reset + invalid guard" {
+    const G = gemm_bf16.GemmKernel224BF;
+
+    // Snapshot defaults.
+    const default_k = G.K_BLOCK;
+    const default_n = G.N_BLOCK;
+    try testing.expectEqual(@as(usize, 1792), default_k);
+    try testing.expectEqual(@as(usize, 256), default_n);
+
+    // Valid override: tile-aligned values (A4-derived for a 512K-L2 host).
+    G.setTileParams(256, 448);
+    try testing.expectEqual(@as(usize, 448), G.K_BLOCK);
+    try testing.expectEqual(@as(usize, 256), G.N_BLOCK);
+
+    // Invalid values are rejected, keeping the last valid state:
+    // - below one tile step
+    G.setTileParams(16, 448);
+    try testing.expectEqual(@as(usize, 448), G.K_BLOCK);
+    try testing.expectEqual(@as(usize, 256), G.N_BLOCK);
+    // - non tile-aligned
+    G.setTileParams(256, 100);
+    try testing.expectEqual(@as(usize, 448), G.K_BLOCK);
+
+    // Reset restores compiled-in defaults.
+    G.resetTileParams();
+    try testing.expectEqual(@as(usize, 1792), G.K_BLOCK);
+    try testing.expectEqual(@as(usize, 256), G.N_BLOCK);
+
+    // The A4 helper must produce tile-aligned values that the override
+    // accepts on this host.
+    var cpu = cpu_detect.detectCpu(testing.allocator) catch return;
+    defer cpu.deinit(testing.allocator);
+    const tp = cpu_detect.selectTileParams(cpu);
+    G.setTileParams(tp.n_block, tp.k_block);
+    defer G.resetTileParams();
+    try testing.expectEqual(tp.n_block, G.N_BLOCK);
+    try testing.expectEqual(tp.k_block, G.K_BLOCK);
+}
