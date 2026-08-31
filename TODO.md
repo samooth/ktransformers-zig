@@ -5,7 +5,7 @@
 Last updated: 2026-08-31
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
-**Tests: WORKING** - `zig build test` RUNS all suites: 34 kernels + 11 MLA + 2 FP8 transport + 1 MLA C API = 48 total pass, 0 leaks, exit 0. (Test harness now uses a simple-mode runner, `tools/test_runner.zig` — the default Zig 0.16 `--listen=-` IPC handshake fails in this environment; see LESSONS note in build.zig.)
+**Tests: WORKING** - `zig build test` RUNS all suites: 34+5 kernels + 11 MLA + 2 FP8 transport + 1 MLA C API = 53 total pass, 0 leaks, exit 0. (Test harness now uses a simple-mode runner, `tools/test_runner.zig` — the default Zig 0.16 `--listen=-` IPC handshake fails in this environment; see LESSONS note in build.zig.)
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so`, each exporting 59 C API symbols.
 **Runtime: WORKING** - work-stealing worker pool (pthread mutex/cond, threads block when idle); NUMA topology via /sys and /proc/cpuinfo.
 **SFT/LoRA: FORWARD+BACKWARD COMPLETE** - training path done; C API exports (forward_sft/backward/update_lora_weights); smoke test passes.
@@ -104,7 +104,8 @@ Last updated: 2026-08-31
 - [x] **SFT/LoRA backward pass** — forward_sft (Dev A) + backward (Dev B) complete with LoRA kernels; kt_moe_forward_sft/kt_moe_backward/kt_moe_update_lora_weights C API exports. 43/43 tests pass.
 - [ ] Speculative decoding (MTP head)
 - [ ] ARM/KML backend (NEON/SVE)
-- [ ] GGML quantization types compatibility
+- [x] **GGML Q8_0 kernel — Phase 1 DONE (2026-08-31)** — `src/kernels/amx/gemm_224_q8_0.zig`: byte-exact `BlockQ8_0` (34 bytes: f16 `d` + 32×i8 `qs`, `@sizeOf` compile-checked) vs ggml-common.h; quantize/dequantize matching ggml-quants.c:276/553 (`d = amax/127`, `qs = round(x·1/d)`, `y = qs·d`); f16↔f32 via Zig's **native f16** `@floatCast`/`@bitCast` (first attempt hand-rolled the bit math — buggy subnormal path, replaced by native casts, lesson for LESSONS); scalar GEMM (BF16 activations × Q8_0 weights → F32, on-the-fly dequant). 5 exact-value tests in test_kernels.zig (f16 round-trip, 34-byte layout, quantize/dequant tolerance, 2 GEMM constants). Wired into root.zig with comptime fn-refs (emission verified via nm). Remaining formats: Q4_K → Q6_K → Q5_K (defer Q8_K — super-block scale/min layout is the fiddliest and least used); C-API quantize/dequantize exports are Phase 2.
+- [ ] GGML quantization types compatibility (remaining: Q4_K, Q6_K, Q5_K, Q8_K; C-API wrappers)
 
 ### Documentation
 - [ ] API documentation (zig doc)
@@ -125,7 +126,7 @@ Last updated: 2026-08-31
 | SFT/LoRA Training | Forward + backward complete + work-stealing parallel forward (d1e0adb: pool-vs-sequential equivalence + backward round-trip); 4 C API exports (new_sft/forward_sft/backward/update_lora) | 100% |
 | C API | 53/53 header symbols exported by all 6 variants (verify_abi.py full PASS); MLA + MoE + Gate + Linear + MLP + SFT backward + FP8 transport + load_weights complete | 100% |
 | Build System | Multi-variant (6 variants, distinct .so names) | 85% |
-| Tests | 34 kernels + 11 MLA + 2 FP8 + 1 MLA C API = 48 total pass, 0 leaks, zig build test exits 0 (simple-mode runner) | 100% |
+| Tests | 39 kernels (incl. 5 Q8_0) + 11 MLA + 2 FP8 + 1 MLA C API = 53 total pass, 0 leaks, zig build test exits 0 (simple-mode runner) | 100% |
 | Python Integration | ctypes wrapper + pyproject.toml + CI workflow; wheel build verified | 60% |
 
 ---

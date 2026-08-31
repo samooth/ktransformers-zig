@@ -25,6 +25,18 @@ pub const lora_kernels = @import("kernels/amx/lora_kernels.zig");
 // (MLA)" in LESSONS_ZIG.md for the mechanism this is built on.
 pub const gemm_mxfp4 = @import("kernels/amx/gemm_224_mxfp4.zig");
 pub const gemm_mxfp8 = @import("kernels/amx/gemm_224_mxfp8.zig");
+
+// GGML quantization kernels (Phase 1: Q8_0). Same lazy-analysis rule applies.
+pub const gemm_q8_0 = @import("kernels/amx/gemm_224_q8_0.zig");
+comptime {
+    _ = &gemm_q8_0.BlockQ8_0;
+    _ = &gemm_q8_0.f32_to_f16;
+    _ = &gemm_q8_0.f16_to_f32;
+    _ = &gemm_q8_0.quantizeRowQ8_0;
+    _ = &gemm_q8_0.dequantizeRowQ8_0;
+    _ = &gemm_q8_0.dequantizeRowQ8_0ToBF16;
+    _ = &gemm_q8_0.gemmQ8_0Scalar;
+}
 comptime {
     _ = &gemm_mxfp4.GemmKernel224MXFP4.gemmFullTile;
     _ = &gemm_mxfp4.MXFP4Block;

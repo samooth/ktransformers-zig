@@ -1456,3 +1456,103 @@ test "SFT forward_sft: work-stealing pool matches sequential (equivalence)" {
         dw.ptr, db.ptr, gweights.ptr, null, null, null, false, 1.0);
     for (grad_input) |v| try testing.expect(!std.math.isNan(v));
 }
+
+// ============================================================================
+// GGML Q8_0 (kernel-layer Phase 1; layout byte-exact vs ggml block_q8_0)
+// ============================================================================
+
+test "Q8_0 f16 <-> f32 round trip known values" {
+    const q8 = root.gemm_q8_0;
+    try testing.expectEqual(@as(u16, 0x3C00), q8.f32_to_f16(1.0));
+    try testing.expectEqual(@as(u16, 0x3800), q8.f32_to_f16(0.5));
+    try testing.expectEqual(@as(u16, 0xC000), q8.f32_to_f16(-2.0));
+    try testing.expectEqual(@as(u16, 0x7BFF), q8.f32_to_f16(65504.0));
+    try testing.expectEqual(@as(f32, 1.0), q8.f16_to_f32(0x3C00));
+    try testing.expectEqual(@as(f32, -2.0), q8.f16_to_f32(0xC000));
+    try testing.expectEqual(@as(u16, 0x7C00), q8.f32_to_f16(std.math.inf(f32)));
+    try testing.expectEqual(@as(u16, 0x0000), q8.f32_to_f16(0.0));
+    // Subnormal f16 2^-24 = 0x0001
+    try testing.expectEqual(@as(f32, 0x1.0p-24), q8.f16_to_f32(0x0001));
+    // Subnormal path in f32_to_f16: 2^-24 quantizes to 0x0001
+    try testing.expectEqual(@as(u16, 0x0001), q8.f32_to_f16(0x1.0p-24));
+}
+
+test "Q8_0 block layout byte-exact vs ggml" {
+    const q8 = root.gemm_q8_0;
+    try testing.expectEqual(@as(usize, 34), @sizeOf(q8.BlockQ8_0));
+    const blk = q8.BlockQ8_0{ .d = 0x3C00, .qs = [_]i8{1} ** 32 };
+    const bytes: [*]const u8 = @ptrCast(&blk);
+    try testing.expectEqual(@as(u8, 0x00), bytes[0]);
+    try testing.expectEqual(@as(u8, 0x3C), bytes[1]);
+    try testing.expectEqual(@as(u8, 1), bytes[2]);
+    try testing.expectEqual(@as(u8, 1), bytes[33]);
+}
+
+test "Q8_0 quantize/dequantize round trip within tolerance" {
+    const q8 = root.gemm_q8_0;
+    const k = 64;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| src[i] = @floatFromInt(@as(i32, @intCast(i % 17)) - 8);
+
+    var blocks: [k / 32]q8.BlockQ8_0 = undefined;
+    q8.quantizeRowQ8_0(&src, &blocks, k);
+
+    var dst: [k]f32 = undefined;
+    q8.dequantizeRowQ8_0(&blocks, &dst, k);
+
+    const amax: f32 = 8.0;
+    const d = amax / 127.0;
+    for (0..k) |i| {
+        try testing.expectApproxEqAbs(src[i], dst[i], d * 0.51);
+    }
+}
+
+test "Q8_0 scalar GEMM 16x16x32 constant weights" {
+    const q8 = root.gemm_q8_0;
+    const M = 16;
+    const N = 16;
+    const K = 32;
+
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var b: [N]q8.BlockQ8_0 = undefined;
+    for (&b) |*blk| {
+        blk.d = q8.f32_to_f16(1.0);
+        for (&blk.qs) |*qq| qq.* = 1;
+    }
+
+    var c: [M * N]f32 = undefined;
+    q8.gemmQ8_0Scalar(&a, K, &b, 1, &c, N, M, N, K);
+
+    for (0..M) |i| {
+        for (0..N) |j| {
+            try testing.expectApproxEqAbs(@as(f32, 32.0), c[i * N + j], 1e-4);
+        }
+    }
+}
+
+test "Q8_0 scalar GEMM with per-block scales" {
+    const q8 = root.gemm_q8_0;
+    const M = 4;
+    const N = 4;
+    const K = 32;
+
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(2.0);
+
+    var b: [N]q8.BlockQ8_0 = undefined;
+    for (&b) |*blk| {
+        blk.d = q8.f32_to_f16(2.0);
+        for (&blk.qs) |*qq| qq.* = 3;
+    }
+
+    var c: [M * N]f32 = undefined;
+    q8.gemmQ8_0Scalar(&a, K, &b, 1, &c, N, M, N, K);
+
+    for (0..M) |i| {
+        for (0..N) |j| {
+            try testing.expectApproxEqAbs(@as(f32, 384.0), c[i * N + j], 1e-3);
+        }
+    }
+}
