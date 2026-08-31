@@ -279,6 +279,27 @@ pub const KT_MLA = opaque {};
 pub const KT_Gate = opaque {};
 pub const KT_Linear = opaque {};
 pub const KT_MLP = opaque {};
+pub const KT_FP8LayerwiseTransport = opaque {};
+
+// C struct returned by kt_fp8_transport_wait. Field order/types must match
+// `kt_fp8_stats_t` in `include/kt_kernel.h:480-494` (the C header is the
+// contract — `int layer_id` per the header even though the C++ internal
+// struct uses int64_t).
+pub const kt_fp8_stats_t = extern struct {
+    epoch: u64,
+    layer_id: c_int,
+    expert_count: c_int,
+    rank: c_int,
+    writer_ms: f64,
+    slot_wait_ms: f64,
+    h2d_ms: f64,
+    total_ms: f64,
+    bytes: usize,
+    poisoned: c_int,
+    error_code: c_int,
+    error_rank: c_int,
+    error_message: [*]const u8,
+};
 
 var g_cpu_variant: [32]u8 = undefined;
 var g_cpu_variant_ptr: [*]const u8 = @ptrCast(&g_cpu_variant[0]);
@@ -1070,6 +1091,336 @@ export fn kt_fp8_dequantize_block(
             dst[b * block_size + i] = gemm_fp8.fp8e4m3_to_f32(src[b * block_size + i]) * scale;
         }
     }
+}
+
+// ============================================================================
+// FP8 Layerwise Transport — callback-only CPU port
+// ============================================================================
+//
+// Coordinator-confirmed scope: the transport stores the per-rank host
+// buffer state handed in by the caller and, in run_producer, hands the
+// caller's callback the correct per-expert w13/w2 weight+scale pointers.
+// It does NOT run GEMMs (the Python caller does, via kt_matmul_fp8) and
+// it does NOT stage H2D copies — so `cuda_device`, `local_gpu_ptrs` and
+// `timeout_ms` are accepted for ABI compatibility and ignored (no GPU in
+// the CPU port, no cross-process waits to time out).
+//
+// Pointer-layout contract (mirrors ktransformers kt-kernel
+// fp8_layerwise_transport.cpp::run_producer and the write_weight_scale_to_buffer
+// consumer; see also examples/test_k2_write_buffer.py::get_expert_ptrs):
+//
+//   local_host_ptrs:    [slot][kind]           — FP8_HOST_SLOTS * FP8_BUFFER_KINDS = 8
+//   all_rank_host_ptrs: [slot][rank][kind]     — 2 * tp_size * 4 (rank zero only)
+//     index = (slot * tp_size + rank) * FP8_BUFFER_KINDS + kind
+//   expert_nbytes:      [kind]                 — 4 (w13_weight, w13_scale, w2_weight, w2_scale)
+//
+// The C API passes raw arrays without lengths (the protocol constants above
+// fix them); shorter arrays from the caller are UB, as in any C API.
+
+const FP8_CONTROL_BYTES: usize = 8192;
+const FP8_MAX_TP_SIZE: c_int = 8;
+const FP8_BUFFER_KINDS: usize = 4; // w13_weight, w13_scale, w2_weight, w2_scale
+const FP8_HOST_SLOTS: usize = 2;
+const FP8_CONTROL_MAGIC: u64 = 0x4b544650384c5731; // "KTFP8LW1" (reference: fp8_layerwise_transport.cpp:29)
+const FP8_CONTROL_VERSION: u64 = 2;
+const FP8_ERROR_PROTOCOL: c_int = 1; // mirrors kErrorProtocol in fp8_layerwise_transport.cpp:35
+
+/// First 64 bytes of the shared control region, matching the reference
+/// ControlHeader layout (fp8_layerwise_transport.cpp:49-56). The full
+/// multi-process slot/ack/poison protocol is not used by the CPU port:
+/// init writes the header, transport_new validates it.
+const Fp8ControlHeader = extern struct {
+    magic: u64,
+    version: u64,
+    struct_bytes: u64,
+    tp_size: u64,
+    padding: [32]u8,
+};
+
+/// Writer callback type passed to kt_fp8_transport_run_producer. Each call
+/// receives four arrays of `tp_size` host pointer values; the kind order
+/// matches the C header: w13_weight, w13_scale, w2_weight, w2_scale.
+pub const Fp8WriterCallback = *const fn (
+    expert_id: c_int,
+    w13_weight_ptrs: [*]const usize,
+    w13_scale_ptrs: [*]const usize,
+    w2_weight_ptrs: [*]const usize,
+    w2_scale_ptrs: [*]const usize,
+) callconv(.c) void;
+
+const Fp8Transport = struct {
+    rank: c_int,
+    tp_size: c_int,
+    num_experts: c_int,
+    local_host_ptrs: [FP8_HOST_SLOTS * FP8_BUFFER_KINDS]usize,
+    all_rank_host_ptrs: []usize, // [slot][rank][kind] on rank zero, empty on other ranks
+    expert_nbytes: [FP8_BUFFER_KINDS]usize,
+    closed: bool,
+    // Last producer-run statistics (CPU-measured; reference fields are the same).
+    last_epoch: u64,
+    last_layer_id: c_int,
+    last_expert_count: c_int,
+    writer_ns: u64,
+    slot_wait_ns: u64,
+    total_ns: u64,
+};
+
+/// Validate the control region header and cast it to a typed pointer.
+/// Panics on any mismatch — the control region is the C API's only error
+/// channel for the init/new contract (no exception path across C ABI).
+fn fp8CheckedControl(control_ptr: ?*anyopaque, control_size: usize, tp_size: c_int) *const Fp8ControlHeader {
+    const ptr = control_ptr orelse @panic("FP8 layerwise control pointer is null");
+    if (@intFromPtr(ptr) & 63 != 0) @panic("FP8 layerwise control pointer must be 64-byte aligned");
+    if (control_size < FP8_CONTROL_BYTES) @panic("FP8 layerwise control region must be at least 8192 bytes");
+    if (tp_size <= 0 or tp_size > FP8_MAX_TP_SIZE) @panic("FP8 layerwise transport supports TP sizes 1 through 8");
+    const header: *const Fp8ControlHeader = @ptrCast(@alignCast(ptr));
+    if (header.magic != FP8_CONTROL_MAGIC) @panic("FP8 layerwise control is uninitialized or has an incompatible ABI");
+    if (header.version != FP8_CONTROL_VERSION or header.struct_bytes != @sizeOf(Fp8ControlHeader)) {
+        @panic("FP8 layerwise control is uninitialized or has an incompatible ABI");
+    }
+    if (header.tp_size != @as(u64, @intCast(tp_size))) {
+        @panic("FP8 layerwise control TP size does not match transport TP size");
+    }
+    return header;
+}
+
+fn fp8CheckedTransport(transport: ?*KT_FP8LayerwiseTransport) *Fp8Transport {
+    return @ptrCast(@alignCast(transport orelse @panic("FP8 layerwise transport is null")));
+}
+
+fn fp8NowNs() u64 {
+    var ts: std.os.linux.timespec = .{ .sec = 0, .nsec = 0 };
+    _ = std.os.linux.syscall2(.clock_gettime, @intFromEnum(std.os.linux.CLOCK.MONOTONIC), @intFromPtr(&ts));
+    return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));
+}
+
+fn fp8NsToMs(ns: u64) f64 {
+    return @as(f64, @floatFromInt(ns)) / 1.0e6;
+}
+
+fn fp8PoisonedStats(epoch: u64, rank: c_int, message: [*]const u8) kt_fp8_stats_t {
+    return .{
+        .epoch = epoch,
+        .layer_id = 0,
+        .expert_count = 0,
+        .rank = rank,
+        .writer_ms = 0,
+        .slot_wait_ms = 0,
+        .h2d_ms = 0,
+        .total_ms = 0,
+        .bytes = 0,
+        .poisoned = 1,
+        .error_code = FP8_ERROR_PROTOCOL,
+        .error_rank = rank,
+        .error_message = message,
+    };
+}
+
+pub export fn kt_fp8_layerwise_init(control_ptr: ?*anyopaque, control_size: usize, tp_size: c_int) void {
+    // Mirror reference initialize_fp8_layerwise_control: validate the control
+    // region, zero it, and stamp the header. Mirroring the magic/version
+    // layout keeps drop-in compatibility with a Python caller that
+    // initializes the same buffer through this C API.
+    const ptr = control_ptr orelse @panic("FP8 layerwise control pointer is null");
+    if (@intFromPtr(ptr) & 63 != 0) @panic("FP8 layerwise control pointer must be 64-byte aligned");
+    if (control_size < FP8_CONTROL_BYTES) @panic("FP8 layerwise control region must be at least 8192 bytes");
+    if (tp_size <= 0 or tp_size > FP8_MAX_TP_SIZE) @panic("FP8 layerwise transport supports TP sizes 1 through 8");
+    @memset(@as([*]u8, @ptrCast(ptr))[0..FP8_CONTROL_BYTES], 0);
+    const header: *Fp8ControlHeader = @ptrCast(@alignCast(ptr));
+    header.magic = FP8_CONTROL_MAGIC;
+    header.version = FP8_CONTROL_VERSION;
+    header.struct_bytes = @sizeOf(Fp8ControlHeader);
+    header.tp_size = @intCast(tp_size);
+    // padding[32] left zeroed by the memset above.
+}
+
+pub export fn kt_fp8_transport_new(
+    control_ptr: ?*anyopaque,
+    control_size: usize,
+    rank: c_int,
+    tp_size: c_int,
+    cuda_device: c_int,
+    local_host_ptrs: ?[*]const usize,
+    local_gpu_ptrs: ?[*]const usize,
+    all_rank_host_ptrs: ?[*]const usize,
+    expert_nbytes: ?[*]const usize,
+    num_experts: c_int,
+    timeout_ms: c_int,
+) *KT_FP8LayerwiseTransport {
+    _ = cuda_device; // no GPU in the CPU port (documented no-op)
+    _ = local_gpu_ptrs; // ditto
+    _ = timeout_ms; // in-process: no cross-rank waits to time out
+
+    _ = fp8CheckedControl(control_ptr, control_size, tp_size);
+
+    if (rank < 0 or rank >= tp_size) @panic("FP8 layerwise rank is outside TP range");
+    if (num_experts <= 0) @panic("FP8 layerwise num_experts must be positive");
+
+    const local = local_host_ptrs orelse @panic("FP8 layerwise local_host_ptrs must contain 8 pointers in [slot][kind] order");
+    const nbytes = expert_nbytes orelse @panic("FP8 layerwise expert_nbytes must contain 4 sizes");
+
+    const tp: usize = @intCast(tp_size);
+    const all_count: usize = FP8_HOST_SLOTS * tp * FP8_BUFFER_KINDS;
+
+    const all_slice: []usize = if (rank == 0) blk: {
+        const src = all_rank_host_ptrs orelse @panic("FP8 layerwise all_rank_host_ptrs is required on rank zero");
+        const buf = std.heap.page_allocator.alloc(usize, all_count) catch @panic("OOM");
+        for (0..all_count) |i| {
+            if (src[i] == 0) @panic("FP8 layerwise buffer pointers must be non-zero");
+            buf[i] = src[i];
+        }
+        break :blk buf;
+    } else std.heap.page_allocator.alloc(usize, 0) catch @panic("OOM");
+
+    var local_buf: [FP8_HOST_SLOTS * FP8_BUFFER_KINDS]usize = undefined;
+    for (0..FP8_HOST_SLOTS * FP8_BUFFER_KINDS) |i| {
+        if (local[i] == 0) @panic("FP8 layerwise buffer pointers must be non-zero");
+        local_buf[i] = local[i];
+    }
+    var nb_buf: [FP8_BUFFER_KINDS]usize = undefined;
+    for (0..FP8_BUFFER_KINDS) |i| {
+        if (nbytes[i] == 0) @panic("FP8 layerwise expert byte sizes must be non-zero");
+        nb_buf[i] = nbytes[i];
+    }
+
+    const t = std.heap.page_allocator.create(Fp8Transport) catch @panic("OOM");
+    t.* = .{
+        .rank = rank,
+        .tp_size = tp_size,
+        .num_experts = num_experts,
+        .local_host_ptrs = local_buf,
+        .all_rank_host_ptrs = all_slice,
+        .expert_nbytes = nb_buf,
+        .closed = false,
+        .last_epoch = 0,
+        .last_layer_id = -1,
+        .last_expert_count = 0,
+        .writer_ns = 0,
+        .slot_wait_ns = 0,
+        .total_ns = 0,
+    };
+    return @ptrCast(t);
+}
+
+pub export fn kt_fp8_transport_run_producer(
+    transport: ?*KT_FP8LayerwiseTransport,
+    epoch: u64,
+    layer_id: c_int,
+    expert_count: c_int,
+    callback: ?Fp8WriterCallback,
+) void {
+    const t: *Fp8Transport = fp8CheckedTransport(transport);
+    if (t.closed) @panic("FP8 layerwise transport is closed");
+    if (t.rank != 0) @panic("FP8 layerwise run_producer is rank-zero only");
+    const cb = callback orelse @panic("FP8 layerwise writer callback is null");
+    if (epoch == 0) @panic("FP8 layerwise epoch zero is reserved");
+    if (layer_id < 0) @panic("FP8 layerwise layer_id must be non-negative");
+    if (expert_count <= 0 or expert_count > t.num_experts) {
+        @panic("FP8 layerwise expert_count is outside the configured expert range");
+    }
+
+    const tp: usize = @intCast(t.tp_size);
+    const ec: usize = @intCast(expert_count);
+
+    // Per-call scratch: four arrays of FP8_MAX_TP_SIZE entries; only the
+    // first tp_size entries are populated and visible to the callback.
+    var w13_weight: [FP8_MAX_TP_SIZE]usize = undefined;
+    var w13_scale: [FP8_MAX_TP_SIZE]usize = undefined;
+    var w2_weight: [FP8_MAX_TP_SIZE]usize = undefined;
+    var w2_scale: [FP8_MAX_TP_SIZE]usize = undefined;
+
+    var writer_ns: u64 = 0;
+    const begin = fp8NowNs();
+    for (0..ec) |expert| {
+        // Reference: ptrs[kind][rank] = all_rank_host_ptrs_[(slot * tp_size_ + rank) * 4 + kind],
+        // with slot = expert % kFP8LayerwiseHostSlots (= 2). This is the
+        // exact index formula from fp8_layerwise_transport.cpp:409-417; the
+        // expert_nbytes array only feeds the bytes stat (handled in wait).
+        const slot = expert % FP8_HOST_SLOTS;
+        for (0..tp) |r| {
+            const base = (slot * tp + r) * FP8_BUFFER_KINDS;
+            w13_weight[r] = t.all_rank_host_ptrs[base + 0];
+            w13_scale[r] = t.all_rank_host_ptrs[base + 1];
+            w2_weight[r] = t.all_rank_host_ptrs[base + 2];
+            w2_scale[r] = t.all_rank_host_ptrs[base + 3];
+        }
+        const writer_begin = fp8NowNs();
+        cb(@intCast(expert), &w13_weight, &w13_scale, &w2_weight, &w2_scale);
+        writer_ns += fp8NowNs() - writer_begin;
+    }
+    t.total_ns = fp8NowNs() - begin;
+    t.writer_ns = writer_ns;
+    t.slot_wait_ns = 0; // single-process CPU port: no consumer slot acks to wait for
+    t.last_epoch = epoch;
+    t.last_layer_id = layer_id;
+    t.last_expert_count = expert_count;
+}
+
+pub export fn kt_fp8_transport_wait(transport: ?*KT_FP8LayerwiseTransport, epoch: u64) kt_fp8_stats_t {
+    const t: *Fp8Transport = fp8CheckedTransport(transport);
+    if (t.closed) @panic("FP8 layerwise transport is closed");
+    if (epoch == 0) {
+        return fp8PoisonedStats(0, t.rank, "FP8 layerwise epoch zero is reserved");
+    }
+    if (t.last_epoch != epoch) {
+        return fp8PoisonedStats(epoch, t.rank, "FP8 layerwise wait called for an epoch that was never produced");
+    }
+    // Reference semantics: per expert the consumer adds Σ expert_nbytes to
+    // the local bytes counter (fp8_layerwise_transport.cpp::copy_expert),
+    // so the per-rank layer total is expert_count × Σ expert_nbytes. The
+    // CPU port surfaces the same number.
+    var per_expert_bytes: usize = 0;
+    for (t.expert_nbytes) |n| per_expert_bytes += n;
+    const ec: usize = @intCast(t.last_expert_count);
+    return .{
+        .epoch = epoch,
+        .layer_id = t.last_layer_id,
+        .expert_count = t.last_expert_count,
+        .rank = t.rank,
+        .writer_ms = fp8NsToMs(t.writer_ns),
+        .slot_wait_ms = fp8NsToMs(t.slot_wait_ns),
+        .h2d_ms = 0, // CPU port: no H2D copies
+        .total_ms = fp8NsToMs(t.total_ns),
+        .bytes = per_expert_bytes * ec,
+        .poisoned = 0,
+        .error_code = 0,
+        .error_rank = -1,
+        .error_message = "",
+    };
+}
+
+pub export fn kt_fp8_transport_close(transport: ?*KT_FP8LayerwiseTransport) void {
+    // Idempotent (reference uses compare_exchange; here plain bool assignment
+    // on a single-threaded C API is sufficient).
+    const t: *Fp8Transport = @ptrCast(@alignCast(transport orelse return));
+    t.closed = true;
+}
+
+pub export fn kt_fp8_transport_free(transport: ?*KT_FP8LayerwiseTransport) void {
+    // Match the C free(NULL) idiom: a null transport is a no-op.
+    const t: *Fp8Transport = @ptrCast(@alignCast(transport orelse return));
+    std.heap.page_allocator.free(t.all_rank_host_ptrs);
+    std.heap.page_allocator.destroy(t);
+}
+
+pub export fn kt_fp8_transport_rank(transport: ?*KT_FP8LayerwiseTransport) c_int {
+    const t: *Fp8Transport = @ptrCast(@alignCast(transport orelse return -1));
+    return t.rank;
+}
+
+pub export fn kt_fp8_transport_tp_size(transport: ?*KT_FP8LayerwiseTransport) c_int {
+    const t: *Fp8Transport = @ptrCast(@alignCast(transport orelse return 0));
+    return t.tp_size;
+}
+
+pub export fn kt_fp8_transport_num_experts(transport: ?*KT_FP8LayerwiseTransport) c_int {
+    const t: *Fp8Transport = @ptrCast(@alignCast(transport orelse return 0));
+    return t.num_experts;
+}
+
+pub export fn kt_fp8_transport_closed(transport: ?*KT_FP8LayerwiseTransport) c_int {
+    const t: *Fp8Transport = @ptrCast(@alignCast(transport orelse return 1));
+    return if (t.closed) 1 else 0;
 }
 
 // ============================================================================
