@@ -6,3 +6,4 @@ zig-out/
 toinclude/
 *.backup
 *.backup2
+__pycache__/
