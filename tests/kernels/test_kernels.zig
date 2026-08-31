@@ -2563,3 +2563,92 @@ test "routeExpertsDeepSeek: no-group config falls back to legacy behavior" {
     );
     for (topk_ids) |id| try testing.expect(id >= 0 and id < 8);
 }
+
+// ============================================================================
+// A4 regression: cache hierarchy detection + selectTileParams
+// ============================================================================
+
+test "cpu_detect detects L1/L2/L3 cache sizes (A4)" {
+    const allocator = testing.allocator;
+    var cpu = cpu_detect.detectCpu(allocator) catch @panic("CPU detect failed");
+    defer cpu.deinit(allocator);
+
+    // On any real host (Linux with sysfs) the detected sizes must be
+    // plausible: L1d in [4K, 1M], L2 in [64K, 64M], L3 in [256K, 1G].
+    // The conservative defaults (32K/512K/16M) also satisfy these
+    // bounds, so the test passes either way — but a sysfs parse bug
+    // (e.g. "32K" parsed as 32 bytes, or a stray 0) would fail.
+    try testing.expect(cpu.l1d_bytes >= 4 * 1024);
+    try testing.expect(cpu.l1d_bytes <= 1 * 1024 * 1024);
+    try testing.expect(cpu.l1i_bytes >= 4 * 1024);
+    try testing.expect(cpu.l2_bytes >= 64 * 1024);
+    try testing.expect(cpu.l2_bytes <= 64 * 1024 * 1024);
+    try testing.expect(cpu.l3_bytes >= 256 * 1024);
+    try testing.expect(cpu.l3_bytes <= 1024 * 1024 * 1024);
+
+    // Print for visibility in CI logs (matches printCpuInfo style).
+    std.debug.print("  cache: L1d={d}K L1i={d}K L2={d}K L3={d}K\n", .{
+        cpu.l1d_bytes / 1024,
+        cpu.l1i_bytes / 1024,
+        cpu.l2_bytes / 1024,
+        cpu.l3_bytes / (1024 * 1024),
+    });
+}
+
+test "selectTileParams derives sane block sizes from cache (A4)" {
+    const allocator = testing.allocator;
+    var cpu = cpu_detect.detectCpu(allocator) catch @panic("CPU detect failed");
+    defer cpu.deinit(allocator);
+
+    const tp = cpu_detect.selectTileParams(cpu);
+
+    // Invariants regardless of host:
+    // - n_block matches the kernel granularity (8 * n_step = 256)
+    // - k_block is tile-aligned (multiple of 32) and at least one tile
+    // - the working set of one block-step fits the 50%-of-L2 budget:
+    //   (m_step + n_block) * k_block * 2 + m_step * n_step * 4 <= L2/2
+    try testing.expect(tp.n_block == 256);
+    try testing.expect(tp.k_block >= 32);
+    try testing.expect(tp.k_block % 32 == 0);
+
+    var l2 = cpu.l2_bytes;
+    if (l2 < 16 * 1024) l2 = 256 * 1024;
+    const working_set = (32 + tp.n_block) * tp.k_block * 2 + 32 * 32 * 4;
+    try testing.expect(working_set <= l2 / 2 + 32 * 32 * 4);
+
+    std.debug.print("  tile params: n_block={d} k_block={d} estimated={}\n", .{
+        tp.n_block, tp.k_block, tp.estimated,
+    });
+}
+
+// ============================================================================
+// B3 regression: kt_cpuinfer_sync drain semantics (waitIdle)
+// ============================================================================
+
+test "Subpool waitIdle drains pending jobs (B3)" {
+    // B3: doWorkStealingJob registers itself in pending_jobs; waitIdle
+    // must observe 0 pending once all jobs complete (it would hang the
+    // test otherwise — a regression in the accounting fails by
+    // deadlock/timeout, which the simple-mode runner surfaces).
+    const allocator = testing.allocator;
+    var pool = try worker_pool.WorkerPool.initSimple(allocator, 2);
+    defer pool.deinit();
+
+    // Run a real job (the existing g_test_inc counter).
+    g_test_counter.store(0, .monotonic);
+    pool.subpools[0].doWorkStealingJob(100, g_test_incFn);
+    try testing.expectEqual(@as(usize, 100), g_test_counter.load(.acquire));
+
+    // waitIdle(0) must return immediately post-completion (all jobs
+    // drained) — not hang.
+    pool.subpools[0].waitIdle(0);
+
+    // pending_jobs must be exactly 0 now.
+    try testing.expectEqual(@as(usize, 0), pool.subpools[0].pending_jobs.load(.acquire));
+
+    // A second waitIdle after more work must also drain.
+    g_test_counter.store(0, .monotonic);
+    pool.subpools[0].doWorkStealingJob(50, g_test_incFn);
+    pool.subpools[0].waitIdle(0);
+    try testing.expectEqual(@as(usize, 50), g_test_counter.load(.acquire));
+}

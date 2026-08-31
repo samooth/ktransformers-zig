@@ -50,6 +50,15 @@ pub const CpuInfo = struct {
     cache_line_size: usize = 64,
     numa_nodes: usize = 1,
 
+    // A4: cache hierarchy sizes in BYTES, detected from
+    // /sys/devices/system/cpu/cpu0/cache/index*/ on Linux. Defaults
+    // are conservative fallbacks (32K L1d / 512K L2 / 16M L3) used
+    // when detection is unavailable (non-Linux, sysfs hidden, VMs).
+    l1d_bytes: usize = 32 * 1024,
+    l1i_bytes: usize = 32 * 1024,
+    l2_bytes: usize = 512 * 1024,
+    l3_bytes: usize = 16 * 1024 * 1024,
+
     /// Free the model_name slice if it was heap-allocated.
     /// The "unknown" sentinel is the string literal "unknown" which must
     /// not be freed. All other values are heap-allocated by detectCpuLinux.
@@ -61,6 +70,70 @@ pub const CpuInfo = struct {
         self.* = undefined;
     }
 };
+
+/// A4: tile/block parameters for the GEMM kernels, derived from the
+/// host's actual cache hierarchy. The kernels' current fixed constants
+/// (e.g. gemm_224_bf16.zig: N_BLOCK=256, K_BLOCK=1792) target a
+/// generic server profile; this helper lets callers size the M/N/K
+/// blocks so the working set of one block-step fits in L2 (compute)
+/// or L3 (weights streaming).
+pub const TileParams = struct {
+    /// Recommended n_block: how many output columns to process per
+    /// outer step. Sized so one B-panel slice (n_block * k_bytes of
+    /// BF16 weights) plus the C output tile stays under ~half of L2.
+    n_block: usize,
+    /// Recommended k_block: how deep a K-panel may grow before the
+    /// A+B working set exceeds L2.
+    k_block: usize,
+    /// True when the values are the conservative defaults (detection
+    /// unavailable) rather than measured-from-sysfs.
+    estimated: bool,
+};
+
+/// A4: derive GEMM block sizes from the detected cache hierarchy.
+/// Heuristic: one block-step's working set is
+///   (m_step + n_step) * k_step * 2 bytes (A and B tiles)
+/// plus m_step * n_step * 4 bytes (C tile, FP32).
+/// We target <= 50% of L2 so two block-steps can be in flight
+/// (prefetch of the next panel while computing the current one).
+/// m_step/n_step/k_step are the kernel tile granularity (32 for the
+/// BF16 GemmKernel224). Returns conservative defaults when the
+/// detected sizes look implausible (0 or tiny).
+pub fn selectTileParams(cpu: CpuInfo) TileParams {
+    const elem_bytes: usize = 2; // BF16
+    const m_step: usize = 32;
+    const n_step: usize = 32;
+    const k_step: usize = 32;
+
+    // A working budget of half the (detected) L2. If L2 is unknown or
+    // implausibly small, fall back to the conservative default budget
+    // of 256 KiB.
+    var l2 = cpu.l2_bytes;
+    if (l2 < 16 * 1024) l2 = 256 * 1024;
+    const budget = l2 / 2;
+
+    // C tile cost (FP32): m_step * n_step * 4. Subtract from budget.
+    const c_cost = m_step * n_step * 4;
+    if (budget <= c_cost) {
+        return .{ .n_block = 256, .k_block = 1792, .estimated = true };
+    }
+
+    // Remaining budget buys K depth: A is m_step * k * 2, B is
+    // n_block * k * 2. For a first-cut n_block we use 8*n_step=256
+    // (the existing kernel constant) and spend what's left on K.
+    const n_block: usize = 8 * n_step;
+    const per_k = (m_step + n_block) * elem_bytes;
+    var k_block = (budget - c_cost) / per_k;
+    // Round down to a multiple of k_step so panels stay tile-aligned.
+    k_block = (k_block / k_step) * k_step;
+    if (k_block < k_step) k_block = k_step;
+
+    return .{
+        .n_block = n_block,
+        .k_block = k_block,
+        .estimated = cpu.l2_bytes < 16 * 1024,
+    };
+}
 
 /// Detect CPU features and vendor
 pub fn detectCpu(allocator: Allocator) !CpuInfo {
@@ -195,6 +268,10 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
         else => "unknown",
     };
 
+    // A4: detect the cache hierarchy from sysfs. Best-effort: on
+    // failure (no sysfs, container, etc.) the CpuInfo defaults hold.
+    var cache = detectCacheLinux(allocator, io);
+
     return CpuInfo{
         .vendor = vendor,
         .arch = arch,
@@ -204,7 +281,113 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
         .cpu_family = cpu_family,
         .model = model,
         .stepping = stepping,
+        .l1d_bytes = cache.l1d,
+        .l1i_bytes = cache.l1i,
+        .l2_bytes = cache.l2,
+        .l3_bytes = cache.l3,
     };
+}
+
+/// A4: parsed cache sizes from
+/// /sys/devices/system/cpu/cpu0/cache/index{N}/{type,level,size}.
+/// `size` is a string like "32K", "512K", "16M" (suffix K/M/G).
+const CacheSizes = struct {
+    l1d: usize,
+    l1i: usize,
+    l2: usize,
+    l3: usize,
+};
+
+fn detectCacheLinux(allocator: Allocator, io: *std.Io.Threaded) CacheSizes {
+    var result = CacheSizes{
+        .l1d = 32 * 1024,
+        .l1i = 32 * 1024,
+        .l2 = 512 * 1024,
+        .l3 = 16 * 1024 * 1024,
+    };
+    var saw_real = false;
+
+    // index0..index7 covers all real-world topologies (typically 0..3).
+    for (0..8) |idx| {
+        var path_buf: [128]u8 = undefined;
+
+        // level
+        const level_path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/cpu/cpu0/cache/index{d}/level", .{idx}) catch break;
+        const level = readSysfsUint(allocator, io, level_path) orelse break;
+
+        var type_buf: [128]u8 = undefined;
+        const type_path = std.fmt.bufPrintZ(&type_buf, "/sys/devices/system/cpu/cpu0/cache/index{d}/type", .{idx}) catch break;
+        const ctype = readSysfsTrimmed(allocator, io, type_path) orelse break;
+        defer allocator.free(ctype);
+
+        var size_buf: [128]u8 = undefined;
+        const size_path = std.fmt.bufPrintZ(&size_buf, "/sys/devices/system/cpu/cpu0/cache/index{d}/size", .{idx}) catch break;
+        const size_str = readSysfsTrimmed(allocator, io, size_path) orelse break;
+        defer allocator.free(size_str);
+        const size = parseSizeString(size_str) orelse continue;
+
+        // sysfs "type": Data, Instruction, Unified. L1 splits d/i;
+        // L2/L3 are Unified.
+        if (level == 1) {
+            if (std.mem.eql(u8, ctype, "Data")) {
+                result.l1d = size;
+                saw_real = true;
+            } else if (std.mem.eql(u8, ctype, "Instruction")) {
+                result.l1i = size;
+                saw_real = true;
+            }
+        } else if (level == 2) {
+            result.l2 = size;
+            saw_real = true;
+        } else if (level == 3) {
+            result.l3 = size;
+            saw_real = true;
+        }
+    }
+
+    if (!saw_real) {
+        // No sysfs info at all — keep the conservative defaults
+        // (already in `result`) so callers get sane TileParams.
+    }
+    return result;
+}
+
+/// Read a whole small sysfs file, trim the trailing newline.
+/// Uses the same std.Io.Dir/File pattern as detectCpuLinux (Zig 0.16:
+/// std.fs.cwd is gone; all FS access goes through the Io interface).
+fn readSysfsTrimmed(allocator: Allocator, io: *std.Io.Threaded, path: [:0]const u8) ?[]u8 {
+    const dir = std.Io.Dir.cwd();
+    const f = dir.openFile(std.Io.Threaded.io(io), path, .{}) catch return null;
+    defer f.close(std.Io.Threaded.io(io));
+    var buf: [64]u8 = undefined;
+    // readPositionalAll reads exactly buf.len or up to EOF at offset 0.
+    // Sysfs attribute files are tiny (a few bytes), so a 64-byte buffer
+    // read at offset 0 captures the whole value including the newline.
+    const n = std.Io.File.readPositionalAll(f, std.Io.Threaded.io(io), &buf, 0) catch return null;
+    return allocator.dupe(u8, std.mem.trim(u8, buf[0..n], " \t\n\r")) catch null;
+}
+
+/// Read a whole small sysfs file as usize (decimal).
+fn readSysfsUint(allocator: Allocator, io: *std.Io.Threaded, path: [:0]const u8) ?usize {
+    const s = readSysfsTrimmed(allocator, io, path) orelse return null;
+    defer allocator.free(s);
+    return std.fmt.parseInt(usize, s, 10) catch null;
+}
+
+/// Parse sysfs cache size strings: "32K", "512K", "16M", "2048G".
+/// Returns bytes. Plain digits ("32768") are also accepted.
+fn parseSizeString(s: []const u8) ?usize {
+    if (s.len == 0) return null;
+    const suffix = s[s.len - 1];
+    const mult: usize = switch (suffix) {
+        'K' => 1024,
+        'M' => 1024 * 1024,
+        'G' => 1024 * 1024 * 1024,
+        else => 1,
+    };
+    const num_part = if (mult != 1) s[0 .. s.len - 1] else s;
+    const n = std.fmt.parseInt(usize, num_part, 10) catch return null;
+    return n * mult;
 }
 
 fn detectCpuDarwin(_allocator: Allocator, _io: std.Io) !CpuInfo {

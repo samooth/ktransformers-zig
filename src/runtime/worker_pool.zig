@@ -89,6 +89,12 @@ pub const Subpool = struct {
     active: std.atomic.Value(bool),
     shutdown: std.atomic.Value(bool),
     done_count: std.atomic.Value(usize),
+    /// B3: count of doWorkStealingJob invocations currently in flight
+    /// on this subpool (incremented on entry, decremented under
+    /// `mutex` on exit, with a done_cv broadcast). Lets waitIdle /
+    /// kt_cpuinfer_sync block until the subpool drains, matching the
+    /// C contract "wait until <= allow_n_pending tasks remain".
+    pending_jobs: std.atomic.Value(usize),
 
     // Blocking synchronization (pthread — threads actually sleep when idle)
     mutex: c.pthread_mutex_t,
@@ -120,6 +126,7 @@ pub const Subpool = struct {
             .active = std.atomic.Value(bool).init(false),
             .shutdown = std.atomic.Value(bool).init(false),
             .done_count = std.atomic.Value(usize).init(0),
+            .pending_jobs = std.atomic.Value(usize).init(0),
             .mutex = c.PTHREAD_MUTEX_INITIALIZER,
             .work_cv = c.PTHREAD_COND_INITIALIZER,
             .done_cv = c.PTHREAD_COND_INITIALIZER,
@@ -188,6 +195,10 @@ pub const Subpool = struct {
 
     /// Dispatch a work-stealing job. Blocks until all `count` tasks complete.
     pub fn doWorkStealingJob(self: *Subpool, count: usize, work_fn: *const fn (usize) void) void {
+        // B3: register this job as in-flight BEFORE any observable
+        // work begins, so a concurrent waitIdle can't miss it.
+        _ = self.pending_jobs.fetchAdd(1, .acq_rel);
+
         _ = c.pthread_mutex_lock(&self.mutex);
         self.task_curr.store(0, .monotonic);
         self.task_end = count;
@@ -203,6 +214,27 @@ pub const Subpool = struct {
 
         self.active.store(false, .release);
         self.work_fn = null;
+        _ = c.pthread_mutex_unlock(&self.mutex);
+
+        // B3: job finished — decrement under the mutex and broadcast
+        // done_cv so any waitIdle sleeping on the condvar wakes up.
+        _ = self.pending_jobs.fetchSub(1, .acq_rel);
+        _ = c.pthread_mutex_lock(&self.mutex);
+        _ = c.pthread_cond_broadcast(&self.done_cv);
+        _ = c.pthread_mutex_unlock(&self.mutex);
+    }
+
+    /// B3: block until at most `allow_n_pending` doWorkStealingJob
+    /// invocations are still running on this subpool. 0 = fully idle.
+    /// This is the primitive behind kt_cpuinfer_sync. Because the
+    /// current submit path is synchronous, this returns immediately in
+    /// the common case; the accounting makes it correct if submit ever
+    /// becomes fire-and-forget (matching the C++ reference's contract).
+    pub fn waitIdle(self: *Subpool, allow_n_pending: usize) void {
+        _ = c.pthread_mutex_lock(&self.mutex);
+        while (self.pending_jobs.load(.acquire) > allow_n_pending) {
+            _ = c.pthread_cond_wait(&self.done_cv, &self.mutex);
+        }
         _ = c.pthread_mutex_unlock(&self.mutex);
     }
 

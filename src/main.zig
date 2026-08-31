@@ -340,6 +340,100 @@ fn ensure_cpu_variant_detected() void {
 // Core C API Functions
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// ABI layout probes — used by tools/audit_layout.py and the pybind11 shim
+// (bindings/kt_kernel_pybind.cpp) to assert that the C++ mirror structs
+// match the Zig extern struct byte layout exactly. A mismatch here is a
+// silent stack-corruption bug; these probes turn it into a loud failure.
+// NOT part of include/kt_kernel.h (test-only surface, nm-gated).
+// ---------------------------------------------------------------------------
+
+export fn kt_abi_size_moe_config() usize {
+    return @sizeOf(kt_moe_config_t);
+}
+
+export fn kt_abi_size_mla_config() usize {
+    return @sizeOf(kt_mla_config_t);
+}
+
+export fn kt_abi_size_moe_sft_config() usize {
+    return @sizeOf(kt_moe_sft_config_t);
+}
+
+export fn kt_abi_size_gate_config() usize {
+    return @sizeOf(kt_gate_config_t);
+}
+
+export fn kt_abi_size_linear_config() usize {
+    return @sizeOf(kt_linear_config_t);
+}
+
+export fn kt_abi_size_mlp_config() usize {
+    return @sizeOf(kt_mlp_config_t);
+}
+
+/// Field-offset probe: returns the byte offset of field `field_index` within
+/// the struct identified by `struct_id` (0 = kt_moe_config_t, 1 = kt_mla_config_t).
+/// Returns SIZE_MAX for an unknown id/index. Lets the C++ shim (and the
+/// layout audit tool) verify field alignment without duplicating layout
+/// knowledge in two places. Uses @offsetOf (comptime, no UB).
+export fn kt_abi_field_offset(struct_id: c_int, field_index: c_int) usize {
+    if (struct_id == 0) {
+        const offsets = [_]usize{
+            @offsetOf(kt_moe_config_t, "expert_num"),
+            @offsetOf(kt_moe_config_t, "num_experts_per_tok"),
+            @offsetOf(kt_moe_config_t, "hidden_size"),
+            @offsetOf(kt_moe_config_t, "intermediate_size"),
+            @offsetOf(kt_moe_config_t, "layer_idx"),
+            @offsetOf(kt_moe_config_t, "pool"),
+            @offsetOf(kt_moe_config_t, "num_gpu_experts"),
+            @offsetOf(kt_moe_config_t, "gate_proj"),
+            @offsetOf(kt_moe_config_t, "up_proj"),
+            @offsetOf(kt_moe_config_t, "down_proj"),
+            @offsetOf(kt_moe_config_t, "gate_scale"),
+            @offsetOf(kt_moe_config_t, "up_scale"),
+            @offsetOf(kt_moe_config_t, "down_scale"),
+            @offsetOf(kt_moe_config_t, "max_len"),
+            @offsetOf(kt_moe_config_t, "path"),
+            @offsetOf(kt_moe_config_t, "save"),
+            @offsetOf(kt_moe_config_t, "load"),
+            @offsetOf(kt_moe_config_t, "share_cache_pool"),
+            @offsetOf(kt_moe_config_t, "gate_type"),
+            @offsetOf(kt_moe_config_t, "up_type"),
+            @offsetOf(kt_moe_config_t, "down_type"),
+            @offsetOf(kt_moe_config_t, "hidden_type"),
+            @offsetOf(kt_moe_config_t, "swiglu_limit"),
+            @offsetOf(kt_moe_config_t, "swiglu_alpha"),
+        };
+        if (field_index < 0 or field_index >= offsets.len) return std.math.maxInt(usize);
+        return offsets[@intCast(field_index)];
+    } else if (struct_id == 1) {
+        const offsets = [_]usize{
+            @offsetOf(kt_mla_config_t, "hidden_size"),
+            @offsetOf(kt_mla_config_t, "q_lora_rank"),
+            @offsetOf(kt_mla_config_t, "num_heads"),
+            @offsetOf(kt_mla_config_t, "nope_size"),
+            @offsetOf(kt_mla_config_t, "rope_size"),
+            @offsetOf(kt_mla_config_t, "kv_lora_rank"),
+            @offsetOf(kt_mla_config_t, "layer_idx"),
+            @offsetOf(kt_mla_config_t, "pool"),
+            @offsetOf(kt_mla_config_t, "q_a_proj"),
+            @offsetOf(kt_mla_config_t, "q_a_norm"),
+            @offsetOf(kt_mla_config_t, "q_b_proj"),
+            @offsetOf(kt_mla_config_t, "kv_a_proj_with_mqa"),
+            @offsetOf(kt_mla_config_t, "kv_a_norm"),
+            @offsetOf(kt_mla_config_t, "kv_b_proj"),
+            @offsetOf(kt_mla_config_t, "o_proj"),
+            @offsetOf(kt_mla_config_t, "m_block"),
+            @offsetOf(kt_mla_config_t, "n_block"),
+            @offsetOf(kt_mla_config_t, "page_count"),
+        };
+        if (field_index < 0 or field_index >= offsets.len) return std.math.maxInt(usize);
+        return offsets[@intCast(field_index)];
+    }
+    return std.math.maxInt(usize);
+}
+
 export fn kt_version() [*]const u8 {
     return "0.6.1-zig";
 }
@@ -448,11 +542,17 @@ export fn kt_cpuinfer_submit(cpuinfer: *KT_CPUInfer, func: *const fn (*anyopaque
 }
 
 export fn kt_cpuinfer_sync(cpuinfer: *KT_CPUInfer, allow_n_pending: usize) void {
-    _ = cpuinfer;
-    _ = allow_n_pending;
-    // Wait for all tasks to complete
-    // In a real implementation, we'd wait on the task queue
-    // For now, this is a no-op as tasks are fire-and-forget
+    // B3: real drain semantics. Wait until every in-flight
+    // doWorkStealingJob on every subpool has finished, or until at
+    // most `allow_n_pending` remain (the C++ reference contract).
+    // The current submit path is synchronous so this is normally a
+    // fast return, but the accounting is real: if submit becomes
+    // fire-and-forget (or a caller enqueues from another thread),
+    // sync blocks on the subpool condvars until drained.
+    const pool: *worker_pool.WorkerPool = @ptrCast(@alignCast(cpuinfer));
+    for (pool.subpools) |subpool| {
+        subpool.waitIdle(allow_n_pending);
+    }
 }
 
 // ============================================================================
