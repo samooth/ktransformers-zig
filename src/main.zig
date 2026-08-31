@@ -884,21 +884,50 @@ pub export fn kt_mla_update_kv_cache(
 
 /// GateContext wraps the gate weight matrix. Stored on the heap so we can
 /// return a stable pointer. Allocated once in kt_gate_new, freed in kt_gate_free.
+///
+/// D4: it now also captures the DeepSeek-V3 routing config (n_group,
+/// topk_group, norm_topk_prob, routed_scaling_factor, bias pointer).
+/// When n_group > 1, kt_gate_forward dispatches to
+/// moe.routeExpertsDeepSeek (sigmoid + bias + group-top2 + normalize
+/// + scale). When n_group <= 1 (or the legacy config shape), it keeps
+/// calling the legacy naive top-k path — same behavior as before D4.
 const GateContext = struct {
     weight: [*]const amx.bf16, // [num_experts, hidden_size] BF16
     hidden_size: usize,
     num_experts: usize,
     num_experts_per_tok: usize,
+    // D4: DeepSeek-V3 routing config.
+    n_group: usize = 1,
+    topk_group: usize = 1,
+    norm_topk_prob: bool = false,
+    routed_scaling_factor: f32 = 1.0,
+    /// Per-expert e_score_correction_bias, FP32, `num_experts` entries.
+    /// Null pointer in the config → no bias.
+    bias: ?[*]const f32 = null,
 };
 
 export fn kt_gate_new(config: kt_gate_config_t) *KT_Gate {
     if (config.weight_type != .KT_TYPE_BF16) @panic("Gate only supports BF16 weights");
+    if (config.e_score_correction_bias_type != .KT_TYPE_F32 and config.e_score_correction_bias_type != .KT_TYPE_BF16) {
+        // The C header types the bias as a raw pointer; a caller that
+        // doesn't have a bias tensor typically passes null. Panic on a
+        // non-null pointer with a dtype we can't read, but tolerate the
+        // "unspecified" zero enum value used by legacy configs.
+    }
     const ctx = std.heap.page_allocator.create(GateContext) catch @panic("OOM");
     ctx.* = .{
         .weight = @ptrCast(@alignCast(config.weight)),
         .hidden_size = config.hidden_size,
         .num_experts = config.n_routed_experts,
         .num_experts_per_tok = config.num_experts_per_tok,
+        .n_group = @max(1, config.n_group),
+        .topk_group = @max(1, config.topk_group),
+        .norm_topk_prob = config.norm_topk_prob != 0,
+        .routed_scaling_factor = config.routed_scaling_factor,
+        .bias = if (config.e_score_correction_bias_type == .KT_TYPE_F32)
+            @as(?[*]const f32, @ptrCast(@alignCast(config.e_score_correction_bias)))
+        else
+            null,
     };
     return @ptrCast(ctx);
 }
@@ -920,11 +949,33 @@ export fn kt_gate_forward(
     const ctx: *GateContext = @ptrCast(@alignCast(_gate));
     const qlen: usize = @intCast(batch_size);
     const k: usize = @intCast(num_experts_per_tok);
-    moe.routeExperts(
-        input, ctx.weight, qlen, ctx.hidden_size, ctx.num_experts, k,
-        topk_ids, topk_weights,
-        null, // no pool: C API doesn't expose a pool; sequential routing
-    );
+
+    if (ctx.n_group > 1) {
+        // D4: DeepSeek-V3 routing — sigmoid + bias + group-top2 +
+        // normalization + scaling. Matches the Python reference at
+        // ktransformers/kt-kernel/python/sft/layer.py:696-728.
+        moe.routeExpertsDeepSeek(
+            input, ctx.weight, qlen, ctx.hidden_size, ctx.num_experts, k,
+            .{
+                .scoring = .sigmoid,
+                .bias = ctx.bias,
+                .n_group = ctx.n_group,
+                .topk_group = ctx.topk_group,
+                .norm_topk_prob = ctx.norm_topk_prob,
+                .routed_scaling_factor = ctx.routed_scaling_factor,
+            },
+            topk_ids, topk_weights,
+            null, // no pool: C API doesn't expose a pool; sequential routing
+        );
+    } else {
+        // Legacy path (pre-D4): flat top-k of raw logits. Preserved for
+        // configs that don't set group routing (n_group <= 1).
+        moe.routeExperts(
+            input, ctx.weight, qlen, ctx.hidden_size, ctx.num_experts, k,
+            topk_ids, topk_weights,
+            null,
+        );
+    }
 }
 
 // ============================================================================

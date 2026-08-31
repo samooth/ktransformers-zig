@@ -2361,3 +2361,205 @@ test "gemmExpert vectorized: k=37 (vec + scalar tail)" {
         }
     }
 }
+
+// ============================================================================
+// D4 regression: DeepSeek-V3 group-top2 routing (sigmoid + bias + groups)
+// ============================================================================
+//
+// Mirrors the Python reference at
+// ktransformers/kt-kernel/test/per_commit/test_sft_router_grad.py:38-67
+// (the `_DeepseekRouter` class): 8 experts, hidden=4, n_group=2 (4
+// experts/group), topk_group=1, top_k=2, norm_topk_prob=True,
+// routed_scaling_factor=2.5.
+//
+// The test constructs a deterministic weight/bias/input set where the
+// correct routing decision is computable by hand, then asserts the Zig
+// implementation selects the same experts and produces the same
+// normalized+scaled weights within FP32 tolerance.
+
+test "routeExpertsDeepSeek: group-top2 matches Python reference algorithm" {
+    const allocator = testing.allocator;
+
+    const hidden: usize = 4;
+    const expert_num: usize = 8;
+    const n_group: usize = 2;
+    const topk_group: usize = 1;
+    const k: usize = 2; // num_experts_per_tok
+    const qlen: usize = 1;
+
+    // Gate weight [8, 4] BF16. Row e gives expert e's projection.
+    // Chosen so the logits are distinct and the group structure matters.
+    const gate_w = try allocator.alloc(amx.bf16, expert_num * hidden);
+    defer allocator.free(gate_w);
+    for (0..expert_num) |e| {
+        for (0..hidden) |h| {
+            // gate_w[e][h] = small distinct values: (e+1)/10 * (h+1)/10
+            const v: f32 = @as(f32, @floatFromInt(e + 1)) * 0.1 * @as(f32, @floatFromInt(h + 1)) * 0.1;
+            gate_w[e * hidden + h] = amx.f32_to_bf16(v);
+        }
+    }
+
+    // Input [1, 4]: all 0.5
+    const input = try allocator.alloc(amx.bf16, qlen * hidden);
+    defer allocator.free(input);
+    for (input) |*v| v.* = amx.f32_to_bf16(0.5);
+
+    // Bias [8] FP32. Distinct per expert so the bias shifts the choice.
+    const bias = try allocator.alloc(f32, expert_num);
+    defer allocator.free(bias);
+    for (0..expert_num) |e| bias[e] = @as(f32, @floatFromInt(e)) * 0.05;
+
+    // ---- Hand-computed reference (mirrors the Python algorithm) ----
+    // 1. logits[e] = input @ gate_w[e].T
+    var logits: [expert_num]f32 = undefined;
+    for (0..expert_num) |e| {
+        var s: f32 = 0;
+        for (0..hidden) |h| {
+            s += amx.bf16_to_f32(input[h]) * amx.bf16_to_f32(gate_w[e * hidden + h]);
+        }
+        logits[e] = s;
+    }
+    // 2. scores = sigmoid(logits)
+    var scores: [expert_num]f32 = undefined;
+    for (0..expert_num) |e| scores[e] = 1.0 / (1.0 + @exp(-logits[e]));
+    // 3. choice = scores + bias
+    var choice: [expert_num]f32 = undefined;
+    for (0..expert_num) |e| choice[e] = scores[e] + bias[e];
+    // 4. group_scores[g] = top2(choice[g*4..g*4+4]).sum
+    var group_scores: [n_group]f32 = undefined;
+    for (0..n_group) |g| {
+        var top1: f32 = -std.math.inf(f32);
+        var top2: f32 = -std.math.inf(f32);
+        for (0..4) |i| {
+            const v = choice[g * 4 + i];
+            if (v > top1) {
+                top2 = top1;
+                top1 = v;
+            } else if (v > top2) {
+                top2 = v;
+            }
+        }
+        group_scores[g] = top1 + top2;
+    }
+    // 5. winner group = argmax(group_scores)
+    var winner: usize = 0;
+    for (1..n_group) |g| {
+        if (group_scores[g] > group_scores[winner]) winner = g;
+    }
+    // 6. top-2 experts among the winner group's experts (by choice)
+    var exp1: usize = winner * 4;
+    var exp2: usize = winner * 4;
+    var best1: f32 = -std.math.inf(f32);
+    var best2: f32 = -std.math.inf(f32);
+    for (0..4) |i| {
+        const e = winner * 4 + i;
+        if (choice[e] > best1) {
+            best2 = best1;
+            exp2 = exp1;
+            best1 = choice[e];
+            exp1 = e;
+        } else if (choice[e] > best2) {
+            best2 = choice[e];
+            exp2 = e;
+        }
+    }
+    // 7. weights = scores[exp] / sum(scores[exp1..exp2]) * 2.5
+    const w_sum = scores[exp1] + scores[exp2];
+    const w1 = scores[exp1] / (w_sum + 1e-20) * 2.5;
+    const w2 = scores[exp2] / (w_sum + 1e-20) * 2.5;
+
+    // ---- Zig implementation ----
+    const topk_ids = try allocator.alloc(i64, qlen * k);
+    defer allocator.free(topk_ids);
+    const topk_weights = try allocator.alloc(f32, qlen * k);
+    defer allocator.free(topk_weights);
+
+    moe.routeExpertsDeepSeek(
+        input.ptr, gate_w.ptr, qlen, hidden, expert_num, k,
+        .{
+            .scoring = .sigmoid,
+            .bias = bias.ptr,
+            .n_group = n_group,
+            .topk_group = topk_group,
+            .norm_topk_prob = true,
+            .routed_scaling_factor = 2.5,
+        },
+        topk_ids.ptr, topk_weights.ptr,
+        null,
+    );
+
+    // ---- Assertions ----
+    // The selected experts must be exactly the two hand-computed ones
+    // (order between the two ranks doesn't matter — we check set-wise).
+    const got_ids = [_]usize{ @intCast(topk_ids[0]), @intCast(topk_ids[1]) };
+    try testing.expect(
+        (got_ids[0] == exp1 and got_ids[1] == exp2) or
+        (got_ids[0] == exp2 and got_ids[1] == exp1),
+    );
+
+    // Both selected experts must be in the winner group.
+    try testing.expect(got_ids[0] / 4 == winner);
+    try testing.expect(got_ids[1] / 4 == winner);
+
+    // Weights must match the hand-computed normalized+scaled values.
+    // Map weights back to ids (the Zig impl writes weights in the same
+    // rank order as ids).
+    var got_w1: f32 = 0;
+    var got_w2: f32 = 0;
+    if (got_ids[0] == exp1) {
+        got_w1 = topk_weights[0];
+        got_w2 = topk_weights[1];
+    } else {
+        got_w1 = topk_weights[1];
+        got_w2 = topk_weights[0];
+    }
+    try testing.expect(@abs(got_w1 - w1) < 1e-4);
+    try testing.expect(@abs(got_w2 - w2) < 1e-4);
+
+    // Sanity: weights sum to the scaling factor when normalized.
+    const wsum = topk_weights[0] + topk_weights[1];
+    try testing.expect(@abs(wsum - 2.5) < 1e-4);
+}
+
+test "routeExpertsDeepSeek: no-group config falls back to legacy behavior" {
+    // D4 guard: a malformed config (n_group=0 or non-divisible) must
+    // not panic — it falls back to routeExperts (naive top-k). This
+    // mirrors the "never fail on a model load" policy in the Zig gate.
+    const allocator = testing.allocator;
+
+    const hidden: usize = 4;
+    const expert_num: usize = 8;
+    const k: usize = 2;
+    const qlen: usize = 1;
+
+    const gate_w = try allocator.alloc(amx.bf16, expert_num * hidden);
+    defer allocator.free(gate_w);
+    for (0..expert_num * hidden) |i| gate_w[i] = amx.f32_to_bf16(0.1);
+
+    const input = try allocator.alloc(amx.bf16, qlen * hidden);
+    defer allocator.free(input);
+    for (input) |*v| v.* = amx.f32_to_bf16(0.5);
+
+    const topk_ids = try allocator.alloc(i64, qlen * k);
+    defer allocator.free(topk_ids);
+    const topk_weights = try allocator.alloc(f32, qlen * k);
+    defer allocator.free(topk_weights);
+
+    // n_group=0: invalid, must fall back (not panic).
+    moe.routeExpertsDeepSeek(
+        input.ptr, gate_w.ptr, qlen, hidden, expert_num, k,
+        .{ .n_group = 0 },
+        topk_ids.ptr, topk_weights.ptr,
+        null,
+    );
+    for (topk_ids) |id| try testing.expect(id >= 0 and id < 8);
+
+    // n_group=3 with 8 experts: non-divisible, must fall back.
+    moe.routeExpertsDeepSeek(
+        input.ptr, gate_w.ptr, qlen, hidden, expert_num, k,
+        .{ .n_group = 3 },
+        topk_ids.ptr, topk_weights.ptr,
+        null,
+    );
+    for (topk_ids) |id| try testing.expect(id >= 0 and id < 8);
+}

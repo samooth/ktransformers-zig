@@ -127,6 +127,247 @@ pub const GateContext = struct {
     num_experts_per_tok: usize,
 };
 
+/// Expert routing options (D4: DeepSeek-V3 group-top2 routing).
+///
+/// Defaults reproduce the pre-D4 behavior (naive top-k of raw logits,
+/// no sigmoid/bias/grouping). The new fields drive the DeepSeek-V3
+/// routing algorithm: sigmoid scores + bias correction + group-top2
+/// selection + optional normalization + scaling.
+pub const RouteOpts = struct {
+    /// Scoring function. `.sigmoid` (DeepSeek-V3) applies sigmoid to the
+    /// gate logits and then uses bias-corrected sigmoid for the
+    /// group/top-k selection (but the original sigmoid is what's
+    /// returned as the routing weight). `.softmax` (Qwen3 / vanilla)
+    /// applies softmax over the full expert dim and uses the softmax
+    /// probability for both selection and weights.
+    scoring: Scoring = .sigmoid,
+
+    /// Per-expert bias added to the sigmoid score before group selection.
+    /// `null` means no bias (e.g. older DeepSeek checkpoints that don't
+    /// ship the e_score_correction_bias tensor). The bias is FP32; the
+    /// gate weight is BF16. Matches the Python reference at
+    /// `ktransformers/kt-kernel/python/sft/layer.py:642-728`.
+    bias: ?[*]const f32 = null,
+
+    /// Number of expert groups for group-topk selection. 1 (default)
+    /// disables grouping (use a plain top-k over all experts). For
+    /// DeepSeek-V3 the model config sets this to 8 (256 experts / 8 per
+    /// group). Must divide `expert_num` exactly.
+    n_group: usize = 1,
+
+    /// Number of top groups to keep (must be <= n_group). Only the
+    /// experts in the selected groups are eligible for the final
+    /// top-k. DeepSeek-V3 uses 4.
+    topk_group: usize = 1,
+
+    /// If true, divide the top-k weights by their sum (with an
+    /// epsilon to avoid div-by-zero) before applying the scaling
+    /// factor. Matches `norm_topk_prob=True` in the HF config.
+    norm_topk_prob: bool = false,
+
+    /// Multiplier applied to the final weights. DeepSeek-V3 uses 2.5.
+    routed_scaling_factor: f32 = 1.0,
+
+    pub const Scoring = enum { sigmoid, softmax };
+};
+
+/// D4: DeepSeek-V3 group-top2 router. Computes the full DeepSeek
+/// routing algorithm for a single token (or a batch). The input
+/// `logits` are the raw `input @ gate_weight.T` values (un-normalized);
+/// this function applies the bias correction, group-top2, final
+/// top-k, normalization, and scaling per the HF DeepSeek-V3 reference
+/// (`sft/layer.py:696-728`).
+///
+/// Output: writes `topk_ids[i * k + j]` and `topk_weights[i * k + j]`
+/// for token `i`, rank `j` in [0, k). `topk_ids` are indices into
+/// `[0, expert_num)`. `topk_weights` are the routing probabilities
+/// (sum is not 1.0 — they incorporate `routed_scaling_factor`).
+///
+/// Pre-conditions:
+/// - `logits.len == qlen * expert_num`
+/// - `bias == null` OR `bias.len >= expert_num`
+/// - `expert_num % opts.n_group == 0`
+/// - `opts.topk_group <= opts.n_group`
+/// - `k == num_experts_per_tok`
+fn routeExpertsWithOpts(
+    logits: []f32,
+    qlen: usize,
+    expert_num: usize,
+    k: usize,
+    opts: RouteOpts,
+    topk_ids: [*]i64,
+    topk_weights: [*]f32,
+) void {
+    const experts_per_group = expert_num / opts.n_group;
+    // Per-token scratch: sigmoid/softmax score, bias-corrected score,
+    // and the group-mask. Allocated once per call to avoid re-allocation
+    // per token in the inner loop.
+    var scores = std.heap.page_allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
+    defer std.heap.page_allocator.free(scores);
+    var scores_for_choice = std.heap.page_allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
+    defer std.heap.page_allocator.free(scores_for_choice);
+    var group_scores = std.heap.page_allocator.alloc(f32, qlen * opts.n_group) catch @panic("OOM");
+    defer std.heap.page_allocator.free(group_scores);
+    var group_mask = std.heap.page_allocator.alloc(f32, qlen * opts.n_group) catch @panic("OOM");
+    defer std.heap.page_allocator.free(group_mask);
+
+    for (0..qlen) |i| {
+        const logit_row = logits[i * expert_num ..][0..expert_num];
+        const score_row = scores[i * expert_num ..][0..expert_num];
+        const choice_row = scores_for_choice[i * expert_num ..][0..expert_num];
+
+        // Step 1: scoring function — sigmoid (DeepSeek) or softmax.
+        switch (opts.scoring) {
+            .sigmoid => {
+                for (0..expert_num) |e| {
+                    score_row[e] = 1.0 / (1.0 + @exp(-logit_row[e]));
+                }
+            },
+            .softmax => {
+                // Numerically-stable softmax: subtract max for stability.
+                var max_logit: f32 = logit_row[0];
+                for (1..expert_num) |e| {
+                    if (logit_row[e] > max_logit) max_logit = logit_row[e];
+                }
+                var sum: f32 = 0;
+                for (0..expert_num) |e| {
+                    const e_x = @exp(logit_row[e] - max_logit);
+                    score_row[e] = e_x;
+                    sum += e_x;
+                }
+                const inv_sum = 1.0 / sum;
+                for (0..expert_num) |e| {
+                    score_row[e] *= inv_sum;
+                }
+            },
+        }
+
+        // Step 2: score_for_choice = score + bias (if bias provided).
+        // For softmax scoring, the bias is still added to the score for
+        // group selection (matches the Python reference).
+        if (opts.bias) |bias| {
+            for (0..expert_num) |e| {
+                choice_row[e] = score_row[e] + bias[e];
+            }
+        } else {
+            @memcpy(choice_row, score_row);
+        }
+
+        // Step 3+4: group-top2 (DeepSeek) or flat top-k of the score.
+        // The DeepSeek inner top-2 is hardcoded — see the comment at
+        // ktransformers/kt-kernel/python/sft/layer.py:155-157. For
+        // n_group == 1 (no grouping), the top-2 per group is just
+        // top-2 of the whole expert dim, and group selection is
+        // trivial (only one group, always selected), so the algorithm
+        // collapses to a flat top-k of choice_row — same as the old
+        // naive path.
+        for (0..opts.n_group) |g| {
+            group_mask[i * opts.n_group + g] = 0.0;
+        }
+        if (opts.n_group == 1) {
+            group_mask[i] = 1.0;
+            group_scores[i] = 0.0;
+        } else {
+            // For each group, sum the top-2 of choice_row in that group.
+            for (0..opts.n_group) |g| {
+                const gstart = g * experts_per_group;
+                const gend = gstart + experts_per_group;
+                // Find top-2 with a 2-element tournament (avoids a
+                // full sort; experts_per_group is small in practice,
+                // 8-32, so this is O(experts_per_group) per group).
+                var top1: f32 = -std.math.inf(f32);
+                var top2: f32 = -std.math.inf(f32);
+                for (gstart..gend) |e| {
+                    const v = choice_row[e];
+                    if (v > top1) {
+                        top2 = top1;
+                        top1 = v;
+                    } else if (v > top2) {
+                        top2 = v;
+                    }
+                }
+                group_scores[i * opts.n_group + g] = top1 + top2;
+            }
+            // Find topk_group groups.
+            var selected_groups: [16]usize = undefined;
+            for (0..opts.topk_group) |tg| {
+                var best_g: usize = 0;
+                var best_v: f32 = -std.math.inf(f32);
+                for (0..opts.n_group) |g| {
+                    const v = group_scores[i * opts.n_group + g];
+                    if (v > best_v) {
+                        best_v = v;
+                        best_g = g;
+                    }
+                }
+                selected_groups[tg] = best_g;
+                group_mask[i * opts.n_group + best_g] = 1.0;
+                // Prevent re-selection by zeroing the picked group's score.
+                group_scores[i * opts.n_group + best_g] = -std.math.inf(f32);
+            }
+        }
+
+        // Step 5+6: build a masked score and find the top-k experts.
+        // Experts in selected groups keep their choice_row value;
+        // others are zeroed. The top-k is then taken over the
+        // masked score, and the topk_ids are the indices.
+        var token_topk_ids: [256]i64 = undefined; // k <= 256
+        var token_topk_vals: [256]f32 = undefined;
+        const max_k = @min(k, 256);
+        for (0..max_k) |tk| {
+            var best_e: usize = 0;
+            var best_v: f32 = -std.math.inf(f32);
+            for (0..expert_num) |e| {
+                // Apply group mask: only experts in selected groups
+                // are eligible. The mask is per-group, so check which
+                // group expert e belongs to.
+                const g = e / experts_per_group;
+                if (group_mask[i * opts.n_group + g] == 0.0) continue;
+                if (choice_row[e] > best_v) {
+                    best_v = choice_row[e];
+                    best_e = e;
+                }
+            }
+            token_topk_ids[tk] = @intCast(best_e);
+            token_topk_vals[tk] = best_v;
+            // Mask out the picked expert so the next iteration finds
+            // a different one.
+            choice_row[best_e] = -std.math.inf(f32);
+        }
+
+        // Step 7: gather original sigmoid/softmax scores (NOT
+        // choice_row) at the topk_ids. This is the routing weight
+        // that downstream MoE multiplication uses — it's the model's
+        // confidence, not the bias-corrected score.
+        var weight_sum: f32 = 0;
+        for (0..max_k) |tk| {
+            const e: usize = @intCast(token_topk_ids[tk]);
+            topk_weights[i * k + tk] = score_row[e];
+            weight_sum += score_row[e];
+        }
+
+        // Step 8: optional normalization.
+        if (opts.norm_topk_prob) {
+            const inv_sum = 1.0 / (weight_sum + 1e-20);
+            for (0..max_k) |tk| {
+                topk_weights[i * k + tk] *= inv_sum;
+            }
+        }
+
+        // Step 9: scaling.
+        if (opts.routed_scaling_factor != 1.0) {
+            for (0..max_k) |tk| {
+                topk_weights[i * k + tk] *= opts.routed_scaling_factor;
+            }
+        }
+
+        // Write the ids.
+        for (0..max_k) |tk| {
+            topk_ids[i * k + tk] = token_topk_ids[tk];
+        }
+    }
+}
+
 pub fn routeExperts(
     input: [*]const amx.bf16, // [qlen, hidden_size]
     gate_proj: [*]const amx.bf16, // [expert_num, hidden_size]
@@ -138,15 +379,16 @@ pub fn routeExperts(
     topk_weights: [*]f32,
     pool: ?*worker_pool.WorkerPool,
 ) void {
-    // Compute gate scores: input @ gate_proj^T via batched BF16 GEMM, then
-    // select top-k experts per token. The matmul reuses gemm_bf16.gemmExpert
-    // (the same kernel the MLA engine uses for projectQ). pool is optional:
-    // the C API (kt_gate_forward) passes null; the MoE forward path passes a
-    // real pool. Sequential matmul today; future: parallelize the M dim.
-    const total_work = qlen;
-    const thread_count = if (pool) |p| p.getTotalThreads() else 1;
-    _ = @max(1, total_work / thread_count);
-
+    // D4: when the caller wants DeepSeek-V3 routing, it calls
+    // routeExpertsDeepSeek below. The legacy path here preserves the
+    // pre-D4 behavior exactly: one batched BF16 GEMM for the logits,
+    // then a per-token flat top-k of the raw logits. This is the
+    // fallback for callers that don't pass bias/group config (e.g.
+    // the existing test_kernels test that doesn't use DeepSeek).
+    // The pool argument is preserved for API compat with existing
+    // callers; future work: parallelize the matmul + topk across the
+    // pool's threads.
+    if (pool) |_| {}
     var logits = std.heap.page_allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
     defer std.heap.page_allocator.free(logits);
 
@@ -171,6 +413,52 @@ pub fn routeExperts(
             if (best_idx >= 0) logits[i * expert_num + @as(usize, @intCast(best_idx))] = -std.math.inf(f32);
         }
     }
+}
+
+/// D4: DeepSeek-V3-aware expert routing. Same I/O contract as
+/// `routeExperts` but applies sigmoid + bias + group-top2 + normalize
+/// + scale per the HF DeepSeek-V3 reference. Used by `kt_gate_forward`
+/// when the C config has `n_group > 1` (the standard DeepSeek-V3
+/// case). Callers that want the legacy naive top-k should use
+/// `routeExperts` directly.
+pub fn routeExpertsDeepSeek(
+    input: [*]const amx.bf16, // [qlen, hidden_size]
+    gate_proj: [*]const amx.bf16, // [expert_num, hidden_size]
+    qlen: usize,
+    hidden_size: usize,
+    expert_num: usize,
+    num_experts_per_tok: usize,
+    opts: RouteOpts,
+    topk_ids: [*]i64,
+    topk_weights: [*]f32,
+    pool: ?*worker_pool.WorkerPool,
+) void {
+    // Sanity: the algorithm requires expert_num % n_group == 0 and
+    // n_group >= 1. If a malformed config slips through, fall back
+    // to the simple softmax path so we never panic on a model load.
+    if (opts.n_group < 1 or expert_num % opts.n_group != 0 or opts.topk_group > opts.n_group) {
+        routeExperts(input, gate_proj, qlen, hidden_size, expert_num, num_experts_per_tok, topk_ids, topk_weights, pool);
+        return;
+    }
+
+    var logits = std.heap.page_allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
+    defer std.heap.page_allocator.free(logits);
+
+    gemm_bf16.gemmExpert(
+        input, gate_proj, logits.ptr,
+        qlen, expert_num, hidden_size,
+        hidden_size, hidden_size, expert_num,
+    );
+
+    routeExpertsWithOpts(
+        logits,
+        qlen,
+        expert_num,
+        num_experts_per_tok,
+        opts,
+        topk_ids,
+        topk_weights,
+    );
 }
 
 // ============================================================================
