@@ -159,6 +159,8 @@ pub fn build(b: *std.Build) void {
     RunTest.run(b, test_step, "tests/kernels/mla_capi_tests.zig", "src/main.zig", target, optimize);
     // Suite 5: GGML quant C API (rooted at main.zig for export access)
     RunTest.run(b, test_step, "tests/kernels/ggml_capi_tests.zig", "src/main.zig", target, optimize);
+    // Suite 5b: custom allocator injection C API (B1)
+    RunTest.run(b, test_step, "tests/kernels/allocator_capi_tests.zig", "src/main.zig", target, optimize);
     // Suite 5: aarch64 CPU detection in selectBestVariant
     RunTest.run(b, test_step, "tests/kernels/aarch64_detect_test.zig", "src/root.zig", target, optimize);
     // Suite 6: ARM NEON feature detection (comptime flag must be false on

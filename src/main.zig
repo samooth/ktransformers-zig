@@ -1158,7 +1158,7 @@ const GateContext = struct {
     allocator: std.mem.Allocator,
 };
 
-export fn kt_gate_new(config: kt_gate_config_t) *KT_Gate {
+pub export fn kt_gate_new(config: kt_gate_config_t) *KT_Gate {
     if (config.weight_type != .KT_TYPE_BF16) @panic("Gate only supports BF16 weights");
     if (config.e_score_correction_bias_type != .KT_TYPE_F32 and config.e_score_correction_bias_type != .KT_TYPE_BF16) {
         // The C header types the bias as a raw pointer; a caller that
@@ -1186,13 +1186,13 @@ export fn kt_gate_new(config: kt_gate_config_t) *KT_Gate {
     return @ptrCast(ctx);
 }
 
-export fn kt_gate_free(gate: *KT_Gate) void {
+pub export fn kt_gate_free(gate: *KT_Gate) void {
     const ctx: *GateContext = @ptrCast(@alignCast(gate));
     const a = ctx.allocator;
     a.destroy(ctx);
 }
 
-export fn kt_gate_forward(
+pub export fn kt_gate_forward(
     _gate: *KT_Gate,
     input: [*]const amx.bf16,
     _logits: [*]f32, // unused; kept for API compat
@@ -1539,6 +1539,9 @@ const Fp8Transport = struct {
     writer_ns: u64,
     slot_wait_ns: u64,
     total_ns: u64,
+    /// B1: allocator captured at kt_fp8_transport_new; the free paths
+    /// (kt_fp8_transport_free) destroy through it.
+    allocator: std.mem.Allocator,
 };
 
 /// Validate the control region header and cast it to a typed pointer.
@@ -1637,16 +1640,17 @@ pub export fn kt_fp8_transport_new(
 
     const tp: usize = @intCast(tp_size);
     const all_count: usize = FP8_HOST_SLOTS * tp * FP8_BUFFER_KINDS;
+    const allocator = defaultAllocator(); // B1
 
     const all_slice: []usize = if (rank == 0) blk: {
         const src = all_rank_host_ptrs orelse @panic("FP8 layerwise all_rank_host_ptrs is required on rank zero");
-        const buf = std.heap.page_allocator.alloc(usize, all_count) catch @panic("OOM");
+        const buf = allocator.alloc(usize, all_count) catch @panic("OOM");
         for (0..all_count) |i| {
             if (src[i] == 0) @panic("FP8 layerwise buffer pointers must be non-zero");
             buf[i] = src[i];
         }
         break :blk buf;
-    } else std.heap.page_allocator.alloc(usize, 0) catch @panic("OOM");
+    } else allocator.alloc(usize, 0) catch @panic("OOM");
 
     var local_buf: [FP8_HOST_SLOTS * FP8_BUFFER_KINDS]usize = undefined;
     for (0..FP8_HOST_SLOTS * FP8_BUFFER_KINDS) |i| {
@@ -1659,7 +1663,7 @@ pub export fn kt_fp8_transport_new(
         nb_buf[i] = nbytes[i];
     }
 
-    const t = std.heap.page_allocator.create(Fp8Transport) catch @panic("OOM");
+    const t = allocator.create(Fp8Transport) catch @panic("OOM");
     t.* = .{
         .rank = rank,
         .tp_size = tp_size,
@@ -1674,6 +1678,7 @@ pub export fn kt_fp8_transport_new(
         .writer_ns = 0,
         .slot_wait_ns = 0,
         .total_ns = 0,
+        .allocator = allocator,
     };
     return @ptrCast(t);
 }
@@ -1775,8 +1780,9 @@ pub export fn kt_fp8_transport_close(transport: ?*KT_FP8LayerwiseTransport) void
 pub export fn kt_fp8_transport_free(transport: ?*KT_FP8LayerwiseTransport) void {
     // Match the C free(NULL) idiom: a null transport is a no-op.
     const t: *Fp8Transport = @ptrCast(@alignCast(transport orelse return));
-    std.heap.page_allocator.free(t.all_rank_host_ptrs);
-    std.heap.page_allocator.destroy(t);
+    const a = t.allocator; // B1: captured allocator, not the default
+    a.free(t.all_rank_host_ptrs);
+    a.destroy(t);
 }
 
 pub export fn kt_fp8_transport_rank(transport: ?*KT_FP8LayerwiseTransport) c_int {

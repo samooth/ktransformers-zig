@@ -613,4 +613,19 @@ void kt_apply_rms_norm(const void* input, const void* weight, void* output,
 void kt_apply_rope(void* q, void* k, int64_t position, size_t head_dim, double rope_theta);
 void kt_softmax(const float* input, float* output, size_t size);
 
+// --- Custom allocator injection (call BEFORE any kt_*_new) ---
+// Installs a C-ABI allocator used by every subsequent kt_* construction
+// and per-call scratch. Objects created earlier keep the allocator they
+// were built with; their *_free paths use that captured allocator, so
+// swapping the default between new and free is safe. Pass NULL to
+// restore the built-in default (mmap-backed page allocator).
+typedef struct kt_allocator_vtable {
+    void* userdata;                                   /* passed to every callback */
+    uint8_t* (*alloc)(void* userdata, size_t size, size_t alignment);   /* NULL on failure */
+    void (*free)(void* userdata, uint8_t* ptr, size_t size, size_t alignment);
+    int (*resize)(void* userdata, uint8_t* ptr, size_t old_size,
+                  size_t new_size, size_t alignment); /* 0 ok, -1 unsupported */
+} kt_allocator_vtable;
+void kt_set_default_allocator(const kt_allocator_vtable* vtable);
+
 #endif // KTRANSFORMERS_C_API_H

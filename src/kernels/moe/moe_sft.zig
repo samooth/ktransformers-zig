@@ -178,8 +178,13 @@ pub const TpMoeSft = struct {
     }
 
     pub fn deinit(self: *TpMoeSft) void {
+        // B1: free through the allocator the base TpMoe captured at
+        // init (prepare_bwd allocates with the same one — see below).
+        // This was a hardcoded page_allocator before, an invalid-free
+        // waiting to happen whenever TpMoeSft is constructed with a
+        // different allocator (e.g. std.testing.allocator in tests).
         if (self.buffer_len > 0) {
-            const allocator = std.heap.page_allocator;
+            const allocator = self.moe.allocator;
             allocator.free(self.grad_inter);
             allocator.free(self.grad_up_scratch);
         }
@@ -523,7 +528,9 @@ pub const TpMoeSft = struct {
         const inter = @as(usize, @intCast(cfg.intermediate_size));
         const needed = max_tokens * inter;
         if (needed > self.buffer_len) {
-            const allocator = std.heap.page_allocator;
+            // B1: allocate through the captured base-TpMoe allocator so
+            // the deinit free path (same allocator) stays symmetric.
+            const allocator = self.moe.allocator;
             if (self.buffer_len > 0) {
                 allocator.free(self.grad_inter);
                 allocator.free(self.grad_up_scratch);
