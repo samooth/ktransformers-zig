@@ -7,8 +7,6 @@ const Allocator = std.mem.Allocator;
 const avx512vnni_str = "avx512vnni";
 const avx512_vnni_str = "avx512_vnni";
 
-
-
 /// CPU vendor identification
 pub const Vendor = enum {
     intel,
@@ -39,15 +37,13 @@ pub const Features = struct {
     neon: bool = false,
 };
 
-
-
 /// CPU information
 pub const CpuInfo = struct {
     vendor: Vendor,
     arch: []const u8,
     features: Features,
     flags: [16]u8,
-    model_name: []u8,  // owned, freed by deinit
+    model_name: []u8, // owned, freed by deinit
     cpu_family: u32,
     model: u32,
     stepping: u32,
@@ -66,11 +62,9 @@ pub const CpuInfo = struct {
     }
 };
 
-
 /// Detect CPU features and vendor
-
 pub fn detectCpu(allocator: Allocator) !CpuInfo {
-        var io = std.Io.Threaded.init(allocator, .{ .environ = std.process.Environ.empty });
+    var io = std.Io.Threaded.init(allocator, .{ .environ = std.process.Environ.empty });
     const os = builtin.target.os.tag;
     switch (os) {
         .linux => return detectCpuLinux(allocator, &io),
@@ -88,7 +82,6 @@ pub fn detectCpu(allocator: Allocator) !CpuInfo {
         },
     }
 }
-
 
 fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
     const dir = std.Io.Dir.cwd();
@@ -112,7 +105,6 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
     var flags_len: usize = 0;
     for (&flags) |*elem| elem.* = 0;
     const features = Features{};
-
 
     while (lines.next()) |line| {
         if (std.mem.startsWith(u8, line, "vendor_id")) {
@@ -155,7 +147,7 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
                     stepping = std.fmt.parseInt(u32, std.mem.trim(u8, value, " \t"), 10) catch 0;
                 }
             }
-                } else if (std.mem.startsWith(u8, line, "flags") or std.mem.startsWith(u8, line, "Features")) {
+        } else if (std.mem.startsWith(u8, line, "flags") or std.mem.startsWith(u8, line, "Features")) {
             var parts = std.mem.splitScalar(u8, line, 58);
             if (parts.next()) |_| {
                 if (parts.next()) |value| {
@@ -163,7 +155,10 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
                     var iter = std.mem.splitScalar(u8, flag_str, 32);
                     while (iter.next()) |flag| {
                         if (flag.len > 0) {
-                            if (flags_len < 16) { flags[flags_len] = flag[0]; flags_len += 1; }
+                            if (flags_len < 16) {
+                                flags[flags_len] = flag[0];
+                                flags_len += 1;
+                            }
                             try parseFlag(allocator, flag, @constCast(&features));
                         }
                     }
@@ -186,7 +181,8 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
             (std.mem.indexOf(u8, lower, "arm cortex") != null) or
             (std.mem.indexOf(u8, lower, "kunpeng") != null) or
             (std.mem.indexOf(u8, lower, "kirin") != null) or
-            (std.mem.indexOf(u8, lower, "huawei") != null)) {
+            (std.mem.indexOf(u8, lower, "huawei") != null))
+        {
             vendor = .arm;
         }
     }
@@ -211,7 +207,9 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
     };
 }
 
-fn detectCpuDarwin(_allocator: Allocator, _io: std.Io) !CpuInfo { _ = _io; _ = _allocator;
+fn detectCpuDarwin(_allocator: Allocator, _io: std.Io) !CpuInfo {
+    _ = _io;
+    _ = _allocator;
     const arch = switch (builtin.target.cpu.arch) {
         .aarch64 => "aarch64",
         .x86_64 => "x86_64",
@@ -220,8 +218,7 @@ fn detectCpuDarwin(_allocator: Allocator, _io: std.Io) !CpuInfo { _ = _io; _ = _
 
     const vendor: Vendor = if (std.mem.eql(u8, arch, "aarch64")) .arm else .intel;
     const features = Features{};
-    
-    
+
     if (std.mem.eql(u8, arch, "aarch64")) {
         features.neon = true;
         features.sve = true; // Apple Silicon has SVE-like features
@@ -239,7 +236,10 @@ fn detectCpuDarwin(_allocator: Allocator, _io: std.Io) !CpuInfo { _ = _io; _ = _
     };
 }
 
-fn detectCpuWindows(_allocator: Allocator, _io: anytype) !CpuInfo { _ = _io; _ = _io; _ = _allocator;
+fn detectCpuWindows(_allocator: Allocator, _io: anytype) !CpuInfo {
+    _ = _io;
+    _ = _io;
+    _ = _allocator;
     const arch = switch (builtin.target.cpu.arch) {
         .x86_64 => "x86_64",
         .aarch64 => "aarch64",
@@ -249,8 +249,7 @@ fn detectCpuWindows(_allocator: Allocator, _io: anytype) !CpuInfo { _ = _io; _ =
 
     const vendor: Vendor = if (std.mem.eql(u8, arch, "aarch64")) .arm else .unknown;
     const features = Features{};
-    
-    
+
     return CpuInfo{
         .vendor = vendor,
         .arch = arch,
@@ -265,58 +264,42 @@ fn detectCpuWindows(_allocator: Allocator, _io: anytype) !CpuInfo { _ = _io; _ =
 
 fn parseFlag(allocator: std.mem.Allocator, flag: []const u8, features: *Features) error{OutOfMemory}!void {
     const f = try std.ascii.allocLowerString(allocator, flag);
-                        defer allocator.free(f);
+    defer allocator.free(f);
     if (std.mem.eql(u8, f, "avx")) {
         features.avx = true;
     } else if (std.mem.eql(u8, f, "avx2")) {
         features.avx2 = true;
-    }
-    else if (std.mem.eql(u8, f, "fma")) {
+    } else if (std.mem.eql(u8, f, "fma")) {
         features.fma = true;
-    }
-    else if (std.mem.eql(u8, f, "f16c")) {
+    } else if (std.mem.eql(u8, f, "f16c")) {
         features.f16c = true;
-    }
-    else if (std.mem.eql(u8, f, "avx512f")) {
+    } else if (std.mem.eql(u8, f, "avx512f")) {
         features.avx512f = true;
-    }
-    else if (std.mem.eql(u8, f, "avx512bw")) {
+    } else if (std.mem.eql(u8, f, "avx512bw")) {
         features.avx512bw = true;
-    }
-    else if (std.mem.eql(u8, f, "avx512dq")) {
+    } else if (std.mem.eql(u8, f, "avx512dq")) {
         features.avx512dq = true;
-    }
-    else if (std.mem.eql(u8, f, "avx512vl")) {
+    } else if (std.mem.eql(u8, f, "avx512vl")) {
         features.avx512vl = true;
-    }
-    else if (std.mem.eql(u8, f, "avx512vnni") or std.mem.eql(u8, f, "avx512_vnni")) {
+    } else if (std.mem.eql(u8, f, "avx512vnni") or std.mem.eql(u8, f, "avx512_vnni")) {
         features.avx512vnni = true;
-    }
-    else if (std.mem.eql(u8, f, "avx512bf16") or std.mem.eql(u8, f, "avx512_bf16")) {
+    } else if (std.mem.eql(u8, f, "avx512bf16") or std.mem.eql(u8, f, "avx512_bf16")) {
         features.avx512bf16 = true;
-    }
-    else if (std.mem.eql(u8, f, "avx512vbmi") or std.mem.eql(u8, f, "avx512_vbmi")) {
+    } else if (std.mem.eql(u8, f, "avx512vbmi") or std.mem.eql(u8, f, "avx512_vbmi")) {
         features.avx512vbmi = true;
-    }
-    else if (std.mem.eql(u8, f, "avx512vpopcntdq") or std.mem.eql(u8, f, "avx512_vpopcntdq")) {
+    } else if (std.mem.eql(u8, f, "avx512vpopcntdq") or std.mem.eql(u8, f, "avx512_vpopcntdq")) {
         features.avx512vpopcntdq = true;
-    }
-    else if (std.mem.eql(u8, f, "amx_bf16") or std.mem.eql(u8, f, "amx-bf16")) {
+    } else if (std.mem.eql(u8, f, "amx_bf16") or std.mem.eql(u8, f, "amx-bf16")) {
         features.amx_bf16 = true;
-    }
-    else if (std.mem.eql(u8, f, "amx_int8") or std.mem.eql(u8, f, "amx-int8")) {
+    } else if (std.mem.eql(u8, f, "amx_int8") or std.mem.eql(u8, f, "amx-int8")) {
         features.amx_int8 = true;
-    }
-    else if (std.mem.eql(u8, f, "amx_tile") or std.mem.eql(u8, f, "amx-tile")) {
+    } else if (std.mem.eql(u8, f, "amx_tile") or std.mem.eql(u8, f, "amx-tile")) {
         features.amx_tile = true;
-    }
-    else if (std.mem.eql(u8, f, "sve")) {
+    } else if (std.mem.eql(u8, f, "sve")) {
         features.sve = true;
-    }
-    else if (std.mem.eql(u8, f, "sve2")) {
+    } else if (std.mem.eql(u8, f, "sve2")) {
         features.sve2 = true;
-    }
-    else if (std.mem.eql(u8, f, "neon")) {
+    } else if (std.mem.eql(u8, f, "neon")) {
         features.neon = true;
     }
 }
@@ -325,18 +308,32 @@ fn parseFlag(allocator: std.mem.Allocator, flag: []const u8, features: *Features
 pub fn selectBestVariant(cpu: CpuInfo) []const u8 {
     const f = cpu.features;
 
+    // aarch64: NEON is baseline on ARMv8; SVE/SVE2 are optional (Armv8.2+ and
+    // Armv8.4+ respectively). On aarch64, prefer SVE2 > SVE > NEON. On Apple
+    // Silicon the kernel-space HWCAP reports no SVE even though the M-series
+    // microarchitecture has wide SIMD, so fall back to "neon" whenever neither
+    // SVE feature is set. We test on cpu.vendor first (set by detectCpuLinux
+    // from /proc/cpuinfo model name and by detectCpuDarwin from the arch),
+    // falling back to cpu.arch == "aarch64" for hosts where the vendor was
+    // not classified.
+    if (cpu.vendor == .arm or std.mem.eql(u8, cpu.arch, "aarch64")) {
+        if (f.sve2) return "sve2";
+        if (f.sve) return "sve";
+        return "neon";
+    }
+
     // Check for AMX support (Sapphire Rapids+)
-    if (f.amx_bf16  and  f.amx_int8  and  f.amx_tile) {
+    if (f.amx_bf16 and f.amx_int8 and f.amx_tile) {
         return "amx";
     }
 
     // Check for AVX512 BF16 (Ice Lake Server, Zen 4+)
-    if (f.avx512bf16  and  f.avx512vbmi  and  f.avx512vnni) {
+    if (f.avx512bf16 and f.avx512vbmi and f.avx512vnni) {
         return "avx512_bf16";
     }
 
     // Check for AVX512 VBMI (Ice Lake Client)
-    if (f.avx512vbmi  and  f.avx512vnni) {
+    if (f.avx512vbmi and f.avx512vnni) {
         return "avx512_vbmi";
     }
 
@@ -346,7 +343,7 @@ pub fn selectBestVariant(cpu: CpuInfo) []const u8 {
     }
 
     // Check for base AVX512 (Skylake-X+)
-    if (f.avx512f  and  f.avx512bw  and  f.avx512dq  and  f.avx512vl) {
+    if (f.avx512f and f.avx512bw and f.avx512dq and f.avx512vl) {
         return "avx512_base";
     }
 
@@ -362,28 +359,28 @@ pub fn selectBestVariant(cpu: CpuInfo) []const u8 {
 /// Print CPU info for debugging
 pub fn printCpuInfo(cpu: CpuInfo) void {
     std.debug.print("CPU Info:\n", .{});
-    std.debug.print("  Vendor: {s}\n", .{ @tagName(cpu.vendor) });
-    std.debug.print("  Arch: {s}\n", .{ cpu.arch });
-    std.debug.print("  Model: {s}\n", .{ cpu.model_name });
+    std.debug.print("  Vendor: {s}\n", .{@tagName(cpu.vendor)});
+    std.debug.print("  Arch: {s}\n", .{cpu.arch});
+    std.debug.print("  Model: {s}\n", .{cpu.model_name});
     std.debug.print("  Family: {d}, Model: {d}, Stepping: {d}\n", .{ cpu.cpu_family, cpu.model, cpu.stepping });
     std.debug.print("  Features:\n", .{});
-    std.debug.print("    AVX: {}\n", .{ cpu.features.avx });
-    std.debug.print("    AVX2: {}\n", .{ cpu.features.avx2 });
-    std.debug.print("    FMA: {}\n", .{ cpu.features.fma });
-    std.debug.print("    F16C: {}\n", .{ cpu.features.f16c });
-    std.debug.print("    AVX512F: {}\n", .{ cpu.features.avx512f });
-    std.debug.print("    AVX512BW: {}\n", .{ cpu.features.avx512bw });
-    std.debug.print("    AVX512DQ: {}\n", .{ cpu.features.avx512dq });
-    std.debug.print("    AVX512VL: {}\n", .{ cpu.features.avx512vl });
-    std.debug.print("    AVX512VNNI: {}\n", .{ cpu.features.avx512vnni });
-    std.debug.print("    AVX512BF16: {}\n", .{ cpu.features.avx512bf16 });
-    std.debug.print("    AVX512VBMI: {}\n", .{ cpu.features.avx512vbmi });
-    std.debug.print("    AMX BF16: {}\n", .{ cpu.features.amx_bf16 });
-    std.debug.print("    AMX INT8: {}\n", .{ cpu.features.amx_int8 });
-    std.debug.print("    AMX TILE: {}\n", .{ cpu.features.amx_tile });
-    std.debug.print("    SVE: {}\n", .{ cpu.features.sve });
-    std.debug.print("    NEON: {}\n", .{ cpu.features.neon });
-    std.debug.print("  Best variant: {s}\n", .{ selectBestVariant(cpu) });
+    std.debug.print("    AVX: {}\n", .{cpu.features.avx});
+    std.debug.print("    AVX2: {}\n", .{cpu.features.avx2});
+    std.debug.print("    FMA: {}\n", .{cpu.features.fma});
+    std.debug.print("    F16C: {}\n", .{cpu.features.f16c});
+    std.debug.print("    AVX512F: {}\n", .{cpu.features.avx512f});
+    std.debug.print("    AVX512BW: {}\n", .{cpu.features.avx512bw});
+    std.debug.print("    AVX512DQ: {}\n", .{cpu.features.avx512dq});
+    std.debug.print("    AVX512VL: {}\n", .{cpu.features.avx512vl});
+    std.debug.print("    AVX512VNNI: {}\n", .{cpu.features.avx512vnni});
+    std.debug.print("    AVX512BF16: {}\n", .{cpu.features.avx512bf16});
+    std.debug.print("    AVX512VBMI: {}\n", .{cpu.features.avx512vbmi});
+    std.debug.print("    AMX BF16: {}\n", .{cpu.features.amx_bf16});
+    std.debug.print("    AMX INT8: {}\n", .{cpu.features.amx_int8});
+    std.debug.print("    AMX TILE: {}\n", .{cpu.features.amx_tile});
+    std.debug.print("    SVE: {}\n", .{cpu.features.sve});
+    std.debug.print("    NEON: {}\n", .{cpu.features.neon});
+    std.debug.print("  Best variant: {s}\n", .{selectBestVariant(cpu)});
 }
 
 /// Get feature summary string

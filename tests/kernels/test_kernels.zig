@@ -1766,3 +1766,109 @@ test "Q6_K scalar GEMM constant weights" {
     for (w) |v| sum_abs += @abs(v);
     try testing.expect(@abs(expected - 256.0) / 256.0 < 0.01);
 }
+
+// ============================================================================
+// GGML Q5_K (kernel-layer Phase 1; 176-byte blocks, byte-exact vs ggml)
+// ============================================================================
+
+test "Q5_K block layout byte-exact (176 bytes)" {
+    const q5k = root.gemm_q5_k;
+    try testing.expectEqual(@as(usize, 176), @sizeOf(q5k.BlockQ5_K));
+    const blk = std.mem.zeroes(q5k.BlockQ5_K);
+    const bytes: [*]const u8 = @ptrCast(&blk);
+    // d [0,2), dmin [2,4), scales [4,16), qh [16,48), qs [48,176)
+    try testing.expectEqual(@as(u8, 0), bytes[0]);
+    try testing.expectEqual(@as(u8, 0), bytes[3]);
+    try testing.expectEqual(@as(u8, 0), bytes[4]);
+    try testing.expectEqual(@as(u8, 0), bytes[15]);
+    try testing.expectEqual(@as(u8, 0), bytes[16]);
+    try testing.expectEqual(@as(u8, 0), bytes[47]);
+    try testing.expectEqual(@as(u8, 0), bytes[48]);
+    try testing.expectEqual(@as(u8, 0), bytes[175]);
+}
+
+test "Q5_K quantize/dequantize round trip accuracy" {
+    const q5k = root.gemm_q5_k;
+    const k = q5k.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+
+    var blk: [1]q5k.BlockQ5_K = undefined;
+    q5k.quantizeRowQ5_K(&src, &blk, k);
+
+    var dst: [k]f32 = undefined;
+    q5k.dequantizeRowQ5_K(&blk, &dst, k);
+
+    var max_abs_err: f32 = 0;
+    var sum_abs_x: f32 = 0;
+    for (0..k) |i| {
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+        sum_abs_x += @abs(src[i]);
+    }
+    const rel = max_abs_err / (sum_abs_x / k);
+    // ~5.5 bits/weight: between Q4_K (15%) and Q6_K (10%); allow 12%
+    try testing.expect(rel < 0.12);
+}
+
+test "Q5_K all-zero input dequantizes to zero" {
+    const q5k = root.gemm_q5_k;
+    const k = q5k.QK_K;
+    var src: [k]f32 = [_]f32{0.0} ** k;
+    var blk: [1]q5k.BlockQ5_K = undefined;
+    q5k.quantizeRowQ5_K(&src, &blk, k);
+
+    var dst: [k]f32 = undefined;
+    q5k.dequantizeRowQ5_K(&blk, &dst, k);
+    for (dst) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "Q5_K high-bit plane (qh) exercised" {
+    const q5k = root.gemm_q5_k;
+    const k = q5k.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @as(f32, @floatFromInt(i % 32)) * 0.03 - 0.2;
+    }
+
+    var blk: [1]q5k.BlockQ5_K = undefined;
+    q5k.quantizeRowQ5_K(&src, &blk, k);
+
+    var qh_nonzero: usize = 0;
+    for (blk[0].qh) |v| {
+        if (v != 0) qh_nonzero += 1;
+    }
+    // Wide-range data must set some high bits; all-zero qh would mean the
+    // 5th bit was never used (i.e., only 4-bit levels were ever produced).
+    try testing.expect(qh_nonzero > 0);
+}
+
+test "Q5_K scalar GEMM vs dequantized reference" {
+    const q5k = root.gemm_q5_k;
+    const M = 4;
+    const N = 4;
+    const K = q5k.QK_K;
+
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var src: [K]f32 = undefined;
+    for (&src) |*v| v.* = 1.0;
+    var b: [N]q5k.BlockQ5_K = undefined;
+    for (0..N) |j| q5k.quantizeRowQ5_K(&src, @ptrCast(&b[j]), K);
+
+    var c: [M * N]f32 = undefined;
+    q5k.gemmQ5_KScalar(&a, K, &b, 1, &c, N, M, N, K);
+
+    var w: [K]f32 = undefined;
+    q5k.dequantizeRowQ5_K(@ptrCast(&b[0]), &w, K);
+    var expected: f32 = 0;
+    for (w) |v| expected += v;
+    for (0..M) |i| {
+        for (0..N) |j| {
+            try testing.expectApproxEqAbs(expected, c[i * N + j], 1e-3);
+        }
+    }
+    try testing.expect(@abs(expected - 256.0) / 256.0 < 0.01);
+}
