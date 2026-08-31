@@ -313,6 +313,140 @@ var g_cpu_variant_ptr: [*]const u8 = @ptrCast(&g_cpu_variant[0]);
 var g_cpu_variant_len: usize = 0;
 
 // ============================================================================
+// Default Allocator (B1)
+// ============================================================================
+//
+// Historically every C-API entry allocated with std.heap.page_allocator
+// hardcoded (IMPROVE.md B1). Two problems: (1) Python/embedded callers
+// cannot supply their own allocator (e.g. a tracked arena to detect
+// leaks, or a NUMA-bound allocator), and (2) the free paths must
+// hardcode the same allocator — an invalid-free waiting to happen
+// the moment any constructor gains an allocator parameter.
+//
+// B1 fix, additive-only (header/ABI coordination required for config
+// struct changes, so we do NOT touch kt_*_config_t):
+//
+//   - `kt_set_default_allocator(vtable)` lets the caller install a
+//     C-ABI allocator (alloc/free/resize fn pointers + userdata)
+//     BEFORE constructing any kt_* object. Called with null, it
+//     resets to page_allocator (also the pre-call default).
+//   - Every context created after that captures `g_default_allocator`
+//     at construction and frees through the captured allocator —
+//     so set-default-allocator must not be swapped between a *_new
+//     and its *_free (documented contract; a per-context capture
+//     would need a header change).
+//   - Per-call scratch (mlaForwardImpl buffers etc.) also uses the
+//     captured allocator so it round-trips symmetrically.
+//
+// Invariant maintained everywhere: whatever allocates also frees —
+// always the same allocator instance, either the captured context
+// one or the global default in stateless helpers.
+
+/// C-ABI allocator vtable. `alloc` returns null on failure (matching
+/// malloc semantics). Layout is C-friendly (opaque userdata + plain
+/// fn pointers); the adapter below bridges it to std.mem.Allocator.
+pub const kt_allocator_vtable_t = extern struct {
+    /// userdata passed back to every callback (may be null)
+    userdata: ?*anyopaque,
+    /// allocate `size` bytes at `alignment` (power of two) — returns
+    /// null on failure
+    alloc: ?*const fn (userdata: ?*anyopaque, size: usize, alignment: usize) callconv(.c) ?[*]u8,
+    /// free a previous allocation (alignment must match the alloc)
+    free: ?*const fn (userdata: ?*anyopaque, ptr: [*]u8, size: usize, alignment: usize) callconv(.c) void,
+    /// optional in-place resize; return 0 on success, -1 (or leave
+    /// null) to force the alloc+copy+free fallback
+    resize: ?*const fn (userdata: ?*anyopaque, ptr: [*]u8, old_size: usize, new_size: usize, alignment: usize) callconv(.c) c_int,
+};
+
+var g_alloc_vtable: ?*const kt_allocator_vtable_t = null;
+
+/// Bridge struct: holds the C vtable and implements the
+/// std.mem.Allocator.VTable calling convention. One global instance
+/// (the vtable is process-wide by design; a multi-allocator setup
+/// would use userdata to distinguish).
+const CAllocAdapter = struct {
+    fn alloc(userdata: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        _ = ret_addr;
+        const vt: *const kt_allocator_vtable_t = @ptrCast(@alignCast(userdata));
+        const f = vt.alloc orelse return null;
+        return f(vt.userdata, len, @intFromEnum(alignment));
+    }
+
+    fn resize(userdata: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        _ = ret_addr;
+        const vt: *const kt_allocator_vtable_t = @ptrCast(@alignCast(userdata));
+        if (vt.resize) |f| {
+            return f(vt.userdata, buf.ptr, buf.len, new_len, @intFromEnum(alignment)) == 0;
+        }
+        return false;
+    }
+
+    fn remap(userdata: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        // The C vtable has no remap contract; fall back to the
+        // resize-then-copy path by reporting "unsupported" (null).
+        _ = userdata;
+        _ = buf;
+        _ = alignment;
+        _ = new_len;
+        _ = ret_addr;
+        return null;
+    }
+
+    fn free(userdata: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        _ = ret_addr;
+        const vt: *const kt_allocator_vtable_t = @ptrCast(@alignCast(userdata));
+        const f = vt.free orelse return;
+        f(vt.userdata, buf.ptr, buf.len, @intFromEnum(alignment));
+    }
+
+    fn vtable() *const std.mem.Allocator.VTable {
+        return &.{
+            .alloc = alloc,
+            .resize = resize,
+            .remap = remap,
+            .free = free,
+        };
+    }
+};
+
+/// The allocator every C-API entry uses. page_allocator when no custom
+/// allocator has been installed; an adapter around the installed
+/// vtable otherwise.
+fn defaultAllocator() std.mem.Allocator {
+    const vt = g_alloc_vtable orelse return std.heap.page_allocator;
+    return std.mem.Allocator{
+        // The VTable callbacks receive the vtable pointer itself as
+        // userdata (so the adapter can read .userdata/.alloc/... from
+        // it). CAllocAdapter casts it back to the C vtable type.
+        .ptr = @constCast(@ptrCast(vt)),
+        .vtable = CAllocAdapter.vtable(),
+    };
+}
+
+/// Install a custom allocator for all subsequent kt_* allocations.
+/// Pass null to restore the default (page_allocator).
+/// MUST be called before any kt_*_new — objects created earlier keep
+/// the allocator they were constructed with.
+/// Zig extension beyond the C++ kt-kernel (same section as the other
+/// Zig extensions in include/kt_kernel.h).
+pub export fn kt_set_default_allocator(vtable: ?*const kt_allocator_vtable_t) void {
+    g_alloc_vtable = vtable;
+}
+
+/// B1: create/destroy helpers used by every context below — single
+/// choke point so the allocator choice is uniform.
+fn ctxCreate(comptime T: type, value: T) *T {
+    const a = defaultAllocator();
+    const p = a.create(T) catch @panic("OOM");
+    p.* = value;
+    return p;
+}
+
+fn ctxDestroy(comptime T: type, ptr: *T) void {
+    defaultAllocator().destroy(T, ptr);
+}
+
+// ============================================================================
 // CPU Variant Detection
 // ============================================================================
 
@@ -468,14 +602,14 @@ export fn kt_f32_to_bf16(src: [*]const f32, dst: [*]amx.bf16, count: usize) void
 // ============================================================================
 
 export fn kt_worker_pool_new(thread_count: c_int) *KT_WorkerPool {
-    const allocator = std.heap.page_allocator;
+    const allocator = defaultAllocator();
     const pool = allocator.create(worker_pool.WorkerPool) catch @panic("OOM");
     pool.* = worker_pool.WorkerPool.initSimple(allocator, @intCast(thread_count)) catch @panic("pool init");
     return @ptrCast(pool);
 }
 
 export fn kt_worker_pool_new_config(config: kt_worker_pool_config_t) *KT_WorkerPool {
-    const allocator = std.heap.page_allocator;
+    const allocator = defaultAllocator();
 
     const numa_map = allocator.alloc(usize, @intCast(config.subpool_count)) catch @panic("OOM");
     const thread_counts = allocator.alloc(usize, @intCast(config.subpool_count)) catch @panic("OOM");
@@ -497,7 +631,10 @@ export fn kt_worker_pool_new_config(config: kt_worker_pool_config_t) *KT_WorkerP
 export fn kt_worker_pool_free(pool: *KT_WorkerPool) void {
     const wp: *worker_pool.WorkerPool = @ptrCast(@alignCast(pool));
     wp.deinit();
-    std.heap.page_allocator.destroy(wp);
+    // B1: free through the allocator the pool was constructed with
+    // (captured in the struct), NOT the current default — a caller may
+    // swap the default between new and free.
+    wp.allocator.destroy(wp);
 }
 
 export fn kt_worker_pool_get_thread_num(pool: *KT_WorkerPool) c_int {
@@ -583,8 +720,9 @@ export fn kt_moe_new(cpuinfer: *KT_CPUInfer, config: kt_moe_config_t) *KT_MOE {
     const pool: *worker_pool.WorkerPool = @ptrCast(@alignCast(cpuinfer));
     var cfg = toMoeConfig(config);
     cfg.pool = pool;
-    const moe_inst = std.heap.page_allocator.create(moe.TpMoe) catch @panic("OOM");
-    moe_inst.* = moe.TpMoe.init(cfg, std.heap.page_allocator) catch @panic("Failed to init MoE");
+    const allocator = defaultAllocator();
+    const moe_inst = allocator.create(moe.TpMoe) catch @panic("OOM");
+    moe_inst.* = moe.TpMoe.init(cfg, allocator) catch @panic("Failed to init MoE");
     return @ptrCast(moe_inst);
 }
 
@@ -592,8 +730,9 @@ export fn kt_moe_new_sft(cpuinfer: *KT_CPUInfer, config: kt_moe_sft_config_t) *K
     const pool: *worker_pool.WorkerPool = @ptrCast(@alignCast(cpuinfer));
     var base_cfg = toMoeConfig(config.base);
     base_cfg.pool = pool;
-    const sft_inst = std.heap.page_allocator.create(moe_sft.TpMoeSft) catch @panic("OOM");
-    sft_inst.* = moe_sft.TpMoeSft.init(base_cfg, std.heap.page_allocator) catch @panic("Failed to init SFT MoE");
+    const allocator = defaultAllocator();
+    const sft_inst = allocator.create(moe_sft.TpMoeSft) catch @panic("OOM");
+    sft_inst.* = moe_sft.TpMoeSft.init(base_cfg, allocator) catch @panic("Failed to init SFT MoE");
     sft_inst.lora_rank = @intCast(config.lora_rank);
     sft_inst.lora_alpha = config.lora_alpha;
     sft_inst.lora_scaling = if (config.lora_rank > 0) config.lora_alpha / @as(f32, @floatFromInt(@as(c_int, config.lora_rank))) else 0.0;
@@ -682,13 +821,15 @@ export fn kt_moe_free(moe_ptr: *KT_MOE) void {
     const m: *moe.TpMoe = @ptrCast(@alignCast(moe_ptr));
     switch (m.kind) {
         .inference => {
+            const a = m.allocator;
             m.deinit();
-            std.heap.page_allocator.destroy(m);
+            a.destroy(m);
         },
         .sft => {
             const sft: *moe_sft.TpMoeSft = @ptrCast(@alignCast(moe_ptr));
+            const a = sft.moe.allocator;
             sft.deinit();
-            std.heap.page_allocator.destroy(sft);
+            a.destroy(sft);
         },
     }
 }
@@ -825,27 +966,30 @@ pub export fn kt_mla_new(config: kt_mla_config_t) *KT_MLA {
     };
 
     // 2. Estimate max_pages and create KV cache
+    const allocator = defaultAllocator();
     const max_pages = (config.max_kvlen / config.token_count_in_page) + 1;
-    const cache = std.heap.page_allocator.create(mla_cache.MlaKvCache) catch @panic("OOM");
-    cache.* = mla_cache.MlaKvCache.init(std.heap.page_allocator, mla_cfg, max_pages) catch @panic("OOM");
+    const cache = allocator.create(mla_cache.MlaKvCache) catch @panic("OOM");
+    cache.* = mla_cache.MlaKvCache.init(allocator, mla_cfg, max_pages) catch @panic("OOM");
 
     // 3. Create MlaEngine (allocates 11 aligned f32 scratch buffers internally)
-    const engine = std.heap.page_allocator.create(mla_core.MlaEngine) catch @panic("OOM");
-    engine.* = mla_core.MlaEngine.init(std.heap.page_allocator, mla_cfg, cache) catch @panic("OOM");
+    const engine = allocator.create(mla_core.MlaEngine) catch @panic("OOM");
+    engine.* = mla_core.MlaEngine.init(allocator, mla_cfg, cache) catch @panic("OOM");
 
     // 4. Create context wrapper
-    const ctx = std.heap.page_allocator.create(MlaContext) catch @panic("OOM");
-    ctx.* = .{ .engine = engine, .cache = cache, .allocator = std.heap.page_allocator };
+    const ctx = allocator.create(MlaContext) catch @panic("OOM");
+    ctx.* = .{ .engine = engine, .cache = cache, .allocator = allocator };
     return @ptrCast(ctx);
 }
 
 pub export fn kt_mla_free(mla: *KT_MLA) void {
     const ctx: *MlaContext = @ptrCast(@alignCast(mla));
+    // B1: capture before deinit (deinit sets * = undefined).
+    const a = ctx.allocator;
     ctx.engine.deinit();
     ctx.cache.deinit();
-    std.heap.page_allocator.destroy(ctx.engine);
-    std.heap.page_allocator.destroy(ctx.cache);
-    std.heap.page_allocator.destroy(ctx);
+    a.destroy(ctx.engine);
+    a.destroy(ctx.cache);
+    a.destroy(ctx);
 }
 
 /// Mark weights as loaded (C++ reference: TP_MLA_Common::load_weights sets
@@ -873,17 +1017,21 @@ fn mlaForwardImpl(
         @panic("kt_mla_forward: weights not loaded (call kt_mla_load_weights first)");
     }
     const cfg = ctx.engine.config;
+    // B1: per-call scratch goes through the context's captured
+    // allocator (round-trips symmetrically with whatever kt_mla_new
+    // installed).
+    const allocator = ctx.allocator;
 
     // BF16 -> F32 input conversion
-    const input_f32 = std.heap.page_allocator.alloc(f32, qlen * cfg.hidden_size) catch @panic("OOM");
-    defer std.heap.page_allocator.free(input_f32);
+    const input_f32 = allocator.alloc(f32, qlen * cfg.hidden_size) catch @panic("OOM");
+    defer allocator.free(input_f32);
     for (0..qlen * cfg.hidden_size) |i| {
         input_f32[i] = amx.bf16_to_f32(input[i]);
     }
 
     // Allocate F32 output
-    const output_f32 = std.heap.page_allocator.alloc(f32, qlen * cfg.hidden_size) catch @panic("OOM");
-    defer std.heap.page_allocator.free(output_f32);
+    const output_f32 = allocator.alloc(f32, qlen * cfg.hidden_size) catch @panic("OOM");
+    defer allocator.free(output_f32);
 
     // Call engine.forward (kv_start_pos = kvlen - qlen for prefill)
     const kv_start_pos = kvlen - qlen;
@@ -960,13 +1108,14 @@ pub export fn kt_mla_update_kv_cache(
     const ctx: *MlaContext = @ptrCast(@alignCast(mla));
     const cfg = ctx.engine.config;
     _ = position; // appendToken appends sequentially; position is implicit
+    const allocator = ctx.allocator; // B1
 
     // new_kv has shape [hidden_size] = [kv_lora_rank + rope_size] for the compressed KV
     // Split into compressed_kv (nope) and k_pe (rope), convert BF16 -> F32
-    const nope_f32 = std.heap.page_allocator.alloc(f32, cfg.kv_lora_rank) catch @panic("OOM");
-    defer std.heap.page_allocator.free(nope_f32);
-    const rope_f32 = std.heap.page_allocator.alloc(f32, cfg.rope_size) catch @panic("OOM");
-    defer std.heap.page_allocator.free(rope_f32);
+    const nope_f32 = allocator.alloc(f32, cfg.kv_lora_rank) catch @panic("OOM");
+    defer allocator.free(nope_f32);
+    const rope_f32 = allocator.alloc(f32, cfg.rope_size) catch @panic("OOM");
+    defer allocator.free(rope_f32);
 
     for (0..cfg.kv_lora_rank) |i| {
         nope_f32[i] = amx.bf16_to_f32(new_kv[i]);
@@ -1004,6 +1153,9 @@ const GateContext = struct {
     /// Per-expert e_score_correction_bias, FP32, `num_experts` entries.
     /// Null pointer in the config → no bias.
     bias: ?[*]const f32 = null,
+    /// B1: allocator captured at kt_gate_new; kt_gate_free destroys
+    /// through it (immune to default-allocator swaps).
+    allocator: std.mem.Allocator,
 };
 
 export fn kt_gate_new(config: kt_gate_config_t) *KT_Gate {
@@ -1014,7 +1166,8 @@ export fn kt_gate_new(config: kt_gate_config_t) *KT_Gate {
         // non-null pointer with a dtype we can't read, but tolerate the
         // "unspecified" zero enum value used by legacy configs.
     }
-    const ctx = std.heap.page_allocator.create(GateContext) catch @panic("OOM");
+    const allocator = defaultAllocator();
+    const ctx = allocator.create(GateContext) catch @panic("OOM");
     ctx.* = .{
         .weight = @ptrCast(@alignCast(config.weight)),
         .hidden_size = config.hidden_size,
@@ -1028,12 +1181,15 @@ export fn kt_gate_new(config: kt_gate_config_t) *KT_Gate {
             @as(?[*]const f32, @ptrCast(@alignCast(config.e_score_correction_bias)))
         else
             null,
+        .allocator = allocator,
     };
     return @ptrCast(ctx);
 }
 
 export fn kt_gate_free(gate: *KT_Gate) void {
-    std.heap.page_allocator.destroy(@as(*GateContext, @ptrCast(@alignCast(gate))));
+    const ctx: *GateContext = @ptrCast(@alignCast(gate));
+    const a = ctx.allocator;
+    a.destroy(ctx);
 }
 
 export fn kt_gate_forward(
@@ -1089,22 +1245,29 @@ const LinearContext = struct {
     weight: [*]const amx.bf16, // [out_features, in_features] BF16
     in_features: usize,
     out_features: usize,
+    /// B1: allocator captured at construction; used by the per-call
+    /// scratch and by kt_linear_free.
+    allocator: std.mem.Allocator,
 };
 
 export fn kt_linear_new(config: kt_linear_config_t) *KT_Linear {
     if (config.proj_type != .KT_TYPE_BF16) @panic("Linear only supports BF16 weights");
     if (config.hidden_type != .KT_TYPE_BF16) @panic("Linear only supports BF16 input");
-    const ctx = std.heap.page_allocator.create(LinearContext) catch @panic("OOM");
+    const allocator = defaultAllocator();
+    const ctx = allocator.create(LinearContext) catch @panic("OOM");
     ctx.* = .{
         .weight = @ptrCast(@alignCast(config.proj)),
         .in_features = config.hidden_size,
         .out_features = config.intermediate_size,
+        .allocator = allocator,
     };
     return @ptrCast(ctx);
 }
 
 export fn kt_linear_free(linear: *KT_Linear) void {
-    std.heap.page_allocator.destroy(@as(*LinearContext, @ptrCast(@alignCast(linear))));
+    const ctx: *LinearContext = @ptrCast(@alignCast(linear));
+    const a = ctx.allocator;
+    a.destroy(ctx);
 }
 
 export fn kt_linear_forward(
@@ -1116,8 +1279,8 @@ export fn kt_linear_forward(
     const ctx: *LinearContext = @ptrCast(@alignCast(linear));
     const m: usize = @intCast(batch_size);
 
-    const out_f32 = std.heap.page_allocator.alloc(f32, m * ctx.out_features) catch @panic("OOM");
-    defer std.heap.page_allocator.free(out_f32);
+    const out_f32 = ctx.allocator.alloc(f32, m * ctx.out_features) catch @panic("OOM");
+    defer ctx.allocator.free(out_f32);
 
     // out[m, out] = input[m, in] @ weight^T[out, in]
     // gemmExpert reads weight as [n=out, k=in] row-major, weight_ld = k.
@@ -1145,6 +1308,8 @@ const MlpContext = struct {
     down_w: [*]const amx.bf16,
     hidden_size: usize,
     intermediate_size: usize,
+    /// B1: allocator captured at construction.
+    allocator: std.mem.Allocator,
 };
 
 export fn kt_mlp_new(config: kt_mlp_config_t) *KT_MLP {
@@ -1153,19 +1318,23 @@ export fn kt_mlp_new(config: kt_mlp_config_t) *KT_MLP {
         config.down_type != .KT_TYPE_BF16 or
         config.hidden_type != .KT_TYPE_BF16)
         @panic("MLP only supports BF16");
-    const ctx = std.heap.page_allocator.create(MlpContext) catch @panic("OOM");
+    const allocator = defaultAllocator();
+    const ctx = allocator.create(MlpContext) catch @panic("OOM");
     ctx.* = .{
         .gate_w = @ptrCast(@alignCast(config.gate_proj)),
         .up_w = @ptrCast(@alignCast(config.up_proj)),
         .down_w = @ptrCast(@alignCast(config.down_proj)),
         .hidden_size = config.hidden_size,
         .intermediate_size = config.intermediate_size,
+        .allocator = allocator,
     };
     return @ptrCast(ctx);
 }
 
 export fn kt_mlp_free(mlp_inst: *KT_MLP) void {
-    std.heap.page_allocator.destroy(@as(*MlpContext, @ptrCast(@alignCast(mlp_inst))));
+    const ctx: *MlpContext = @ptrCast(@alignCast(mlp_inst));
+    const a = ctx.allocator;
+    a.destroy(ctx);
 }
 
 export fn kt_mlp_forward(
@@ -1183,13 +1352,14 @@ export fn kt_mlp_forward(
     // avoids the BF16/F32 size-mismatch that would happen if we tried to
     // store F32 into a BF16-sized allocation. We round-trip through BF16
     // for the down GEMM because gemmExpert's input is BF16.
-    const gate_buf = std.heap.page_allocator.alloc(f32, m * i_dim) catch @panic("OOM");
-    const up_buf = std.heap.page_allocator.alloc(f32, m * i_dim) catch @panic("OOM");
-    const down_buf = std.heap.page_allocator.alloc(f32, m * h) catch @panic("OOM");
+    const a = ctx.allocator; // B1
+    const gate_buf = a.alloc(f32, m * i_dim) catch @panic("OOM");
+    const up_buf = a.alloc(f32, m * i_dim) catch @panic("OOM");
+    const down_buf = a.alloc(f32, m * h) catch @panic("OOM");
     defer {
-        std.heap.page_allocator.free(gate_buf);
-        std.heap.page_allocator.free(up_buf);
-        std.heap.page_allocator.free(down_buf);
+        a.free(gate_buf);
+        a.free(up_buf);
+        a.free(down_buf);
     }
 
     // gate[m, i] = input[m, h] @ gate_w^T[i, h]
@@ -1210,8 +1380,8 @@ export fn kt_mlp_forward(
         gate_buf[idx] = amx.swiglu(gate_buf[idx], up_buf[idx]);
     }
     // Convert gate_buf F32 -> BF16 view for the down GEMM input
-    var swiglu_bf16 = std.heap.page_allocator.alloc(amx.bf16, m * i_dim) catch @panic("OOM");
-    defer std.heap.page_allocator.free(swiglu_bf16);
+    const swiglu_bf16 = a.alloc(amx.bf16, m * i_dim) catch @panic("OOM");
+    defer a.free(swiglu_bf16);
     for (0..m * i_dim) |idx| {
         swiglu_bf16[idx] = amx.f32_to_bf16(gate_buf[idx]);
     }
