@@ -29,6 +29,7 @@ pub const gemm_mxfp8 = @import("kernels/amx/gemm_224_mxfp8.zig");
 // GGML quantization kernels (Phase 1: Q8_0). Same lazy-analysis rule applies.
 pub const gemm_q8_0 = @import("kernels/amx/gemm_224_q8_0.zig");
 pub const gemm_q4_k = @import("kernels/amx/gemm_224_q4_k.zig");
+pub const gemm_q6_k = @import("kernels/amx/gemm_224_q6_k.zig");
 comptime {
     _ = &gemm_q8_0.BlockQ8_0;
     _ = &gemm_q8_0.f32_to_f16;
@@ -46,6 +47,14 @@ comptime {
     _ = &gemm_q4_k.dequantizeRowQ4_K;
     _ = &gemm_q4_k.dequantizeRowQ4_KToBF16;
     _ = &gemm_q4_k.gemmQ4_KScalar;
+    _ = &gemm_q6_k.BlockQ6_K;
+    _ = &gemm_q6_k.f32_to_f16;
+    _ = &gemm_q6_k.f16_to_f32;
+    _ = &gemm_q6_k.nearestInt;
+    _ = &gemm_q6_k.quantizeRowQ6_K;
+    _ = &gemm_q6_k.dequantizeRowQ6_K;
+    _ = &gemm_q6_k.dequantizeRowQ6_KToBF16;
+    _ = &gemm_q6_k.gemmQ6_KScalar;
 }
 comptime {
     _ = &gemm_mxfp4.GemmKernel224MXFP4.gemmFullTile;

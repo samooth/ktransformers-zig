@@ -1673,3 +1673,96 @@ test "Q4_K scalar GEMM constant weights" {
         }
     }
 }
+
+// ============================================================================
+// GGML Q6_K (kernel-layer Phase 1; 210-byte blocks, byte-exact vs ggml)
+// ============================================================================
+
+test "Q6_K block layout byte-exact (210 bytes)" {
+    const q6k = root.gemm_q6_k;
+    try testing.expectEqual(@as(usize, 210), @sizeOf(q6k.BlockQ6_K));
+    const blk = std.mem.zeroes(q6k.BlockQ6_K);
+    const bytes: [*]const u8 = @ptrCast(&blk);
+    // ql [0,128), qh [128,192), scales [192,208), d [208,210)
+    try testing.expectEqual(@as(u8, 0), bytes[0]);
+    try testing.expectEqual(@as(u8, 0), bytes[127]);
+    try testing.expectEqual(@as(u8, 0), bytes[128]);
+    try testing.expectEqual(@as(u8, 0), bytes[191]);
+    try testing.expectEqual(@as(u8, 0), bytes[192]);
+    try testing.expectEqual(@as(u8, 0), bytes[207]);
+    try testing.expectEqual(@as(u8, 0), bytes[208]);
+    try testing.expectEqual(@as(u8, 0), bytes[209]);
+}
+
+test "Q6_K quantize/dequantize round trip accuracy" {
+    const q6k = root.gemm_q6_k;
+    const k = q6k.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+
+    var blk: [1]q6k.BlockQ6_K = undefined;
+    q6k.quantizeRowQ6_K(&src, &blk, k);
+
+    var dst: [k]f32 = undefined;
+    q6k.dequantizeRowQ6_K(&blk, &dst, k);
+
+    var max_abs_err: f32 = 0;
+    var sum_abs_x: f32 = 0;
+    for (0..k) |i| {
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+        sum_abs_x += @abs(src[i]);
+    }
+    const rel = max_abs_err / (sum_abs_x / k);
+    // Q6_K is ~6.5 bits/weight: tighter than Q4_K; allow 10%
+    try testing.expect(rel < 0.10);
+}
+
+test "Q6_K all-zero super-block zeros d" {
+    const q6k = root.gemm_q6_k;
+    const k = q6k.QK_K;
+    var src: [k]f32 = [_]f32{0.0} ** k;
+    var blk: [1]q6k.BlockQ6_K = undefined;
+    q6k.quantizeRowQ6_K(&src, &blk, k);
+    try testing.expectEqual(@as(u16, 0), blk[0].d);
+
+    var dst: [k]f32 = undefined;
+    q6k.dequantizeRowQ6_K(&blk, &dst, k);
+    for (dst) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "Q6_K scalar GEMM constant weights" {
+    const q6k = root.gemm_q6_k;
+    const M = 4;
+    const N = 4;
+    const K = q6k.QK_K;
+
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    // Quantize a constant 1.0 weight row and GEMM against it. The product of
+    // each weight with itself-summed is not exact (quant error), so compare
+    // against a dequantized reference instead of an analytic constant:
+    var src: [K]f32 = undefined;
+    for (&src) |*v| v.* = 1.0;
+    var b: [N]q6k.BlockQ6_K = undefined;
+    for (0..N) |j| q6k.quantizeRowQ6_K(&src, @ptrCast(&b[j]), K);
+    var c: [M * N]f32 = undefined;
+    q6k.gemmQ6_KScalar(&a, K, &b, 1, &c, N, M, N, K);
+
+    // Reference: dequantized weight rows dotted with all-1 activations
+    var w: [K]f32 = undefined;
+    q6k.dequantizeRowQ6_K(@ptrCast(&b[0]), &w, K);
+    var expected: f32 = 0;
+    for (w) |v| expected += v;
+    for (0..M) |i| {
+        for (0..N) |j| {
+            try testing.expectApproxEqAbs(expected, c[i * N + j], 1e-3);
+        }
+    }
+    // And the constant-1 row must quantize tightly (rel err << 1%)
+    var sum_abs: f32 = 0;
+    for (w) |v| sum_abs += @abs(v);
+    try testing.expect(@abs(expected - 256.0) / 256.0 < 0.01);
+}
