@@ -4,8 +4,13 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // CPU variant to build (default: avx2)
-    const variant_opt = b.option([]const u8, "variant", "CPU variant: avx2, avx512_base, avx512_vnni, avx512_vbmi, avx512_bf16, amx") orelse "avx2";
+    // CPU variant to build (default: avx2). The .neon variant requires an
+    // aarch64 target (see neon_target_check below).
+    const variant_opt = b.option(
+        []const u8,
+        "variant",
+        "CPU variant: avx2, avx512_base, avx512_vnni, avx512_vbmi, avx512_bf16, amx, neon",
+    ) orelse "avx2";
 
     // Variant configurations
     const Variant = enum {
@@ -15,14 +20,28 @@ pub fn build(b: *std.Build) void {
         avx512_vbmi,
         avx512_bf16,
         amx,
+        neon,
     };
 
     const all_variants = [_]Variant{ .avx2, .avx512_base, .avx512_vnni, .avx512_vbmi, .avx512_bf16, .amx };
 
     const variant = std.meta.stringToEnum(Variant, variant_opt).?;
 
-    const cpu_instruct_table = [_][]const u8{ "AVX2", "AVX512", "AVX512", "AVX512", "AVX512", "AVX512" };
-    const suffix_table = [_][]const u8{ "avx2", "avx512_base", "avx512_vnni", "avx512_vbmi", "avx512_bf16", "amx" };
+    const cpu_instruct_table = [_][]const u8{ "AVX2", "AVX512", "AVX512", "AVX512", "AVX512", "AVX512", "NEON" };
+    const suffix_table = [_][]const u8{ "avx2", "avx512_base", "avx512_vnni", "avx512_vbmi", "avx512_bf16", "amx", "neon" };
+
+    // Footgun guard: the neon variant targets aarch64. If the user selects it
+    // without an aarch64 target, fail fast with a clear message rather than
+    // silently building a meaningless x86 "neon" library.
+    if (variant == .neon and target.result.cpu.arch != .aarch64) {
+        std.debug.print(
+            "error: -Dvariant=neon requires an aarch64 target.\n" ++
+                "       Use: zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu\n" ++
+                "       (got arch: {s})\n",
+            .{@tagName(target.result.cpu.arch)},
+        );
+        std.process.exit(1);
+    }
 
     // Build one variant's shared library. lib_name determines the installed
     // filename: lib<lib_name>.so. target/optimize are resolved once in the
@@ -67,7 +86,12 @@ pub fn build(b: *std.Build) void {
     }.build;
 
     // --- Single-variant build (default path) ---
-    const lib = buildLib(b, variant, "kt_kernel_ext", target, optimize);
+    // Install the default variant as `libkt_kernel_ext.so` (no suffix) for the
+    // historical "just dlopen me" Python ctypes path; install everything else
+    // as `libkt_kernel_ext_<suffix>.so` so they don't clobber the default.
+    const variant_suffix = suffix_table[@intFromEnum(variant)];
+    const default_lib_name: []const u8 = if (variant == .avx2) "kt_kernel_ext" else b.fmt("kt_kernel_ext_{s}", .{variant_suffix});
+    const lib = buildLib(b, variant, default_lib_name, target, optimize);
     const install_step = b.addInstallArtifact(lib, .{});
     b.getInstallStep().dependOn(&install_step.step);
 
@@ -137,4 +161,15 @@ pub fn build(b: *std.Build) void {
     RunTest.run(b, test_step, "tests/kernels/ggml_capi_tests.zig", "src/main.zig", target, optimize);
     // Suite 5: aarch64 CPU detection in selectBestVariant
     RunTest.run(b, test_step, "tests/kernels/aarch64_detect_test.zig", "src/root.zig", target, optimize);
+    // Suite 6: ARM NEON feature detection (comptime flag must be false on
+    // x86_64; aarch64 cross-build verified by `zig build
+    // -Dvariant=neon -Dtarget=aarch64-linux-gnu` plus tools/verify_abi.py).
+    const arch_neon_mod = b.createModule(.{ .root_source_file = b.path("src/kernels/arch/neon.zig"), .target = target, .optimize = optimize });
+    const neon_test_mod = b.createModule(.{ .root_source_file = b.path("tests/kernels/neon_arch_test.zig"), .target = target, .optimize = optimize });
+    neon_test_mod.addImport("arch_neon", arch_neon_mod);
+    const neon_test_obj = b.addTest(.{
+        .root_module = neon_test_mod,
+        .test_runner = .{ .path = b.path("tools/test_runner.zig"), .mode = .simple },
+    });
+    test_step.dependOn(&b.addRunArtifact(neon_test_obj).step);
 }
