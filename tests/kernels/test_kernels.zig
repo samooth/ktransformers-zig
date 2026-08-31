@@ -1556,3 +1556,120 @@ test "Q8_0 scalar GEMM with per-block scales" {
         }
     }
 }
+
+// ============================================================================
+// GGML Q4_K (kernel-layer Phase 1; 144-byte super-blocks, byte-exact vs ggml)
+// ============================================================================
+
+test "Q4_K nearest_int matches ggml magic trick" {
+    const q4k = root.gemm_q4_k;
+    try testing.expectEqual(@as(i32, 0), q4k.nearestInt(0.4));
+    try testing.expectEqual(@as(i32, 1), q4k.nearestInt(0.6));
+    try testing.expectEqual(@as(i32, -1), q4k.nearestInt(-0.6));
+    try testing.expectEqual(@as(i32, 15), q4k.nearestInt(14.9));
+    try testing.expectEqual(@as(i32, 2), q4k.nearestInt(2.4));
+    try testing.expectEqual(@as(i32, 3), q4k.nearestInt(2.6));
+}
+
+test "Q4_K block layout byte-exact (144 bytes)" {
+    const q4k = root.gemm_q4_k;
+    try testing.expectEqual(@as(usize, 144), @sizeOf(q4k.BlockQ4_K));
+    const blk = q4k.BlockQ4_K{
+        .d = 0x3C00,
+        .dmin = 0x3800,
+        .scales = [_]u8{0} ** 12,
+        .qs = [_]u8{0} ** 128,
+    };
+    const bytes: [*]const u8 = @ptrCast(&blk);
+    try testing.expectEqual(@as(u8, 0x00), bytes[0]);
+    try testing.expectEqual(@as(u8, 0x3C), bytes[1]);
+    try testing.expectEqual(@as(u8, 0x00), bytes[2]);
+    try testing.expectEqual(@as(u8, 0x38), bytes[3]);
+    try testing.expectEqual(@as(u8, 0x00), bytes[16]); // first qs byte (after scales)
+    try testing.expectEqual(@as(u8, 0x00), bytes[143]); // last byte
+}
+
+test "Q4_K get_scale_min_k4 unpacking" {
+    const q4k = root.gemm_q4_k;
+    var d: u8 = undefined;
+    var m: u8 = undefined;
+
+    // j < 4: sc = scales[j] & 63; m = scales[j+4] & 63
+    var scales = [_]u8{0} ** 12;
+    scales[0] = 42;
+    scales[4] = 17;
+    q4k.getScaleMinK4(0, &scales, &d, &m);
+    try testing.expectEqual(@as(u8, 42), d);
+    try testing.expectEqual(@as(u8, 17), m);
+
+    // j >= 4: sc = (scales[j+4] & 0xF) | ((scales[j-4] >> 6) << 4)
+    //         m  = (scales[j+4] >> 4)   | ((scales[j]   >> 6) << 4)
+    scales = [_]u8{0} ** 12;
+    scales[8] = (1 << 4) | 5; // sc low=5, m low=1
+    scales[0] = 2 << 6; // sc high 2 bits -> sc = 5 | (2<<4) = 37
+    scales[4] = 3 << 6; // m high 2 bits -> m = 1 | (3<<4) = 49
+    q4k.getScaleMinK4(4, &scales, &d, &m);
+    try testing.expectEqual(@as(u8, 37), d);
+    try testing.expectEqual(@as(u8, 49), m);
+}
+
+test "Q4_K quantize/dequantize round trip accuracy" {
+    const q4k = root.gemm_q4_k;
+    const k = q4k.QK_K; // one super-block (256)
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+
+    var blocks: [1]q4k.BlockQ4_K = undefined;
+    q4k.quantizeRowQ4_K(&src, &blocks, k);
+
+    var dst: [k]f32 = undefined;
+    q4k.dequantizeRowQ4_K(&blocks, &dst, k);
+
+    var max_abs_err: f32 = 0;
+    var sum_abs_x: f32 = 0;
+    for (0..k) |i| {
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+        sum_abs_x += @abs(src[i]);
+    }
+    const rel = max_abs_err / (sum_abs_x / k);
+    // K-quants achieve ~2-4% error on smooth data; allow 15%
+    try testing.expect(rel < 0.15);
+}
+
+test "Q4_K scalar GEMM constant weights" {
+    const q4k = root.gemm_q4_k;
+    const M = 4;
+    const N = 4;
+    const K = q4k.QK_K;
+
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var b: [N]q4k.BlockQ4_K = undefined;
+    for (&b) |*blk| {
+        // Target weight value y = 1.0:
+        // y = d * sc * q - dmin * m; choose d=1, dmin=0, sc=1, m=0, q=1
+        blk.d = q4k.f32_to_f16(1.0);
+        blk.dmin = q4k.f32_to_f16(0.0);
+        for (0..12) |si| blk.scales[si] = 0;
+        for (0..4) |j| blk.scales[j] = 1; // sc=1 for j<4
+        // j>=4 packed entries stay 0 (sc=0 would zero those sub-blocks)
+        // -> set them so sc=1, m=0 as well:
+        //   sc=(scales[j+4]&0xF)|((scales[j-4]>>6)<<4)=1 needs scales[j+4]&0xF=1
+        //   m=0 needs scales[j+4]>>4 == 0 and scales[j]>>6 == 0
+        for (8..12) |idx| blk.scales[idx] = 1; // j=4..7: scales[8..11]
+        for (&blk.qs) |*qq| qq.* = 0x11; // both nibbles = 1
+    }
+
+    var c: [M * N]f32 = undefined;
+    q4k.gemmQ4_KScalar(&a, K, &b, 1, &c, N, M, N, K);
+
+    for (0..M) |i| {
+        for (0..N) |j| {
+            // All 256 weights = 1.0 => C = 256
+            try testing.expectApproxEqAbs(@as(f32, 256.0), c[i * N + j], 0.5);
+        }
+    }
+}
