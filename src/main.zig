@@ -685,9 +685,11 @@ const MlaContext = struct {
     weights_loaded: bool = false,
 };
 
-pub export fn kt_mla_new(cpuinfer: *KT_CPUInfer, config: kt_mla_config_t) *KT_MLA {
-    _ = cpuinfer; // engine is sequential-heads, no NUMA dispatch yet
-
+// kt_mla_new matches the C++ contract (single config arg, 1 param total).
+// The Zig implementation does not use a CPUInfer — the engine is
+// single-threaded per MLA instance (matches the reference semantics), so
+// dropping the cpuinfer parameter is the correct contract.
+pub export fn kt_mla_new(config: kt_mla_config_t) *KT_MLA {
     // Validate the full MLA weight set up front. The C header types these as
     // *anyopaque (non-nullable), but a Python/caller bug could still pass 0.
     // The engine stores raw pointers — catching it here is the only sane spot.
@@ -793,17 +795,34 @@ fn mlaForwardImpl(
     }
 }
 
+// Matches the C++ kt_kernel.h paged/batched contract: qlens, page_tables,
+// kv_lens are parallel arrays of length qlen_count. The Zig engine is
+// single-sequence with an internal sequential KV cache layout, so:
+//   - qlen_count == 1: full forward (kvlen = kv_lens[0])
+//   - qlen_count >  1: paged/batched MLA not yet supported (paged attention
+//     indirection into a per-sequence paged cache is a separate feature);
+//     call once per sequence and concatenate the outputs externally.
+// page_tables / page_table_lens are accepted to match the C ABI but are
+// currently unused (the engine's cache uses sequential token positions).
 pub export fn kt_mla_forward(
     mla: *KT_MLA,
+    qlens: [*]const c_int,
+    qlen_count: c_int,
+    page_tables: [*]const [*]const c_int,
+    page_table_lens: [*]const c_int,
+    kv_lens: [*]const c_int,
     input: [*]const amx.bf16,
     output: [*]amx.bf16,
-    qlen: c_int,
-    kvlen: c_int,
-    position_ids: [*]const i64,
 ) void {
-    _ = position_ids; // engine uses kvlen - qlen for kv_start_pos
+    _ = page_tables;
+    _ = page_table_lens;
+    if (qlen_count != 1) {
+        @panic("kt_mla_forward: batched/paged MLA (qlen_count > 1) not yet supported; call once per sequence");
+    }
     const ctx: *MlaContext = @ptrCast(@alignCast(mla));
-    mlaForwardImpl(ctx, input, output, @intCast(qlen), @intCast(kvlen));
+    const qlen: usize = @intCast(qlens[0]);
+    const kvlen: usize = @intCast(kv_lens[0]);
+    mlaForwardImpl(ctx, input, output, qlen, kvlen);
 }
 
 pub export fn kt_mla_prefill(

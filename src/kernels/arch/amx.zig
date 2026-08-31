@@ -7,13 +7,102 @@ const builtin = @import("builtin");
 // ============================================================================
 // AMX Feature Detection
 // ============================================================================
+//
+// `AmxFeatures.available` is a COMPTIME gate: true only when the build target
+// is x86_64 (so we don't even emit AMX asm on aarch64/other arches). The
+// RUNTIME decision — does THIS host actually have AMX, AND will the kernel
+// let us use it — is made by `detectAmxSupport()`, which all AMX intrinsics
+// call as their guard. The runtime result is cached in a process-global
+// atomic so the CPUID/arch_prctl cost is paid once.
+//
+// Why not `@hasField(std.Target.Cpu.Feature.Set, "amx_int8")`: in Zig 0.16
+// `Feature.Set` is a packed struct whose feature names are not exposed as
+// fields, so that comptime check returns false unconditionally and would
+// short-circuit every AMX intrinsic into a no-op even on real AMX hardware
+// with `-Dvariant=amx`. This was the P0/A2 bug.
 
 pub const AmxFeatures = struct {
+    /// Comptime gate: true only when the build target is x86_64 AND the
+    /// target's CPU feature set explicitly includes `amx_tile` (which is
+    /// the prerequisite for all AMX-TMUL instructions: amx_bf16, amx_int8,
+    /// amx_fp16, ...). The feature check is what makes `-Dvariant=amx`
+    /// vs `-Dvariant=avx2` actually different at assembly-emission time:
+    /// without `amx_tile` in the feature set, GNU as refuses to assemble
+    /// `ldtilecfg`/`tilezero`/etc. with "invalid mnemonic".
+    ///
+    /// We previously used `@hasField(std.Target.Cpu.Feature.Set, "amx_int8")`
+    /// which is a no-op in Zig 0.16 (`Feature.Set` is a packed bitmask, not
+    /// a struct with named fields) — that short-circuited every AMX intrinsic
+    /// into a no-op even on real AMX hardware, the P0/A2 bug.
     pub const available: bool = switch (builtin.cpu.arch) {
-        .x86_64 => @hasField(std.Target.Cpu.Feature.Set, "amx_int8"),
+        .x86_64 => comptime_feature_has_amx_tile(),
         else => false,
     };
 };
+
+fn comptime_feature_has_amx_tile() bool {
+    if (!@hasDecl(std.Target, "x86")) return false;
+    return std.Target.x86.featureSetHas(builtin.cpu.features, .amx_tile);
+}
+
+/// Runtime cache for AMX availability: 0 = unknown, 1 = available,
+/// 2 = unavailable. Mirrors the layering in `amx_enable_state` but
+/// covers BOTH the CPUID-side check and the kernel permission check,
+/// so callers only need one helper.
+var amx_runtime_available: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
+
+/// Runtime AMX detection. Returns true iff:
+///   1. comptime: target is x86_64 + Linux
+///   2. runtime: CPUID leaf 7 sub-leaf 0 reports AMX-BF16 (EBX bit 22)
+///      and AMX-INT8 (EBX bit 25)
+///   3. runtime: kernel arch_prctl succeeds (requestAmxPermission)
+/// The result is cached in `amx_runtime_available` so the CPUID/syscall
+/// pair runs at most once per process. Safe to call from multiple threads.
+pub fn detectAmxSupport() bool {
+    if (comptime builtin.cpu.arch != .x86_64) return false;
+    if (comptime builtin.os.tag != .linux) return false;
+
+    const state = amx_runtime_available.load(.acquire);
+    if (state == 1) return true;
+    if (state == 2) return false;
+
+    // CPUID leaf 7, sub-leaf 0: structured extended feature info.
+    // EBX bit 22 = AMX-BF16, EBX bit 25 = AMX-INT8.
+    // Both are required for the ktransformers BF16/INT8 GEMM kernels.
+    var ebx: u32 = undefined;
+    var ecx_out: u32 = undefined;
+    var edx: u32 = undefined;
+    asm volatile (
+        \\cpuid
+        : [ebx] "={ebx}" (ebx),
+          [ecx] "={ecx}" (ecx_out),
+          [edx] "={edx}" (edx),
+        : [leaf] "{eax}" (@as(u32, 7)),
+          [sub] "{ecx}" (@as(u32, 0)),
+        : "eax"
+    );
+    const AMX_BF16: u32 = 1 << 22;
+    const AMX_INT8: u32 = 1 << 25;
+    const have_bf16 = (ebx & AMX_BF16) != 0;
+    const have_int8 = (ebx & AMX_INT8) != 0;
+
+    if (!have_bf16 or !have_int8) {
+        amx_runtime_available.store(2, .release);
+        return false;
+    }
+
+    // CPUID says yes — now check the kernel will permit it (XFEATURE
+    // permission request). `requestAmxPermission` is the existing helper
+    // that handles the layered arch_prctl dance; layering keeps the
+    // syscall plumbing out of this file's hot path.
+    if (!requestAmxPermission()) {
+        amx_runtime_available.store(2, .release);
+        return false;
+    }
+
+    amx_runtime_available.store(1, .release);
+    return true;
+}
 
 // ============================================================================
 // XFEATURE_XTILEDATA Permission Request
@@ -45,7 +134,9 @@ var amx_enable_state: std.atomic.Value(u8) = std.atomic.Value(u8).init(0);
 /// Returns true on success. Safe to call from multiple threads - the syscall
 /// will only run once.
 pub fn requestAmxPermission() bool {
-    if (!AmxFeatures.available) return false;
+    // (AmxFeatures.available is the comptime arch gate; requestAmxPermission
+    //  is also called by detectAmxSupport which has already cached the result.)
+    if (comptime !AmxFeatures.available) return false;
     if (comptime builtin.os.tag != .linux) return false;
 
     // Fast path: already enabled.
@@ -146,7 +237,8 @@ pub const TileReg = enum(u8) {
 /// Encoding: ldtilecfg [rbx]
 /// Config must be 64-byte aligned.
 pub fn tile_loadconfig(cfg: *const TileConfig) void {
-    if (!AmxFeatures.available) return;
+    if (comptime !AmxFeatures.available) return;
+    if (!detectAmxSupport()) return;
     ensureAmxEnabled();
     asm volatile (
         "ldtilecfg (%[cfg])"
@@ -159,7 +251,8 @@ pub fn tile_loadconfig(cfg: *const TileConfig) void {
 /// Release tile configuration
 /// Encoding: tilerelease
 pub fn tile_release() void {
-    if (!AmxFeatures.available) return;
+    if (comptime !AmxFeatures.available) return;
+    if (!detectAmxSupport()) return;
     asm volatile ("tilerelease" ::: "memory");
 }
 
@@ -167,7 +260,8 @@ pub fn tile_release() void {
 /// Encoding: tileloadd (%[base],%[stride],1), %tmm%[tmm]
 /// base must be 64-byte aligned.
 pub fn tile_loadd(tile: TileReg, ptr: *const u8, stride: usize) void {
-    if (!AmxFeatures.available) return;
+    if (comptime !AmxFeatures.available) return;
+    if (!detectAmxSupport()) return;
     const tmm: u8 = @intFromEnum(tile);
     asm volatile (
         "tileloadd (%[base],%[stride],1), %%tmm%[tmm]"
@@ -182,7 +276,8 @@ pub fn tile_loadd(tile: TileReg, ptr: *const u8, stride: usize) void {
 /// Store tile to memory (row-major)
 /// Encoding: tilestored %tmm%[tmm], (%[base],%[stride],1)
 pub fn tile_stored(tile: TileReg, ptr: *u8, stride: usize) void {
-    if (!AmxFeatures.available) return;
+    if (comptime !AmxFeatures.available) return;
+    if (!detectAmxSupport()) return;
     const tmm: u8 = @intFromEnum(tile);
     asm volatile (
         "tilestored %%tmm%[tmm], (%[base],%[stride],1)"
@@ -197,7 +292,8 @@ pub fn tile_stored(tile: TileReg, ptr: *u8, stride: usize) void {
 /// Zero tile register
 /// Encoding: tilezero %tmm%[tmm]
 pub fn tile_zero(tile: TileReg) void {
-    if (!AmxFeatures.available) return;
+    if (comptime !AmxFeatures.available) return;
+    if (!detectAmxSupport()) return;
     const tmm: u8 = @intFromEnum(tile);
     asm volatile (
         "tilezero %%tmm%[tmm]"
@@ -215,7 +311,8 @@ pub fn tile_zero(tile: TileReg) void {
 /// A: BF16, B: BF16, C: FP32
 /// Encoding: tilebf16dpd %tmm%B, %tmm%A, %tmm%C
 pub fn tile_dpbf16ps(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
-    if (!AmxFeatures.available) return;
+    if (comptime !AmxFeatures.available) return;
+    if (!detectAmxSupport()) return;
     const tmmA: u8 = @intFromEnum(src_a);
     const tmmB: u8 = @intFromEnum(src_b);
     const tmmC: u8 = @intFromEnum(dst);
@@ -233,7 +330,8 @@ pub fn tile_dpbf16ps(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
 /// A: INT8, B: INT8, C: INT32
 /// Encoding: tileint8dpd %tmm%B, %tmm%A, %tmm%C
 pub fn tile_dpbssd(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
-    if (!AmxFeatures.available) return;
+    if (comptime !AmxFeatures.available) return;
+    if (!detectAmxSupport()) return;
     const tmmA: u8 = @intFromEnum(src_a);
     const tmmB: u8 = @intFromEnum(src_b);
     const tmmC: u8 = @intFromEnum(dst);
@@ -253,7 +351,7 @@ pub fn tile_dpbssd(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
 /// all INT8 ops go through the same `tileint8dpd` path. The kernel layer must
 /// ensure that operands are sign-/zero-extended as required before this call.
 pub fn tile_dpbsud(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
-    if (!AmxFeatures.available) return;
+    if (!detectAmxSupport()) return;
     // tileint8dpd treats both operands as signed; the caller is responsible for
     // sign-/zero-extending the unsigned operand to a signed 8-bit value if needed.
     tile_dpbssd(dst, src_a, src_b);
@@ -261,13 +359,13 @@ pub fn tile_dpbsud(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
 
 /// DPBUSD: INT8 matrix multiply-accumulate (C += A * B^T, unsigned x signed)
 pub fn tile_dpbusd(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
-    if (!AmxFeatures.available) return;
+    if (!detectAmxSupport()) return;
     tile_dpbssd(dst, src_a, src_b);
 }
 
 /// DPBUUD: INT8 matrix multiply-accumulate (C += A * B^T, unsigned x unsigned)
 pub fn tile_dpbuud(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
-    if (!AmxFeatures.available) return;
+    if (!detectAmxSupport()) return;
     tile_dpbssd(dst, src_a, src_b);
 }
 

@@ -395,7 +395,14 @@ void kt_mla_forward(KT_MLA* mla, const int* qlens, int qlen_count,
 
 KT_Gate* kt_gate_new(kt_gate_config_t config);
 void kt_gate_free(KT_Gate* gate);
-void kt_gate_forward(KT_Gate* gate, const void* input, void* output, int qlen);
+// kt_gate_forward: Zig extension beyond the 4-arg C++ minimum (input/output/qlen).
+// The Zig port additionally returns the routing decisions in (topk_ids,
+// topk_weights) and exposes batch_size for callers that batch multiple
+// sequences through one gate instance. The ctypes wrapper (and the
+// existing tests) bind this 7-arg form; the 4-arg form is not exported.
+void kt_gate_forward(KT_Gate* gate, const void* input, void* output,
+                     int64_t* topk_ids, float* topk_weights,
+                     int batch_size, int qlen);
 
 // ============================================================================
 // Linear / MLP
@@ -550,5 +557,60 @@ int kt_fp8_transport_closed(KT_FP8LayerwiseTransport* transport);
 #ifdef __cplusplus
 }
 #endif
+
+// ============================================================================
+// Zig extensions (not in the C++ kt-kernel, exported by the Zig .so)
+// ============================================================================
+// These are stable additions made by the Zig port. They are part of the .so
+// surface and gated by tools/verify_abi.py. The C++ pybind11 wrapper does not
+// expose them; only the ctypes path (python/kt_kernel/__init__.py) uses them.
+
+// --- MoE per-expert step APIs (allow splitting gate+up and down projections
+//     for callers that want to interleave work with other ops) ---
+void kt_moe_forward_gate_up(KT_MOE* moe, int expert_idx, int qlen,
+                            const void* input, void* gate_output, void* up_output);
+void kt_moe_forward_down(KT_MOE* moe, int expert_idx, int qlen,
+                         const void* input, void* output);
+
+// --- MLA single-sequence conveniences (the paged/batched kt_mla_forward is
+//     the canonical contract; these are wrappers for the prefill / decode
+//     shapes that the C++ reference exposes via paged-attention queues) ---
+void kt_mla_prefill(KT_MLA* mla, const void* input, void* output,
+                    int qlen, const int64_t* position_ids);
+void kt_mla_decode(KT_MLA* mla, const void* input, void* output,
+                   int64_t position_id);
+// external kv_cache is accepted for API symmetry with the C++ MLA binding
+// but is currently ignored (the engine uses its own internal MlaKvCache).
+void kt_mla_update_kv_cache(KT_MLA* mla, void* kv_cache,
+                            const void* new_kv, int64_t position);
+
+// --- FP8 E4M3 quantize/dequantize (per-tensor and per-block variants) ---
+void kt_fp8_quantize(const void* config, const float* src, uint8_t* dst, size_t count);
+void kt_fp8_dequantize(const void* config, const uint8_t* src, float* dst, size_t count);
+void kt_fp8_quantize_block(const float* src, uint8_t* dst, float* scales,
+                           size_t num_blocks, int block_size);
+void kt_fp8_dequantize_block(const uint8_t* src, const float* scales,
+                             float* dst, size_t num_blocks, int block_size);
+
+// --- Scalar GEMM helpers (BF16 / INT8 / INT4 GPTQ / FP8) ---
+void kt_matmul_bf16(const void* a, const void* b, float* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+void kt_matmul_int8(const void* a, const void* b, int* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+void kt_matmul_int4(const void* a, const void* b, float* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+void kt_matmul_fp8(const void* a, const void* b, const float* b_scales, float* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+
+// --- WorkerPool thread count (useful for the C API consumer to size resources) ---
+int kt_worker_pool_get_thread_num(KT_WorkerPool* pool);
+
+// --- Math helper primitives (SwiGLU, RMSNorm, RoPE, Softmax) ---
+void kt_apply_swiglu(const void* gate, const void* up, void* dst,
+                     size_t count, float limit, float alpha);
+void kt_apply_rms_norm(const void* input, const void* weight, void* output,
+                       size_t hidden_size, float eps);
+void kt_apply_rope(void* q, void* k, int64_t position, size_t head_dim, double rope_theta);
+void kt_softmax(const float* input, float* output, size_t size);
 
 #endif // KTRANSFORMERS_C_API_H

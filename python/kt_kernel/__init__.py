@@ -359,4 +359,143 @@ __all__ = [
     "kt_dequantize_" + _f for _f in _GGML_FORMATS
 ] + [
     "kt_matmul_" + _f for _f in _GGML_FORMATS
+] + [
+    # Zig extension raw bindings (see include/kt_kernel.h "Zig extensions" section)
+    "kt_moe_forward_gate_up", "kt_moe_forward_down",
+    "kt_mla_prefill", "kt_mla_decode", "kt_mla_update_kv_cache",
+    "kt_fp8_quantize", "kt_fp8_dequantize",
+    "kt_fp8_quantize_block", "kt_fp8_dequantize_block",
+    "kt_matmul_bf16", "kt_matmul_int8", "kt_matmul_int4", "kt_matmul_fp8",
+    "kt_worker_pool_get_thread_num",
+    "kt_apply_swiglu", "kt_apply_rms_norm", "kt_apply_rope", "kt_softmax",
+]
+
+# ---------------------------------------------------------------------------
+# Zig-extension raw bindings (signatures mirror include/kt_kernel.h exactly
+# so header-following callers get the right argtypes; the verifier gate
+# confirms all of these are exported by every variant .so)
+# ---------------------------------------------------------------------------
+kt_moe_forward_gate_up = _so.kt_moe_forward_gate_up
+kt_moe_forward_gate_up.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+]
+kt_moe_forward_gate_up.restype = None
+
+kt_moe_forward_down = _so.kt_moe_forward_down
+kt_moe_forward_down.argtypes = [
+    ctypes.c_void_p, ctypes.c_int, ctypes.c_int,
+    ctypes.c_void_p, ctypes.c_void_p,
+]
+kt_moe_forward_down.restype = None
+
+kt_mla_prefill = _so.kt_mla_prefill
+kt_mla_prefill.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+    ctypes.c_int, ctypes.POINTER(ctypes.c_int64),
+]
+kt_mla_prefill.restype = None
+
+kt_mla_decode = _so.kt_mla_decode
+kt_mla_decode.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64]
+kt_mla_decode.restype = None
+
+kt_mla_update_kv_cache = _so.kt_mla_update_kv_cache
+kt_mla_update_kv_cache.argtypes = [
+    ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_int64,
+]
+kt_mla_update_kv_cache.restype = None
+
+# kt_fp8_quantize / kt_dequantize: first arg is `const void* config` (the
+# kt_fp8_transport_config_t struct is accepted as opaque by these scalar
+# helpers; in practice the existing _so.kt_fp8_quantize ignores it).
+kt_fp8_quantize = _so.kt_fp8_quantize
+kt_fp8_quantize.argtypes = [ctypes.c_void_p,
+                            ctypes.POINTER(ctypes.c_float),
+                            ctypes.POINTER(ctypes.c_uint8),
+                            ctypes.c_size_t]
+kt_fp8_quantize.restype = None
+kt_fp8_dequantize = _so.kt_fp8_dequantize
+kt_fp8_dequantize.argtypes = [ctypes.c_void_p,
+                              ctypes.POINTER(ctypes.c_uint8),
+                              ctypes.POINTER(ctypes.c_float),
+                              ctypes.c_size_t]
+kt_fp8_dequantize.restype = None
+kt_fp8_quantize_block = _so.kt_fp8_quantize_block
+kt_fp8_quantize_block.argtypes = [ctypes.POINTER(ctypes.c_float),
+                                  ctypes.POINTER(ctypes.c_uint8),
+                                  ctypes.POINTER(ctypes.c_float),
+                                  ctypes.c_size_t, ctypes.c_int]
+kt_fp8_quantize_block.restype = None
+kt_fp8_dequantize_block = _so.kt_fp8_dequantize_block
+kt_fp8_dequantize_block.argtypes = [ctypes.POINTER(ctypes.c_uint8),
+                                    ctypes.POINTER(ctypes.c_float),
+                                    ctypes.POINTER(ctypes.c_float),
+                                    ctypes.c_size_t, ctypes.c_int]
+kt_fp8_dequantize_block.restype = None
+
+# kt_matmul_bf16 / int8 / int4 / fp8: scalar GEMM helpers (header is the contract;
+# the Zig .so enforces arity and parameter order at the C ABI level).
+kt_matmul_bf16 = _so.kt_matmul_bf16
+kt_matmul_bf16.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                          ctypes.POINTER(ctypes.c_float),
+                          ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+                          ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t]
+kt_matmul_bf16.restype = None
+
+kt_matmul_int8 = _so.kt_matmul_int8
+kt_matmul_int8.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_int),
+                          ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+                          ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t]
+kt_matmul_int8.restype = None
+
+kt_matmul_int4 = _so.kt_matmul_int4
+kt_matmul_int4.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
+                          ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+                          ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t]
+kt_matmul_int4.restype = None
+
+# header order: a, b, b_scales, c
+kt_matmul_fp8 = _so.kt_matmul_fp8
+kt_matmul_fp8.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                          ctypes.POINTER(ctypes.c_float),
+                          ctypes.POINTER(ctypes.c_float),
+                          ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+                          ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t]
+kt_matmul_fp8.restype = None
+
+kt_worker_pool_get_thread_num = _so.kt_worker_pool_get_thread_num
+kt_worker_pool_get_thread_num.argtypes = [ctypes.c_void_p]
+kt_worker_pool_get_thread_num.restype = ctypes.c_int
+
+# Math helpers
+kt_apply_swiglu = _so.kt_apply_swiglu
+kt_apply_swiglu.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                           ctypes.c_size_t, ctypes.c_float, ctypes.c_float]
+kt_apply_swiglu.restype = None
+
+kt_apply_rms_norm = _so.kt_apply_rms_norm
+kt_apply_rms_norm.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+                             ctypes.c_size_t, ctypes.c_float]
+kt_apply_rms_norm.restype = None
+
+kt_apply_rope = _so.kt_apply_rope
+kt_apply_rope.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                         ctypes.c_int64, ctypes.c_size_t, ctypes.c_double]
+kt_apply_rope.restype = None
+
+kt_softmax = _so.kt_softmax
+kt_softmax.argtypes = [ctypes.POINTER(ctypes.c_float),
+                      ctypes.POINTER(ctypes.c_float), ctypes.c_size_t]
+kt_softmax.restype = None
+
+# Update the ctypes wrapper for the new 7-arg kt_gate_forward contract
+kt_gate_forward.argtypes = [
+    ctypes.POINTER(KT_Gate),
+    ctypes.c_void_p,
+    ctypes.c_void_p,
+    ctypes.POINTER(ctypes.c_int64),
+    ctypes.POINTER(ctypes.c_float),
+    ctypes.c_int,
+    ctypes.c_int,
 ]

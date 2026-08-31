@@ -131,7 +131,7 @@ pub const GemmKernel224FP8 = struct {
     /// Set the 8-tile configuration: 2x A (16x32 BF16), 2x B (16x32 BF16),
     /// 4x C (16x16 FP32). Identical to GemmKernel224BF16.
     pub fn config() void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         var tile_config = amx.TileConfig.init();
 
         // Tile 0,1: A matrices (16 x 32 BF16) — 32 bytes per row
@@ -153,7 +153,7 @@ pub const GemmKernel224FP8 = struct {
     }
 
     pub fn cleanC() void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_zero(amx.TileReg.tmm4);
         amx.tile_zero(amx.TileReg.tmm5);
         amx.tile_zero(amx.TileReg.tmm6);
@@ -161,7 +161,7 @@ pub const GemmKernel224FP8 = struct {
     }
 
     pub fn loadC(c: [*]f32, ldc: usize) void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_loadd(amx.TileReg.tmm4, @ptrCast(c), ldc);
         amx.tile_loadd(amx.TileReg.tmm5, @ptrCast(@as([*]f32, @ptrCast(c)) + TILE_N), ldc);
         amx.tile_loadd(amx.TileReg.tmm6, @ptrCast(@as([*]f32, @ptrCast(c)) + ldc * TILE_M), ldc);
@@ -169,7 +169,7 @@ pub const GemmKernel224FP8 = struct {
     }
 
     pub fn storeC(c: [*]f32, ldc: usize) void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_stored(amx.TileReg.tmm4, @ptrCast(c), ldc);
         amx.tile_stored(amx.TileReg.tmm5, @ptrCast(@as([*]f32, @ptrCast(c)) + TILE_N), ldc);
         amx.tile_stored(amx.TileReg.tmm6, @ptrCast(@as([*]f32, @ptrCast(c)) + ldc * TILE_M), ldc);
@@ -179,7 +179,7 @@ pub const GemmKernel224FP8 = struct {
     /// Load 32 rows of BF16 activations (M=16) × 32 K into tmm0/tmm1.
     /// `lda` is the row stride in bytes of the A matrix.
     pub fn loadA(a: [*]const amx.bf16, lda: usize) void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_loadd(amx.TileReg.tmm0, @ptrCast(a), lda);
         amx.tile_loadd(amx.TileReg.tmm1, @ptrCast(@as([*]const amx.bf16, @ptrCast(a)) + TILE_M * lda), lda);
     }
@@ -187,7 +187,7 @@ pub const GemmKernel224FP8 = struct {
     /// Run the 2x2x4 tile dot product: 4 tilebf16dpd instructions.
     /// FP32 accumulator (no INT32 scratch needed).
     pub fn runTile() void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_dpbf16ps(amx.TileReg.tmm4, amx.TileReg.tmm0, amx.TileReg.tmm2);
         amx.tile_dpbf16ps(amx.TileReg.tmm5, amx.TileReg.tmm0, amx.TileReg.tmm3);
         amx.tile_dpbf16ps(amx.TileReg.tmm6, amx.TileReg.tmm1, amx.TileReg.tmm2);
@@ -204,7 +204,7 @@ pub const GemmKernel224FP8 = struct {
     /// Then load as tiles tmm2 (rows 0..15) and tmm3 (rows 16..31).
     /// `ldb` is the row stride of `b` in elements of fp8_e4m3 (1 byte each).
     pub fn loadB(b: [*]const fp8_e4m3, ldb: usize, scratch: *[2 * TILE_N * TILE_K]amx.bf16) void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         // Dequantize 16 rows for tmm2.
         for (0..TILE_N) |i| {
             for (0..TILE_K) |k| {
@@ -245,7 +245,7 @@ pub const GemmKernel224FP8 = struct {
         c: [*]f32, ldc: usize,
         m: usize, n: usize, k: usize
     ) void {
-        if (!amx.AmxFeatures.available) {
+        if (!amx.detectAmxSupport()) {
             gemmFullTileScalar(a, lda, b, b_scales, ldb, c, ldc, m, n, k);
             return;
         }

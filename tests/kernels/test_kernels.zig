@@ -521,7 +521,7 @@ test "INT4 GEMM 16x16x32 with simple constant B" {
     gemm_int4.GemmKernel224Int4.gemmFullTile(
         &a, K,
         &b, k_blocks,
-        &c, N,
+        c.ptr, N,
         M, N, K,
     );
 
@@ -1979,4 +1979,200 @@ test "Q8_K scalar GEMM vs dequantized reference" {
         }
     }
     try testing.expect(@abs(expected - 256.0) / 256.0 < 0.005);
+}
+
+
+// ============================================================================
+// P0 regression tests for MoE forward multi-token-per-expert (D1, D2)
+// ============================================================================
+
+test "TpMoe sequential forward: qlen=3 (multi-token-per-expert)" {
+    // D1 regression: with qlen=3, k=1, expert_num=1 all 3 tokens route to
+    // expert 0 -> count=3. The OLD sequential forward allocated a `hidden`-sized
+    // scratch buffer and called forwardDown inside the per-token loop, writing
+    // `count*hidden` rows into a `hidden`-sized buffer (overflow + redundant
+    // recomputation). The fix hoists forwardDown and uses a `count*hidden` scratch.
+    const allocator = testing.allocator;
+
+    const hidden_size: usize = 8;
+    const intermediate_size: usize = 16;
+    const expert_num: usize = 1;
+    const k: usize = 1;
+    const qlen: usize = 3;
+
+    // Deterministic non-trivial weights
+    const gate_w = try allocator.alloc(amx.bf16, expert_num * intermediate_size * hidden_size);
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(amx.bf16, expert_num * intermediate_size * hidden_size);
+    defer allocator.free(up_w);
+    const down_w = try allocator.alloc(amx.bf16, expert_num * hidden_size * intermediate_size);
+    defer allocator.free(down_w);
+    for (0..gate_w.len) |i| {
+        gate_w[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(i % 7 + 1)) * 0.05);
+        up_w[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(i % 5 + 1)) * 0.05);
+    }
+    for (down_w) |*v| v.* = amx.f32_to_bf16(0.25);
+
+    // Sequential (no pool) — exercises D1 path
+    var moe_seq = try moe.TpMoe.init(moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = @intCast(k),
+        .hidden_size = @intCast(hidden_size),
+        .intermediate_size = @intCast(intermediate_size),
+        .max_len = @intCast(qlen),
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    }, std.heap.page_allocator);
+    defer moe_seq.deinit();
+    moe_seq.loadWeights();
+
+    const input = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(input);
+    for (0..qlen * hidden_size) |i| {
+        // Deterministic non-trivial input
+        input[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(i % 11 + 1)) * 0.1);
+    }
+
+    const expert_ids = [_]i64{ 0, 0, 0 };
+    const routing_weights = [_]f32{ 1.0, 1.0, 1.0 };
+
+    const out_seq = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(out_seq);
+    @memset(out_seq, 0);
+    moe_seq.forward(qlen, k, &expert_ids, &routing_weights, input.ptr, out_seq.ptr, false);
+
+    // Verify: output is non-zero and finite
+    var has_nonzero = false;
+    for (out_seq) |v| {
+        const f = amx.bf16_to_f32(v);
+        try testing.expect(std.math.isFinite(f));
+        if (f != 0.0) has_nonzero = true;
+    }
+    try testing.expect(has_nonzero);
+
+    // Equivalence: parallel path (with pool) MUST produce the same output
+    var pool = try worker_pool.WorkerPool.initSimple(allocator, 2);
+    defer pool.deinit();
+
+    var moe_par = try moe.TpMoe.init(moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = @intCast(k),
+        .hidden_size = @intCast(hidden_size),
+        .intermediate_size = @intCast(intermediate_size),
+        .max_len = @intCast(qlen),
+        .pool = &pool,
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    }, std.heap.page_allocator);
+    defer moe_par.deinit();
+    moe_par.loadWeights();
+
+    const out_par = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(out_par);
+    @memset(out_par, 0);
+    moe_par.forward(qlen, k, &expert_ids, &routing_weights, input.ptr, out_par.ptr, false);
+
+    for (0..qlen * hidden_size) |i| {
+        const a = amx.bf16_to_f32(out_seq[i]);
+        const b = amx.bf16_to_f32(out_par[i]);
+        try testing.expect(@abs(a - b) < 1e-2);
+    }
+}
+
+test "TpMoe forwardParallel: qlen=3 indexing correctness" {
+    // D2 regression: with qlen=3, k=1, expert_num=2, route tokens to different
+    // experts so global indices gi take values 0,1,2 (not just 0). The OLD code
+    // wrote output_f32[gi*h+h] using h as both the loop index AND the stride,
+    // producing garbled writes that happened to coincide for h>=1 only when
+    // gi=0 (single token). The fix uses hidden as the stride.
+    const allocator = testing.allocator;
+
+    const hidden_size: usize = 8;
+    const intermediate_size: usize = 16;
+    const expert_num: usize = 2;
+    const k: usize = 1;
+    const qlen: usize = 3;
+
+    const gate_w = try allocator.alloc(amx.bf16, expert_num * intermediate_size * hidden_size);
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(amx.bf16, expert_num * intermediate_size * hidden_size);
+    defer allocator.free(up_w);
+    const down_w = try allocator.alloc(amx.bf16, expert_num * hidden_size * intermediate_size);
+    defer allocator.free(down_w);
+    for (0..gate_w.len) |i| {
+        gate_w[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(i % 7 + 1)) * 0.05);
+        up_w[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(i % 5 + 1)) * 0.05);
+    }
+    for (down_w) |*v| v.* = amx.f32_to_bf16(0.25);
+
+    const input = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(input);
+    for (0..qlen * hidden_size) |i| {
+        input[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(i % 11 + 1)) * 0.1);
+    }
+
+    // Route tokens 0,1,2 to experts 0,1,0 -> counts are (2,1); gi values are 0,2,1
+    const expert_ids = [_]i64{ 0, 1, 0 };
+    const routing_weights = [_]f32{ 0.7, 0.5, 0.9 };
+
+    // Parallel path (with pool) — exercises D2 path
+    var pool = try worker_pool.WorkerPool.initSimple(allocator, 2);
+    defer pool.deinit();
+
+    var moe_par = try moe.TpMoe.init(moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = @intCast(k),
+        .hidden_size = @intCast(hidden_size),
+        .intermediate_size = @intCast(intermediate_size),
+        .max_len = @intCast(qlen),
+        .pool = &pool,
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    }, std.heap.page_allocator);
+    defer moe_par.deinit();
+    moe_par.loadWeights();
+
+    const out_par = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(out_par);
+    @memset(out_par, 0);
+    moe_par.forward(qlen, k, &expert_ids, &routing_weights, input.ptr, out_par.ptr, false);
+
+    // Each token position must have non-zero, finite output
+    for (0..qlen) |i| {
+        var has_nonzero = false;
+        for (0..hidden_size) |h| {
+            const v = amx.bf16_to_f32(out_par[i * hidden_size + h]);
+            try testing.expect(std.math.isFinite(v));
+            if (v != 0.0) has_nonzero = true;
+        }
+        try testing.expect(has_nonzero);
+    }
+
+    // Equivalence: sequential path must match
+    var moe_seq = try moe.TpMoe.init(moe.MoeConfig{
+        .expert_num = @intCast(expert_num),
+        .num_experts_per_tok = @intCast(k),
+        .hidden_size = @intCast(hidden_size),
+        .intermediate_size = @intCast(intermediate_size),
+        .max_len = @intCast(qlen),
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    }, std.heap.page_allocator);
+    defer moe_seq.deinit();
+    moe_seq.loadWeights();
+
+    const out_seq = try allocator.alloc(amx.bf16, qlen * hidden_size);
+    defer allocator.free(out_seq);
+    @memset(out_seq, 0);
+    moe_seq.forward(qlen, k, &expert_ids, &routing_weights, input.ptr, out_seq.ptr, false);
+
+    for (0..qlen * hidden_size) |i| {
+        const a = amx.bf16_to_f32(out_seq[i]);
+        const b = amx.bf16_to_f32(out_par[i]);
+        try testing.expect(@abs(a - b) < 1e-2);
+    }
 }

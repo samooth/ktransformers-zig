@@ -27,6 +27,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HEADER_DEFAULT = REPO_ROOT / "include" / "kt_kernel.h"
 SO_DIR_DEFAULT = REPO_ROOT / "zig-out" / "lib"
 SO_PREFIX_DEFAULT = "libkt_kernel_ext"
+MAIN_ZIG_DEFAULT = REPO_ROOT / "src" / "main.zig"
 
 # Captures `kt_xxx(` occurrences -> function names declared in the C header.
 SYMBOL_RE = re.compile(r"\b(kt_[A-Za-z0-9_]+)\s*\(")
@@ -123,6 +124,36 @@ def main() -> int:
         return 0
     if overall_ok:
         print(f"PASS: all {len(expected)} declared symbols exported by all variants.")
+        # Also run the arity audit (header signature parity) as part of the gate.
+        import importlib.util
+        arity_path = REPO_ROOT / "tools" / "audit_arity.py"
+        if not arity_path.exists():
+            print("NOTE: tools/audit_arity.py not found; skipping arity gate.")
+            return 0
+        spec = importlib.util.spec_from_file_location("audit_arity", arity_path)
+        if spec is None or spec.loader is None:
+            print("NOTE: could not load audit_arity; skipping arity gate.")
+            return 0
+        arity_mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(arity_mod)
+        header_protos = arity_mod.parse_header_prototypes(args.header)
+        zig_exports = arity_mod.parse_zig_exports(MAIN_ZIG_DEFAULT)
+        arity_bad = []
+        for name in sorted(set(header_protos) & set(zig_exports)):
+            if header_protos[name] != zig_exports[name]:
+                arity_bad.append((name, header_protos[name], zig_exports[name]))
+        if arity_bad:
+            print("ARITY FAIL: header/Zig signature divergence (stack-corruption risk):")
+            for name, h, z in arity_bad:
+                print(f"    {name}: header {h} vs zig {z}")
+            return 1
+        only_header = sorted(set(header_protos) - set(zig_exports))
+        if only_header:
+            print("ARITY FAIL: declared in header but not exported:")
+            for n in only_header:
+                print(f"    {n}")
+            return 1
+        print(f"PASS: arity audit — {len(header_protos)} header prototypes match Zig export signatures.")
         return 0
     print("FAIL: some declared symbols are not exported by every variant.")
     return 1

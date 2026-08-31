@@ -83,7 +83,7 @@ pub const GemmKernel224Int4 = struct {
     /// Set the 8-tile configuration: 2x A (16x64 INT8), 2x B (16x64 INT8),
     /// 4x C (16x16 INT32). Identical to GemmKernel224Int8.
     pub fn config() void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         var tile_config = amx.TileConfig.init();
 
         // Tile 0,1: A matrices (16 x 64 INT8)
@@ -105,7 +105,7 @@ pub const GemmKernel224Int4 = struct {
     }
 
     pub fn cleanC() void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_zero(amx.TileReg.tmm4);
         amx.tile_zero(amx.TileReg.tmm5);
         amx.tile_zero(amx.TileReg.tmm6);
@@ -113,7 +113,7 @@ pub const GemmKernel224Int4 = struct {
     }
 
     pub fn loadC(c: [*]i32, ldc: usize) void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_loadd(amx.TileReg.tmm4, @ptrCast(c), ldc);
         amx.tile_loadd(amx.TileReg.tmm5, @ptrCast(@as([*]i32, @ptrCast(c)) + TILE_N), ldc);
         amx.tile_loadd(amx.TileReg.tmm6, @ptrCast(@as([*]i32, @ptrCast(c)) + ldc * TILE_M), ldc);
@@ -121,7 +121,7 @@ pub const GemmKernel224Int4 = struct {
     }
 
     pub fn storeC(c: [*]i32, ldc: usize) void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_stored(amx.TileReg.tmm4, @ptrCast(c), ldc);
         amx.tile_stored(amx.TileReg.tmm5, @ptrCast(@as([*]i32, @ptrCast(c)) + TILE_N), ldc);
         amx.tile_stored(amx.TileReg.tmm6, @ptrCast(@as([*]i32, @ptrCast(c)) + ldc * TILE_M), ldc);
@@ -131,14 +131,14 @@ pub const GemmKernel224Int4 = struct {
     /// Load 32 rows of INT8 activations (M=16) × 64 K into tmm0/tmm1.
     /// `lda` is the row stride in bytes of the A matrix.
     pub fn loadA(a: [*]const i8, lda: usize) void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_loadd(amx.TileReg.tmm0, @ptrCast(a), lda);
         amx.tile_loadd(amx.TileReg.tmm1, @ptrCast(@as([*]const i8, @ptrCast(a)) + TILE_M * lda), lda);
     }
 
     /// Run the 2x2x4 tile dot product: 4 tile_dpbssd instructions.
     pub fn runTile() void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_dpbssd(amx.TileReg.tmm4, amx.TileReg.tmm0, amx.TileReg.tmm2);
         amx.tile_dpbssd(amx.TileReg.tmm5, amx.TileReg.tmm0, amx.TileReg.tmm3);
         amx.tile_dpbssd(amx.TileReg.tmm6, amx.TileReg.tmm1, amx.TileReg.tmm2);
@@ -203,18 +203,19 @@ pub const GemmKernel224Int4 = struct {
     /// buffer, then load as tiles tmm2 (rows 0..15) and tmm3 (rows 16..31).
     /// `ldb` is the row stride of `b` in elements of BlockQ4_0.
     /// `is_lo` selects which nibble to extract.
-    pub fn loadB(b: [*]const BlockQ4_0, ldb: usize, scratch: *[TILE_N * TILE_K]i8, is_lo: bool) void {
-        if (!amx.AmxFeatures.available) return;
+    pub fn loadB(b: [*]const BlockQ4_0, ldb: usize, scratch_ptr: [*]i8, scratch_len: usize, is_lo: bool) void {
+        if (!amx.detectAmxSupport()) return;
+        const first_tile_len: usize = TILE_N * TILE_K;
+        const scratch = scratch_ptr[0..@min(scratch_len, first_tile_len)];
         @memset(scratch, 0);
         for (0..TILE_N) |i| {
             const block = &(@as([*]const BlockQ4_0, @ptrCast(b)))[i * ldb];
-            // Pad the second half of the K dimension with zeros (already done
-            // by @memset above, but explicit for clarity).
-            dequantRow(block, scratch[i * TILE_K ..][0..GROUP_SIZE * 2].ptr, is_lo);
+            dequantRow(block, scratch[i * TILE_K ..][0 .. GROUP_SIZE * 2].ptr, is_lo);
         }
-        // Load into tmm2 (rows 0..15) and tmm3 (rows 16..31).
-        amx.tile_loadd(amx.TileReg.tmm2, @ptrCast(scratch), TILE_K);
-        amx.tile_loadd(amx.TileReg.tmm3, @ptrCast(scratch[TILE_N * TILE_K ..].ptr), TILE_K);
+        amx.tile_loadd(amx.TileReg.tmm2, @ptrCast(scratch.ptr), TILE_K);
+        if (scratch_len >= 2 * first_tile_len) {
+            amx.tile_loadd(amx.TileReg.tmm3, @ptrCast(scratch_ptr + first_tile_len), TILE_K);
+        }
     }
 
     // =======================================================================
@@ -231,10 +232,10 @@ pub const GemmKernel224Int4 = struct {
     pub fn gemmFullTile(
         a: *const i8, lda: usize,
         b: *const BlockQ4_0, ldb: usize,
-        c: *f32, ldc: usize,
+        c: [*]f32, ldc: usize,
         m: usize, n: usize, k: usize
     ) void {
-        if (!amx.AmxFeatures.available) {
+        if (!amx.detectAmxSupport()) {
             gemmFullTileScalar(a, lda, b, ldb, c, ldc, m, n, k);
             return;
         }
@@ -247,14 +248,9 @@ pub const GemmKernel224Int4 = struct {
         // apply the per-group scales at the end of each K_BLOCK to produce FP32.
         var int_c: [M_STEP * N_STEP]i32 align(64) = undefined;
 
-        // Scratch buffer for dequantized B rows. 16 rows × 64 bytes (TILE_K).
-        // We need a buffer for 32 rows total (because tmm3 loads rows 16..31
-        // of the dequantized data, but in our case B only has 16 rows per
-        // tile block — the second tile in tmm3 is loaded from rows 16..31
-        // of the SAME b block, not a separate block. So we only need 16 rows
-        // of scratch, but tmm3's load is from a separate 16×64 region.
-        // For simplicity we allocate 32×64 = 2048 bytes; only the first
-        // 16×64 is filled with dequant data, the second 16×64 is zero.
+        // Scratch buffer for dequantized B rows: 2 tiles × 16 rows × 64 bytes.
+        // loadB fills the first TILE_N*TILE_K half (tmm2) and, when the
+        // buffer is large enough, the second half (tmm3) — see loadB.
         var b_scratch: [2 * TILE_N * TILE_K]i8 align(64) = undefined;
 
         for (0..m) |m_begin| {
@@ -282,24 +278,24 @@ pub const GemmKernel224Int4 = struct {
                     while (k_begin < k_block_end) : (k_begin += K_STEP) {
                         const a_lo = @as([*]const i8, @ptrCast(a)) + m_begin * lda + (k_begin - k_block_begin);
                         const a_hi = a_lo + K_STEP;
-                        const b_ptr = b + n_begin * ldb + (k_begin / GROUP_SIZE);
+                        const b_ptr = @as([*]const BlockQ4_0, @ptrCast(b)) + n_begin * ldb + (k_begin / GROUP_SIZE);
 
                         // Load activations for lo nibble.
                         if (k_begin + K_STEP <= k_block_end) {
                             GemmKernel224Int4.loadA(a_lo, lda);
-                            GemmKernel224Int4.loadB(b_ptr, ldb, &b_scratch, true);
+                            GemmKernel224Int4.loadB(b_ptr, ldb, &b_scratch, 2 * TILE_N * TILE_K, true);
                             GemmKernel224Int4.runTile();
                             // Load activations for hi nibble.
                             if (k_begin + K_STEP < k_block_end) {
                                 GemmKernel224Int4.loadA(a_hi, lda);
-                                GemmKernel224Int4.loadB(b_ptr, ldb, &b_scratch, false);
+                                GemmKernel224Int4.loadB(b_ptr, ldb, &b_scratch, 2 * TILE_N * TILE_K, false);
                                 GemmKernel224Int4.runTile();
                             }
                         }
                     }
 
                     // Apply per-group scales and write FP32 to c.
-                    applyScales(int_c[0..], c, m_begin, m_end, n_begin, n_end, b, ldb, k_block_begin, k_block_end, ldc);
+                    applyScales(int_c[0..], @as([*]f32, @ptrCast(c)), m_begin, m_end, n_begin, n_end, @as([*]const BlockQ4_0, @ptrCast(b)), ldb, k_block_begin, k_block_end, ldc);
                 }
             }
         }
@@ -392,7 +388,7 @@ pub const GemmKernel224Int4 = struct {
     fn gemmFullTileScalar(
         a: *const i8, lda: usize,
         b: *const BlockQ4_0, ldb: usize,
-        c: *f32, ldc: usize,
+        c: [*]f32, ldc: usize,
         m: usize, n: usize, k: usize
     ) void {
         const k_blocks = k / GROUP_SIZE;

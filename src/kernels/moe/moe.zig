@@ -582,21 +582,24 @@ pub const TpMoe = struct {
                     const u = amx.bf16_to_f32(up_output[idx]);
                     gate_output[idx] = amx.f32_to_bf16(amx.swiglu(g, u));
                 }
-                token_idx = 0;
+                // D1 fix: allocate count*hidden scratch (not just hidden),
+                // call forwardDown ONCE per expert (was per-token), and
+                // accumulate into output_f32 via the per-token routing.
+                const expert_down_out = std.heap.page_allocator.alloc(amx.bf16, count * hidden) catch @panic("OOM");
+                defer std.heap.page_allocator.free(expert_down_out);
+                @memset(expert_down_out, 0);
+                self.forwardDown(e, count, gate_output.ptr, expert_down_out.ptr);
+                var down_token_idx: usize = 0;
                 for (0..qlen) |i| {
                     for (0..@as(usize, @intCast(k))) |j| {
                         const eid = expert_ids[i * @as(usize, @intCast(k)) + j];
                         if (eid == @as(i64, @intCast(e))) {
-                            const expert_down_out = std.heap.page_allocator.alloc(amx.bf16, hidden) catch @panic("OOM");
-                            defer std.heap.page_allocator.free(expert_down_out);
-                            @memset(expert_down_out, 0);
-                            self.forwardDown(e, count, gate_output.ptr, expert_down_out.ptr);
                             const w = weights[i * @as(usize, @intCast(k)) + j];
                             for (0..hidden) |h| {
-                                const val = amx.bf16_to_f32(expert_down_out[h]);
+                                const val = amx.bf16_to_f32(expert_down_out[down_token_idx * hidden + h]);
                                 output_f32[i * hidden + h] += val * w;
                             }
-                            token_idx += 1;
+                            down_token_idx += 1;
                         }
                     }
                 }
@@ -638,7 +641,8 @@ pub const TpMoe = struct {
         subpool.doWorkStealingJob(expert_num, &parallelExpertTask);
         for (0..expert_num) |e| { const count=expert_tokens[e]; if (count==0) continue;
             for (0..count) |s| { const gi=gidx_bufs[e][s]; const w=wt_bufs[e][s];
-                for (0..hidden) |h| { output_f32[gi*h+h]+=amx.bf16_to_f32(scratch_bufs[e][s*h+h])*w; } } }
+                // D2 fix: was gi*h+h (h is loop index AND stride); should be gi*hidden+h
+                for (0..hidden) |h| { output_f32[gi*hidden+h]+=amx.bf16_to_f32(scratch_bufs[e][s*hidden+h])*w; } } }
         for (input_bufs) |slab| allocator.free(slab); allocator.free(input_bufs);
         for (scratch_bufs) |slab| allocator.free(slab); allocator.free(scratch_bufs);
         for (gidx_bufs) |slab| allocator.free(slab); allocator.free(gidx_bufs);
@@ -720,7 +724,7 @@ pub const TpMoe = struct {
         const k: usize = @intCast(cfg.hidden_size);
         const inter: usize = @intCast(cfg.intermediate_size);
         const n = inter / self.tp_count;
-        const ldc: usize = inter;
+        // D3 fix: was ldc=inter; output buffer is m*n so leading dim must be n
 
         // Use FP32 scratch buffers (aligned) for GEMM output, then convert
         // to BF16. The gate_output/up_output params are BF16 arrays that may
@@ -740,14 +744,14 @@ pub const TpMoe = struct {
                 input,
                 gate_bf16_storage + weight_off,
                 gate_f32.ptr,
-                m, n, k, k, k, ldc
+                m, n, k, k, k, n
             );
             // Up projection: input [m, k] @ up_weight [n, k]^T -> up_f32 [m, n]
             gemm_bf16.gemmExpert(
                 input,
                 up_bf16_storage + weight_off,
                 up_f32.ptr,
-                m, n, k, k, k, ldc
+                m, n, k, k, k, n
             );
             // Convert FP32 -> BF16 and store into the per-rank output slice
             for (0..m * n) |idx| {

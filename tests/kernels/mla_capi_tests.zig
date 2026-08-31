@@ -105,10 +105,10 @@ test "kt_mla C API: new -> load_weights -> forward/decode -> free" {
     };
 
     // Lifecycle: new -> load_weights -> forward -> decode -> free.
-    const mla = kt.kt_mla_new(undefined, config);
+    const mla = kt.kt_mla_new(config);
     kt.kt_mla_load_weights(mla);
 
-    // forward: qlen=1, kvlen=1 (single-token prefill at position 0).
+    // forward: qlen_count=1, qlen=1, kvlen=1 (single-token prefill at position 0).
     const input = try allocator.alloc(u16, hidden_size);
     defer allocator.free(input);
     const output = try allocator.alloc(u16, hidden_size);
@@ -116,9 +116,12 @@ test "kt_mla C API: new -> load_weights -> forward/decode -> free" {
     @memset(input, 0);
     @memset(output, 0);
 
-    const position_ids = [_]i64{0};
-    kt.kt_mla_forward(mla, input.ptr, output.ptr, 1, 1, &position_ids);
-    kt.kt_mla_prefill(mla, input.ptr, output.ptr, 1, &position_ids);
+    // 8-arg paged C ABI: qlens[0]=1, page_tables/page_table_lens unused
+    // (engine has its own sequential cache), kv_lens[0]=1.
+    const qlens = [_]c_int{1};
+    const kv_lens = [_]c_int{1};
+    kt.kt_mla_forward(mla, &qlens, 1, undefined, undefined, &kv_lens, input.ptr, output.ptr);
+    kt.kt_mla_prefill(mla, input.ptr, output.ptr, 1, &[_]i64{0});
     kt.kt_mla_decode(mla, input.ptr, output.ptr, 1);
 
     // Zero weights + zero input -> zero output (finite, exact).

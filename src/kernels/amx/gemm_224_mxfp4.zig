@@ -106,7 +106,7 @@ pub const GemmKernel224MXFP4 = struct {
         c: [*]f32, ldc: usize,
         m: usize, n: usize, k: usize
     ) void {
-        if (!amx.AmxFeatures.available) {
+        if (!amx.detectAmxSupport()) {
             gemmFullTileScalar(a, lda, b, ldb, c, ldc, m, n, k);
             return;
         }
@@ -167,7 +167,7 @@ pub const GemmKernel224MXFP4 = struct {
     /// Tile config: identical to GemmKernel224BF16 (2x A 16x32 BF16,
     /// 2x B 16x32 BF16 VNNI, 4x C 16x16 FP32).
     pub fn config() void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         var tile_config = amx.TileConfig.init();
 
         for (0..2) |i| {
@@ -184,7 +184,7 @@ pub const GemmKernel224MXFP4 = struct {
     }
 
     pub fn cleanC() void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_zero(amx.TileReg.tmm4);
         amx.tile_zero(amx.TileReg.tmm5);
         amx.tile_zero(amx.TileReg.tmm6);
@@ -192,7 +192,7 @@ pub const GemmKernel224MXFP4 = struct {
     }
 
     pub fn storeC(c: [*]f32, ldc: usize) void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_stored(amx.TileReg.tmm4, @ptrCast(c), ldc);
         amx.tile_stored(amx.TileReg.tmm5, @ptrCast(@as([*]f32, @ptrCast(c)) + TILE_N), ldc);
         amx.tile_stored(amx.TileReg.tmm6, @ptrCast(@as([*]f32, @ptrCast(c)) + ldc * TILE_M), ldc);
@@ -202,14 +202,14 @@ pub const GemmKernel224MXFP4 = struct {
     /// Load 32 rows of BF16 activations into tmm0/tmm1. `lda` is the A row
     /// stride in BYTES.
     pub fn loadA(a: [*]const amx.bf16, lda: usize) void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_loadd(amx.TileReg.tmm0, @ptrCast(a), lda);
         amx.tile_loadd(amx.TileReg.tmm1, @ptrCast(@as([*]const amx.bf16, @ptrCast(a)) + TILE_M * lda), lda);
     }
 
     /// Run the 2x2x4 BF16 dot product (FP32 accumulate).
     pub fn runTile() void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         amx.tile_dpbf16ps(amx.TileReg.tmm4, amx.TileReg.tmm0, amx.TileReg.tmm2);
         amx.tile_dpbf16ps(amx.TileReg.tmm5, amx.TileReg.tmm0, amx.TileReg.tmm3);
         amx.tile_dpbf16ps(amx.TileReg.tmm6, amx.TileReg.tmm1, amx.TileReg.tmm2);
@@ -228,7 +228,7 @@ pub const GemmKernel224MXFP4 = struct {
         k_total: usize,
         scratch: *[2 * TILE_N * TILE_K]amx.bf16,
     ) void {
-        if (!amx.AmxFeatures.available) return;
+        if (!amx.detectAmxSupport()) return;
         const k_end = @min(k_begin + K_STEP, k_total);
         const k_count = k_end - k_begin;
 
