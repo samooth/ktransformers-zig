@@ -462,6 +462,12 @@ void kt_dequantize_q5_k(const void* src, float* dst, size_t k);
 void kt_quantize_q6_k(const float* src, void* dst, size_t k);
 void kt_dequantize_q6_k(const void* src, float* dst, size_t k);
 
+/// Q8_K: quantize/dequantize one row (k must be a multiple of 256).
+/// Block = f32 d + 256 x i8 qs + 16 x i16 bsums (292 bytes) — note d is
+/// f32 here, unlike the f16 of the other K-quants.
+void kt_quantize_q8_k(const float* src, void* dst, size_t k);
+void kt_dequantize_q8_k(const void* src, float* dst, size_t k);
+
 /// GGML GEMMs: BF16 activations x quantized weights -> F32 output
 void kt_matmul_q8_0(const void* a, const void* b, float* c,
                     size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
@@ -470,6 +476,8 @@ void kt_matmul_q4_k(const void* a, const void* b, float* c,
 void kt_matmul_q5_k(const void* a, const void* b, float* c,
                     size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
 void kt_matmul_q6_k(const void* a, const void* b, float* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+void kt_matmul_q8_k(const void* a, const void* b, float* c,
                     size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
 
 // ============================================================================

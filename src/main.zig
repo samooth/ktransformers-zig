@@ -22,6 +22,7 @@ pub const gemm_q8_0 = root.gemm_q8_0;
 pub const gemm_q4_k = root.gemm_q4_k;
 pub const gemm_q5_k = root.gemm_q5_k;
 pub const gemm_q6_k = root.gemm_q6_k;
+pub const gemm_q8_k = root.gemm_q8_k;
 const moe = root.moe;
 const moe_sft = root.moe_sft;
 const mla_config = root.mla_config;
@@ -1653,6 +1654,14 @@ pub export fn kt_dequantize_q6_k(src: *const anyopaque, dst: [*]f32, k: usize) v
     gemm_q6_k.dequantizeRowQ6_K(@ptrCast(@alignCast(src)), dst[0..k], k);
 }
 
+pub export fn kt_quantize_q8_k(src: [*]const f32, dst: *anyopaque, k: usize) void {
+    gemm_q8_k.quantizeRowQ8_K(src[0..k], @ptrCast(@alignCast(dst)), k);
+}
+
+pub export fn kt_dequantize_q8_k(src: *const anyopaque, dst: [*]f32, k: usize) void {
+    gemm_q8_k.dequantizeRowQ8_K(@ptrCast(@alignCast(src)), dst[0..k], k);
+}
+
 /// GGML GEMMs: a [m,k] BF16 activations, b [n, k/QK] blocks (row-major,
 /// ldb in BLOCKS), c [m,n] F32. On-the-fly dequant (scalar kernels).
 pub export fn kt_matmul_q8_0(
@@ -1709,6 +1718,20 @@ pub export fn kt_matmul_q6_k(
     ldc: usize,
 ) void {
     gemm_q6_k.gemmQ6_KScalar(a, lda, b, ldb, c, ldc, m, n, k);
+}
+
+pub export fn kt_matmul_q8_k(
+    a: [*]const amx.bf16,
+    b: [*]const gemm_q8_k.BlockQ8_K,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    gemm_q8_k.gemmQ8_KScalar(a, lda, b, ldb, c, ldc, m, n, k);
 }
 
 // ============================================================================

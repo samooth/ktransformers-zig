@@ -202,6 +202,134 @@ kt_mlp_forward.argtypes = [
 ]
 kt_mlp_forward.restype = None
 
+# ---------------------------------------------------------------------------
+# GGML quantization types (Q8_0, Q4_K, Q5_K, Q6_K, Q8_K)
+# ---------------------------------------------------------------------------
+# Block layouts are byte-exact vs llama.cpp ggml-common.h: blocks produced by
+# quantize_row() feed the kt_matmul_q* functions directly, and weights loaded
+# from .gguf files can be passed to the matmuls without any conversion.
+
+Q8_0_QK = 32            # weights per Q8_0 block
+Q8_0_BLOCK_BYTES = 34   # f16 d + 32 x i8
+Q4_K_QK = 256           # weights per K-quant super-block
+Q4_K_BLOCK_BYTES = 144  # f16 d+dmin, 12B 6-bit scales, 128B 4-bit quants
+Q5_K_BLOCK_BYTES = 176  # f16 d+dmin, 12B scales, 32B high bits, 128B 4-bit
+Q6_K_BLOCK_BYTES = 210  # 128B ql, 64B qh, 16 x i8 scales, f16 d
+Q8_K_BLOCK_BYTES = 292  # f32 d (NOT f16), 256 x i8, 16 x i16 bsums
+
+_GGML_FORMATS = ("q8_0", "q4_k", "q5_k", "q6_k", "q8_k")
+_GGML_LAYOUT = {
+    "q8_0": (Q8_0_QK, Q8_0_BLOCK_BYTES),
+    "q4_k": (Q4_K_QK, Q4_K_BLOCK_BYTES),
+    "q5_k": (Q4_K_QK, Q5_K_BLOCK_BYTES),
+    "q6_k": (Q4_K_QK, Q6_K_BLOCK_BYTES),
+    "q8_k": (Q4_K_QK, Q8_K_BLOCK_BYTES),
+}
+
+# Raw one-row bindings (kept public for zero-copy users who manage buffers):
+#   kt_quantize_<fmt>(f32* src, void* dst, k)      k multiple of QK
+#   kt_dequantize_<fmt>(void* src, f32* dst, k)
+# Raw matmuls:
+#   kt_matmul_<fmt>(bf16* a, void* b, f32* c, m, n, k, lda, ldb, ldc)
+#   b holds n rows of k/QK contiguous blocks (ldb = 1), a is BF16.
+_GGML_QUANT = {}
+_GGML_DEQUANT = {}
+_GGML_MATMUL = {}
+for _fmt in _GGML_FORMATS:
+    _q = getattr(_so, "kt_quantize_" + _fmt)
+    _q.argtypes = [ctypes.POINTER(ctypes.c_float), ctypes.c_void_p, ctypes.c_size_t]
+    _q.restype = None
+    _d = getattr(_so, "kt_dequantize_" + _fmt)
+    _d.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_size_t]
+    _d.restype = None
+    _m = getattr(_so, "kt_matmul_" + _fmt)
+    _m.argtypes = [
+        ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_float),
+        ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+        ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t,
+    ]
+    _m.restype = None
+    globals()["kt_quantize_" + _fmt] = _q
+    globals()["kt_dequantize_" + _fmt] = _d
+    globals()["kt_matmul_" + _fmt] = _m
+    _GGML_QUANT[_fmt] = _q
+    _GGML_DEQUANT[_fmt] = _d
+    _GGML_MATMUL[_fmt] = _m
+
+
+def _ggml_layout(fmt):
+    try:
+        return _GGML_LAYOUT[fmt]
+    except KeyError:
+        raise ValueError(
+            "unknown GGML format %r (expected one of %s)" % (fmt, ", ".join(_GGML_FORMATS))
+        ) from None
+
+
+def quantize_row(fmt, src):
+    """Quantize one row of float32 values into packed GGML block bytes.
+
+    fmt: one of "q8_0", "q4_k", "q5_k", "q6_k", "q8_k".
+    src: sequence of numbers; length must be a multiple of the format's
+         weights-per-block (32 for q8_0, 256 for the K-quants).
+    Returns bytes of length len(src)//QK * BLOCK_BYTES.
+    """
+    qk, block_bytes = _ggml_layout(fmt)
+    k = len(src)
+    if k % qk:
+        raise ValueError("%s: row length %d is not a multiple of %d" % (fmt, k, qk))
+    src_buf = (ctypes.c_float * k)(*src)
+    dst = ctypes.create_string_buffer((k // qk) * block_bytes)
+    _GGML_QUANT[fmt](src_buf, dst, k)
+    return dst.raw
+
+
+def dequantize_row(fmt, blocks, k):
+    """Dequantize GGML blocks back to float32.
+
+    blocks: bytes (or equally-sized buffer) holding k//QK blocks.
+    Returns a ctypes c_float array of length k (list() it or index directly).
+    """
+    qk, block_bytes = _ggml_layout(fmt)
+    if k % qk:
+        raise ValueError("%s: k=%d is not a multiple of %d" % (fmt, k, qk))
+    expected = (k // qk) * block_bytes
+    if len(blocks) != expected:
+        raise ValueError(
+            "%s: expected %d block bytes for k=%d, got %d" % (fmt, expected, k, len(blocks))
+        )
+    out = (ctypes.c_float * k)()
+    _GGML_DEQUANT[fmt](blocks, out, k)
+    return out
+
+
+def matmul_quantized(fmt, a_f32, b_blocks, m, n, k):
+    """Quantized GEMM with a float32 convenience interface.
+
+    a_f32: flat sequence of m*k activation floats (converted to BF16 here —
+           for repeated use, convert once with kt_f32_to_bf16 and call the
+           raw kt_matmul_<fmt> instead).
+    b_blocks: packed bytes of n rows x (k//QK) blocks each, contiguous.
+    Returns a ctypes c_float array of m*n (row-major output).
+    """
+    qk, block_bytes = _ggml_layout(fmt)
+    if k % qk:
+        raise ValueError("%s: k=%d is not a multiple of %d" % (fmt, k, qk))
+    if len(a_f32) != m * k:
+        raise ValueError("a_f32: expected %d values, got %d" % (m * k, len(a_f32)))
+    expected = n * (k // qk) * block_bytes
+    if len(b_blocks) != expected:
+        raise ValueError(
+            "%s: expected %d block bytes, got %d" % (fmt, expected, len(b_blocks))
+        )
+    a = (ctypes.c_float * (m * k))(*a_f32)
+    a_bf16 = ctypes.create_string_buffer(m * k * 2)
+    kt_f32_to_bf16(a, a_bf16, m * k)
+    c = (ctypes.c_float * (m * n))()
+    _GGML_MATMUL[fmt](a_bf16, b_blocks, c, m, n, k, k, 1, n)
+    return c
+
+
 __all__ = [
     "kt_version",
     "kt_get_cpu_variant",
@@ -221,5 +349,14 @@ __all__ = [
     "kt_mlp_new",
     "kt_mlp_free",
     "kt_mlp_forward",
-    "_so_path",
+    # GGML quantization
+    "Q8_0_QK", "Q8_0_BLOCK_BYTES", "Q4_K_QK",
+    "Q4_K_BLOCK_BYTES", "Q5_K_BLOCK_BYTES", "Q6_K_BLOCK_BYTES", "Q8_K_BLOCK_BYTES",
+    "quantize_row", "dequantize_row", "matmul_quantized",
+] + [
+    "kt_quantize_" + _f for _f in _GGML_FORMATS
+] + [
+    "kt_dequantize_" + _f for _f in _GGML_FORMATS
+] + [
+    "kt_matmul_" + _f for _f in _GGML_FORMATS
 ]

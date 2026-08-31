@@ -1872,3 +1872,111 @@ test "Q5_K scalar GEMM vs dequantized reference" {
     }
     try testing.expect(@abs(expected - 256.0) / 256.0 < 0.01);
 }
+
+// ============================================================================
+// GGML Q8_K (kernel-layer Phase 1; 292-byte blocks, byte-exact vs ggml)
+// ============================================================================
+
+test "Q8_K block layout byte-exact (292 bytes)" {
+    const q8k = root.gemm_q8_k;
+    try testing.expectEqual(@as(usize, 292), @sizeOf(q8k.BlockQ8_K));
+    const blk = std.mem.zeroes(q8k.BlockQ8_K);
+    const bytes: [*]const u8 = @ptrCast(&blk);
+    // d [0,4), qs [4,260), bsums [260,292)
+    try testing.expectEqual(@as(u8, 0), bytes[0]);
+    try testing.expectEqual(@as(u8, 0), bytes[3]);
+    try testing.expectEqual(@as(u8, 0), bytes[4]);
+    try testing.expectEqual(@as(u8, 0), bytes[259]);
+    try testing.expectEqual(@as(u8, 0), bytes[260]);
+    try testing.expectEqual(@as(u8, 0), bytes[291]);
+}
+
+test "Q8_K quantize/dequantize round trip accuracy" {
+    const q8k = root.gemm_q8_k;
+    const k = q8k.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+
+    var blk: [1]q8k.BlockQ8_K = undefined;
+    q8k.quantizeRowQ8_K(&src, &blk, k);
+
+    var dst: [k]f32 = undefined;
+    q8k.dequantizeRowQ8_K(&blk, &dst, k);
+
+    var max_abs_err: f32 = 0;
+    var sum_abs_x: f32 = 0;
+    var abs_max: f32 = 0;
+    for (0..k) |i| {
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+        sum_abs_x += @abs(src[i]);
+        abs_max = @max(abs_max, @abs(src[i]));
+    }
+    const d = abs_max / 127.0;
+    try testing.expect(max_abs_err <= d * 0.51);
+    const rel = max_abs_err / (sum_abs_x / k);
+    try testing.expect(rel < 0.02);
+}
+
+test "Q8_K bsums are exact group sums" {
+    const q8k = root.gemm_q8_k;
+    const k = q8k.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5)) * 0.37;
+    }
+
+    var blk: [1]q8k.BlockQ8_K = undefined;
+    q8k.quantizeRowQ8_K(&src, &blk, k);
+
+    for (0..16) |j| {
+        var sum: i32 = 0;
+        for (0..16) |ii| {
+            sum += blk[0].qs[j * 16 + ii];
+        }
+        try testing.expectEqual(@as(i32, blk[0].bsums[j]), sum);
+    }
+}
+
+test "Q8_K all-zero super-block fast path" {
+    const q8k = root.gemm_q8_k;
+    const k = q8k.QK_K;
+    var src: [k]f32 = [_]f32{0.0} ** k;
+    var blk: [1]q8k.BlockQ8_K = undefined;
+    q8k.quantizeRowQ8_K(&src, &blk, k);
+    try testing.expectEqual(@as(f32, 0), blk[0].d);
+
+    var dst: [k]f32 = undefined;
+    q8k.dequantizeRowQ8_K(&blk, &dst, k);
+    for (dst) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "Q8_K scalar GEMM vs dequantized reference" {
+    const q8k = root.gemm_q8_k;
+    const M = 4;
+    const N = 4;
+    const K = q8k.QK_K;
+
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var src: [K]f32 = undefined;
+    for (&src) |*v| v.* = 1.0;
+    var b: [N]q8k.BlockQ8_K = undefined;
+    for (0..N) |j| q8k.quantizeRowQ8_K(&src, @ptrCast(&b[j]), K);
+
+    var c: [M * N]f32 = undefined;
+    q8k.gemmQ8_KScalar(&a, K, &b, 1, &c, N, M, N, K);
+
+    var w: [K]f32 = undefined;
+    q8k.dequantizeRowQ8_K(@ptrCast(&b[0]), &w, K);
+    var expected: f32 = 0;
+    for (w) |v| expected += v;
+    for (0..M) |i| {
+        for (0..N) |j| {
+            try testing.expectApproxEqAbs(expected, c[i * N + j], 1e-3);
+        }
+    }
+    try testing.expect(@abs(expected - 256.0) / 256.0 < 0.005);
+}
