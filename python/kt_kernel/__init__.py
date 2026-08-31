@@ -146,8 +146,56 @@ kt_cpuinfer_free.argtypes = [ctypes.POINTER(KT_CPUInfer)]
 kt_cpuinfer_free.restype = None
 
 # Linear
+# ---------------------------------------------------------------------------
+# By-value config struct definitions (their layouts mirror src/main.zig
+# extern structs exactly — verified by tools/audit_layout.py). Zig lowers
+# by-value struct params as stack copies; the argtypes below MUST be the
+# Structure class itself so ctypes marshals the struct by value. Passing
+# byref/c_void_p here was a latent stack-corruption bug (caught live).
+# ---------------------------------------------------------------------------
+
+class kt_linear_config_t(ctypes.Structure):
+    _fields_ = [("hidden_size", ctypes.c_size_t),
+                ("intermediate_size", ctypes.c_size_t),
+                ("stride", ctypes.c_int),
+                ("group_max_len", ctypes.c_int),
+                ("proj", ctypes.c_void_p),
+                ("proj_type", ctypes.c_int),
+                ("hidden_type", ctypes.c_int)]
+
+class kt_gate_config_t(ctypes.Structure):
+    _fields_ = [("hidden_size", ctypes.c_size_t),
+                ("num_experts_per_tok", ctypes.c_size_t),
+                ("n_routed_experts", ctypes.c_size_t),
+                ("n_group", ctypes.c_size_t),
+                ("topk_group", ctypes.c_size_t),
+                ("norm_topk_prob", ctypes.c_int),
+                ("routed_scaling_factor", ctypes.c_float),
+                ("scoring_func", ctypes.c_void_p),
+                ("topk_method", ctypes.c_void_p),
+                ("layer_idx", ctypes.c_int),
+                ("pool", ctypes.c_void_p),
+                ("weight", ctypes.c_void_p),
+                ("weight_type", ctypes.c_int),
+                ("e_score_correction_bias", ctypes.c_void_p),
+                ("e_score_correction_bias_type", ctypes.c_int),
+                ("max_seqlen", ctypes.c_size_t)]
+
+class kt_mlp_config_t(ctypes.Structure):
+    _fields_ = [("hidden_size", ctypes.c_size_t),
+                ("intermediate_size", ctypes.c_size_t),
+                ("stride", ctypes.c_int),
+                ("group_max_len", ctypes.c_int),
+                ("gate_proj", ctypes.c_void_p),
+                ("up_proj", ctypes.c_void_p),
+                ("down_proj", ctypes.c_void_p),
+                ("gate_type", ctypes.c_int),
+                ("up_type", ctypes.c_int),
+                ("down_type", ctypes.c_int),
+                ("hidden_type", ctypes.c_int)]
+
 kt_linear_new = _so.kt_linear_new
-kt_linear_new.argtypes = [ctypes.c_void_p]
+kt_linear_new.argtypes = [kt_linear_config_t]
 kt_linear_new.restype = ctypes.POINTER(KT_Linear)
 
 kt_linear_free = _so.kt_linear_free
@@ -165,7 +213,7 @@ kt_linear_forward.restype = None
 
 # Gate
 kt_gate_new = _so.kt_gate_new
-kt_gate_new.argtypes = [ctypes.c_void_p]
+kt_gate_new.argtypes = [kt_gate_config_t]
 kt_gate_new.restype = ctypes.POINTER(KT_Gate)
 
 kt_gate_free = _so.kt_gate_free
@@ -186,7 +234,7 @@ kt_gate_forward.restype = None
 
 # MLP
 kt_mlp_new = _so.kt_mlp_new
-kt_mlp_new.argtypes = [ctypes.c_void_p]
+kt_mlp_new.argtypes = [kt_mlp_config_t]
 kt_mlp_new.restype = ctypes.POINTER(KT_MLP)
 
 kt_mlp_free = _so.kt_mlp_free
@@ -368,6 +416,8 @@ __all__ = [
     "kt_matmul_bf16", "kt_matmul_int8", "kt_matmul_int4", "kt_matmul_fp8",
     "kt_worker_pool_get_thread_num",
     "kt_apply_swiglu", "kt_apply_rms_norm", "kt_apply_rope", "kt_softmax",
+    "kt_allocator_vtable", "kt_set_default_allocator",
+    "kt_linear_config_t", "kt_gate_config_t", "kt_mlp_config_t",
 ]
 
 # ---------------------------------------------------------------------------
@@ -488,6 +538,32 @@ kt_softmax = _so.kt_softmax
 kt_softmax.argtypes = [ctypes.POINTER(ctypes.c_float),
                       ctypes.POINTER(ctypes.c_float), ctypes.c_size_t]
 kt_softmax.restype = None
+
+# ---------------------------------------------------------------------------
+# Custom allocator injection (call BEFORE any kt_*_new; B1, ABI symbol 87).
+# ---------------------------------------------------------------------------
+class kt_allocator_vtable(ctypes.Structure):
+    """C-ABI allocator vtable. Callbacks: alloc/free/resize with userdata.
+    Pass a pointer to an instance of this struct to kt_set_default_allocator;
+    pass None to restore the built-in default."""
+    _fields_ = [
+        ("userdata", ctypes.c_void_p),
+        ("alloc", ctypes.CFUNCTYPE(
+            ctypes.c_void_p,
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_size_t)),
+        ("free", ctypes.CFUNCTYPE(
+            None,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_size_t)),
+        ("resize", ctypes.CFUNCTYPE(
+            ctypes.c_int,
+            ctypes.c_void_p, ctypes.c_void_p,
+            ctypes.c_size_t, ctypes.c_size_t, ctypes.c_size_t)),
+    ]
+
+kt_set_default_allocator = _so.kt_set_default_allocator
+kt_set_default_allocator.argtypes = [ctypes.POINTER(kt_allocator_vtable)]
+kt_set_default_allocator.restype = None
 
 # Update the ctypes wrapper for the new 7-arg kt_gate_forward contract
 kt_gate_forward.argtypes = [
