@@ -172,4 +172,28 @@ pub fn build(b: *std.Build) void {
         .test_runner = .{ .path = b.path("tools/test_runner.zig"), .mode = .simple },
     });
     test_step.dependOn(&b.addRunArtifact(neon_test_obj).step);
+
+    // --- Bench step (B2) ---
+    //
+    // `zig build -Doptimize=ReleaseFast bench` runs the GEMM
+    // micro-benchmark: A1-vectorized gemmExpert vs a pure-scalar
+    // reference at DeepSeek-V3-shaped sizes, reporting ms/call,
+    // GFLOPS, and the speedup ratio. Uses the same module wiring as
+    // the test suites (kt import from root.zig, libc linked for the
+    // clock_gettime syscall path). ReleaseFast is strongly
+    // recommended: Debug-mode timings are meaningless for SIMD work.
+    const bench_step = b.step("bench", "Run GEMM micro-benchmarks (use -Doptimize=ReleaseFast)");
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/gemm_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const bench_kt_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    bench_kt_mod.link_libc = true;
+    bench_mod.addImport("kt", bench_kt_mod);
+    const bench_exe = b.addExecutable(.{
+        .name = "gemm_bench",
+        .root_module = bench_mod,
+    });
+    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
 }
