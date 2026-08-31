@@ -14,6 +14,7 @@ pub const gemm_fp8 = @import("kernels/amx/gemm_224_fp8.zig");
 pub const gemm_int8 = @import("kernels/amx/gemm_224_int8.zig");
 pub const moe = @import("kernels/moe/moe.zig");
 pub const moe_sft = @import("kernels/moe/moe_sft.zig");
+pub const deepseekv3_layer = @import("kernels/moe/deepseekv3_layer.zig");
 pub const mla_config = @import("mla/mla_config.zig");
 pub const mla_cache = @import("mla/mla_cache.zig");
 pub const mla_core = @import("mla/mla_core.zig");
@@ -127,4 +128,11 @@ comptime {
 // wrapping in comptime forces the analysis. Verified experimentally.
 comptime {
     _ = @import("main.zig");
+}
+
+// Force analysis of the DeepseekV3DecoderLayer orchestration module.
+comptime {
+    _ = &deepseekv3_layer.DeepseekV3DecoderLayer.init;
+    _ = &deepseekv3_layer.DeepseekV3DecoderLayer.forward;
+    _ = &deepseekv3_layer.DeepseekV3DecoderLayer.deinit;
 }

@@ -2652,3 +2652,97 @@ test "Subpool waitIdle drains pending jobs (B3)" {
     pool.subpools[0].waitIdle(0);
     try testing.expectEqual(@as(usize, 50), g_test_counter.load(.acquire));
 }
+
+// ============================================================================
+// DeepseekV3DecoderLayer — orchestration (modeling_deepseek_v3.py spec)
+// ============================================================================
+
+test "DeepseekV3DecoderLayer: init -> 2 decode steps -> deinit (no leaks)" {
+    const dsv3 = root.deepseekv3_layer;
+    const allocator = testing.allocator;
+
+    // Tiny dims (mirror the MLA engine test sizes)
+    const hidden: usize = 64;
+    const q_lora_rank: usize = 32;
+    const num_heads: usize = 4;
+    const nope_size: usize = 8;
+    const rope_size: usize = 4;
+    const kv_lora_rank: usize = 16;
+    const max_qlen: usize = 2;
+    const max_kvlen: usize = 16;
+    const tpp: usize = 4;
+    const expert_num: usize = 4;
+    const top_k: usize = 2;
+    const inter: usize = 32;
+
+    // Zeroed BF16 weights (deterministic output)
+    const w = try allocator.alloc(amx.bf16, 64 * 1024);
+    defer allocator.free(w);
+    @memset(w, 0);
+    const gate_w = try allocator.alloc(amx.bf16, expert_num * hidden);
+    defer allocator.free(gate_w);
+    @memset(gate_w, 0);
+
+    const layer = try dsv3.DeepseekV3DecoderLayer.init(allocator, .{
+        .hidden_size = hidden,
+        .q_lora_rank = q_lora_rank,
+        .num_heads = num_heads,
+        .nope_size = nope_size,
+        .rope_size = rope_size,
+        .kv_lora_rank = kv_lora_rank,
+        .max_qlen = max_qlen,
+        .max_kvlen = max_kvlen,
+        .token_count_in_page = tpp,
+        .expert_num = expert_num,
+        .num_experts_per_tok = top_k,
+        .intermediate_size = inter,
+        .n_group = 2,
+        .topk_group = 1,
+        .q_a_proj = w.ptr,
+        .q_a_norm = w.ptr,
+        .q_b_proj = w.ptr,
+        .kv_a_proj_with_mqa = w.ptr,
+        .kv_a_norm = w.ptr,
+        .kv_b_proj = w.ptr,
+        .o_proj = w.ptr,
+        .attn_norm_weight = w.ptr,
+        .ffn_norm_weight = w.ptr,
+        .gate_weight = gate_w.ptr,
+        .gate_proj = w.ptr,
+        .up_proj = w.ptr,
+        .down_proj = w.ptr,
+    });
+    // deinit destroys self
+    var layer_ptr = layer;
+    defer layer_ptr.deinit();
+
+    // Two decode steps: token 0 at kv_start_pos=0, token 1 at kv_start_pos=1.
+    const inp = try allocator.alloc(amx.bf16, hidden);
+    defer allocator.free(inp);
+    @memset(inp, amx.f32_to_bf16(0.5));
+    const out = try allocator.alloc(amx.bf16, hidden);
+    defer allocator.free(out);
+
+    // Step 1
+    @memset(out, 0);
+    layer.forward(1, 0, inp.ptr, out.ptr);
+    // Zero weights everywhere -> MLA attn_out = 0, MoE experts = 0; but the
+    // residual path means output = input (RMSNorm of x with zero weight
+    // gives 0, attention gives 0, so x = residual + 0 = x; then MoE same).
+    // With attn_norm_weight = 0: RMSNorm output is 0 -> attention output 0
+    // -> x1 = residual(x) + 0 = x. FFN block: ffn_norm = 0 -> routed experts
+    // on zero input -> 0 -> x2 = x1 + 0 = x1. So output ~= input (BF16
+    // round-trip of 0.5).
+    for (0..hidden) |i| {
+        const v = amx.bf16_to_f32(out[i]);
+        try testing.expectApproxEqAbs(@as(f32, 0.5), v, 0.01);
+    }
+
+    // Step 2 (kv_start_pos=1: cache has 1 token)
+    @memset(out, 0);
+    layer.forward(1, 1, inp.ptr, out.ptr);
+    for (0..hidden) |i| {
+        const v = amx.bf16_to_f32(out[i]);
+        try testing.expectApproxEqAbs(@as(f32, 0.5), v, 0.01);
+    }
+}
