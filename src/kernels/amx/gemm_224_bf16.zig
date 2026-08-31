@@ -354,14 +354,51 @@ pub fn gemmExpert(
                     }
                 }
 
-                // Simple GEMM for now - will be replaced with AMX tiles
+                // Vectorized over the K axis: process 8 BF16 elements at a
+                // time per (m,n) pair, accumulating into a VecF32 register
+                // and reducing to a scalar at the end of the K-loop. This
+                // emits AVX2 vmulps on this host (256-bit SIMD = 8 f32
+                // lanes, matches VecF32). For the scalar tail (k_step % 8)
+                // we fall back to the plain loop.
+                //
+                // Layout note: input is [m, k] row-major, weight is [n, k]
+                // row-major (the weight matrix is stored transposed relative
+                // to the standard row-major output convention; gemmExpert
+                // computes output = input @ weight^T). For each (i, j) we
+                // take 8 consecutive k-coords of input[i, k_base..] and
+                // weight[j, k_base..] — both are contiguous in memory, so
+                // the loads are vectorizable.
+                //
+                // BF16->f32 conversion: we stage through a [VEC_LEN]f32
+                // array (the same pattern applySwiGLU uses), since BF16 is
+                // 16 bits and f32 is 32 bits — there's no direct @Vector
+                // bitcast between mismatched lane widths. The compiler
+                // lowers the staged conversion to a sequence of movsx/
+                // vmovdqu + vpbroadcastw + vinserti128 on the BF16 chunks.
+                const k_vec_end: usize = k_step - (k_step % amx.VEC_LEN);
+
                 for (0..m_actual) |i| {
                     for (0..n_actual) |j| {
-                        var sum: f32 = 0;
-                        for (0..k_step) |kk| {
-                            const a_val = amx.bf16_to_f32(input[(m_start + i) * input_ld + k_processed + kk]);
-                            const b_val = amx.bf16_to_f32(weight[(n_start + j) * weight_ld + k_processed + kk]);
-                            sum += a_val * b_val;
+                        const in_row: [*]const amx.bf16 = input + (m_start + i) * input_ld + k_processed;
+                        const w_row: [*]const amx.bf16 = weight + (n_start + j) * weight_ld + k_processed;
+                        var acc: amx.VecF32 = @splat(0.0);
+                        var kk: usize = 0;
+                        while (kk < k_vec_end) : (kk += amx.VEC_LEN) {
+                            // Load 8 BF16 values from each row.
+                            var a_arr: [amx.VEC_LEN]f32 = undefined;
+                            var b_arr: [amx.VEC_LEN]f32 = undefined;
+                            for (0..amx.VEC_LEN) |lane| {
+                                a_arr[lane] = amx.bf16_to_f32(in_row[kk + lane]);
+                                b_arr[lane] = amx.bf16_to_f32(w_row[kk + lane]);
+                            }
+                            const a_v: amx.VecF32 = a_arr;
+                            const b_v: amx.VecF32 = b_arr;
+                            acc += a_v * b_v;
+                        }
+                        // Scalar tail for k_step % VEC_LEN (0..7 elements).
+                        var sum: f32 = amx.reduceAddFp32(acc);
+                        while (kk < k_step) : (kk += 1) {
+                            sum += amx.bf16_to_f32(in_row[kk]) * amx.bf16_to_f32(w_row[kk]);
                         }
                         output[(m_start + i) * output_ld + n_start + j] += sum;
                     }

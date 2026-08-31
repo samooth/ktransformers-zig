@@ -2176,3 +2176,133 @@ test "TpMoe forwardParallel: qlen=3 indexing correctness" {
         try testing.expect(@abs(a - b) < 1e-2);
     }
 }
+
+// ============================================================================
+// A1 regression: vectorized gemmExpert correctness
+// ============================================================================
+//
+// `gemmExpert` is the hot path of MoE/MLP/Linear/Gate. After the A1
+// vectorization (8 BF16 elements per inner iteration, scalar tail), these
+// tests verify the new code path matches a hand-computed reference within
+// BF16 accumulation tolerance. Two cases:
+//   1. k_step % VEC_LEN == 0: pure vectorized, no tail.
+//   2. k_step % VEC_LEN != 0 (here k=37 → 32 vec + 5 tail): exercises the
+//      scalar tail loop and confirms the boundary between the two paths
+//      doesn't introduce drift.
+// Both cases compare against the same naive scalar triple-loop reference
+// (independent of gemmExpert itself) so a regression in the vectorized
+// code can't be masked by an identically-wrong scalar reference.
+
+test "gemmExpert vectorized: k aligned to VEC_LEN (no tail)" {
+    const allocator = testing.allocator;
+    const m: usize = 4;
+    const n: usize = 6;
+    const k: usize = 32; // 32 = 4 * VEC_LEN, no tail
+
+    const input = try allocator.alloc(amx.bf16, m * k);
+    defer allocator.free(input);
+    const weight = try allocator.alloc(amx.bf16, n * k);
+    defer allocator.free(weight);
+    const output = try allocator.alloc(f32, m * n);
+    defer allocator.free(output);
+
+    // Deterministic non-trivial values; a[i, j] = (i*k + j + 1) * 0.1
+    // so the dot products are predictable sums of products.
+    for (0..m) |i| {
+        for (0..k) |j| {
+            input[i * k + j] = amx.f32_to_bf16(@as(f32, @floatFromInt(i * k + j + 1)) * 0.1);
+        }
+    }
+    for (0..n) |i| {
+        for (0..k) |j| {
+            weight[i * k + j] = amx.f32_to_bf16(@as(f32, @floatFromInt((i * k + j) % 7 + 1)) * 0.05);
+        }
+    }
+    @memset(output, 0);
+
+    gemm_bf16.gemmExpert(input.ptr, weight.ptr, output.ptr, m, n, k, k, k, n);
+
+    // Hand-computed reference (FP32, no BF16 round-trip in the inner sum).
+    var ref = try allocator.alloc(f32, m * n);
+    defer allocator.free(ref);
+    for (0..m) |i| {
+        for (0..n) |j| {
+            var s: f32 = 0;
+            for (0..k) |kk| {
+                s += amx.bf16_to_f32(input[i * k + kk]) * amx.bf16_to_f32(weight[j * k + kk]);
+            }
+            ref[i * n + j] = s;
+        }
+    }
+
+    // Tolerance: BF16 has ~3 decimal digits; accumulation over k=32 with
+    // values up to ~3.2 contributes at most a few hundredths of relative
+    // error. 5e-2 absolute is comfortably above the FP32 round-trip drift
+    // between the two implementations.
+    for (0..m) |i| {
+        for (0..n) |j| {
+            const got = output[i * n + j];
+            const want = ref[i * n + j];
+            const diff = if (got > want) got - want else want - got;
+            try testing.expect(diff < 5e-2);
+        }
+    }
+}
+
+test "gemmExpert vectorized: k=37 (vec + scalar tail)" {
+    // 37 = 4*8 + 5. The K loop processes 32 elements in 4 vector
+    // iterations, then 5 scalar iterations. This is the case the
+    // pre-vectorization code path exercised naturally; post-A1 we
+    // need to confirm the tail boundary doesn't drop or duplicate
+    // elements.
+    const allocator = testing.allocator;
+    const m: usize = 2;
+    const n: usize = 3;
+    const k: usize = 37;
+
+    const input = try allocator.alloc(amx.bf16, m * k);
+    defer allocator.free(input);
+    const weight = try allocator.alloc(amx.bf16, n * k);
+    defer allocator.free(weight);
+    const output = try allocator.alloc(f32, m * n);
+    defer allocator.free(output);
+
+    // Use a different weight pattern from the aligned test so a wrong
+    // implementation that "happens to pass" the first test (e.g. by
+    // using a different k) would still fail this one.
+    for (0..m) |i| {
+        for (0..k) |j| {
+            input[i * k + j] = amx.f32_to_bf16(@as(f32, @floatFromInt((i * k + j) % 5 + 1)) * 0.3);
+        }
+    }
+    for (0..n) |i| {
+        for (0..k) |j| {
+            weight[i * k + j] = amx.f32_to_bf16(@as(f32, @floatFromInt((i * k + j) % 4 + 1)) * 0.2);
+        }
+    }
+    @memset(output, 0);
+
+    gemm_bf16.gemmExpert(input.ptr, weight.ptr, output.ptr, m, n, k, k, k, n);
+
+    // Hand-computed reference.
+    var ref = try allocator.alloc(f32, m * n);
+    defer allocator.free(ref);
+    for (0..m) |i| {
+        for (0..n) |j| {
+            var s: f32 = 0;
+            for (0..k) |kk| {
+                s += amx.bf16_to_f32(input[i * k + kk]) * amx.bf16_to_f32(weight[j * k + kk]);
+            }
+            ref[i * n + j] = s;
+        }
+    }
+
+    for (0..m) |i| {
+        for (0..n) |j| {
+            const got = output[i * n + j];
+            const want = ref[i * n + j];
+            const diff = if (got > want) got - want else want - got;
+            try testing.expect(diff < 5e-2);
+        }
+    }
+}

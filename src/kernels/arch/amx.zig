@@ -564,6 +564,16 @@ pub fn swiglu_oai(gate_param: f32, up_param: f32, alpha: f32, limit: f32) f32 {
 pub const VecF32 = @Vector(8, f32);
 pub const VEC_LEN: usize = 8;
 
+/// Horizontal sum of all lanes of a `VecF32` into a scalar. Used by
+/// vectorized dot products (e.g. `gemmExpert` K-axis accumulation) to
+/// fold a 256-bit vector register into a single f32 at the end of the
+/// dot product. Zig has `@reduce(.Add, v)` for builtin ints; this
+/// wrapper provides the same for f32 specifically and is the function
+/// shape the GEMM kernel expects.
+pub fn reduceAddFp32(v: VecF32) f32 {
+    return @reduce(.Add, v);
+}
+
 /// SwiGLU: silu(gate) * up, vectorized.
 pub fn swigluVec(g: VecF32, u: VecF32) VecF32 {
     const ones: VecF32 = @splat(1.0);
