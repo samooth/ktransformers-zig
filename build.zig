@@ -133,6 +133,8 @@ pub fn build(b: *std.Build) void {
     RunTest.run(b, test_step, "tests/kernels/fp8_transport_tests.zig", "src/main.zig", target, optimize);
     // Suite 4: MLA C API lifecycle (kt_mla_new/load_weights/forward/decode/free)
     RunTest.run(b, test_step, "tests/kernels/mla_capi_tests.zig", "src/main.zig", target, optimize);
+    // Suite 5: GGML quant C API (rooted at main.zig for export access)
+    RunTest.run(b, test_step, "tests/kernels/ggml_capi_tests.zig", "src/main.zig", target, optimize);
     // Suite 5: aarch64 CPU detection in selectBestVariant
     RunTest.run(b, test_step, "tests/kernels/aarch64_detect_test.zig", "src/root.zig", target, optimize);
 }

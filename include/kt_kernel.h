@@ -438,6 +438,41 @@ void kt_quantize_fp8_e4m3(const void* src, uint8_t* dst, float* scales, size_t r
 void kt_dequantize_fp8_e4m3(const uint8_t* src, const float* scales, void* dst, size_t rows, size_t cols, int block_size);
 
 // ============================================================================
+// GGML Quantization Types (byte-exact vs llama.cpp ggml-common.h)
+// ============================================================================
+// Block sizes: Q8_0 = 34 B / 32 weights, Q4_K = 144 B / 256,
+//              Q5_K = 176 B / 256, Q6_K = 210 B / 256.
+// Quantize: src is F32 [k], dst is BlockX[k/QK]; Dequantize: the reverse.
+// Matmul: a [m,k] BF16 activations, b [n, k/QK] blocks (row-major, ldb in
+// BLOCKS), c [m,n] F32 — on-the-fly dequant.
+
+/// Q8_0: quantize/dequantize one row (k must be a multiple of 32)
+void kt_quantize_q8_0(const float* src, void* dst, size_t k);
+void kt_dequantize_q8_0(const void* src, float* dst, size_t k);
+
+/// Q4_K: quantize/dequantize one row (k must be a multiple of 256)
+void kt_quantize_q4_k(const float* src, void* dst, size_t k);
+void kt_dequantize_q4_k(const void* src, float* dst, size_t k);
+
+/// Q5_K: quantize/dequantize one row (k must be a multiple of 256)
+void kt_quantize_q5_k(const float* src, void* dst, size_t k);
+void kt_dequantize_q5_k(const void* src, float* dst, size_t k);
+
+/// Q6_K: quantize/dequantize one row (k must be a multiple of 256)
+void kt_quantize_q6_k(const float* src, void* dst, size_t k);
+void kt_dequantize_q6_k(const void* src, float* dst, size_t k);
+
+/// GGML GEMMs: BF16 activations x quantized weights -> F32 output
+void kt_matmul_q8_0(const void* a, const void* b, float* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+void kt_matmul_q4_k(const void* a, const void* b, float* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+void kt_matmul_q5_k(const void* a, const void* b, float* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+void kt_matmul_q6_k(const void* a, const void* b, float* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+
+// ============================================================================
 // Utility
 // ============================================================================
 

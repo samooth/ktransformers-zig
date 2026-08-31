@@ -8,7 +8,7 @@ const memory = root.memory;
 const worker_pool = root.worker_pool;
 const task_queue = root.task_queue;
 const cpu_detect = root.cpu_detect;
-const amx = root.amx;
+pub const amx = root.amx;
 const buffers = root.buffers;
 const gemm_bf16 = root.gemm_bf16;
 const gemm_int8 = root.gemm_int8;
@@ -16,6 +16,12 @@ const gemm_int4 = root.gemm_int4;
 const gemm_fp8 = root.gemm_fp8;
 const gemm_mxfp4 = root.gemm_mxfp4;
 const gemm_mxfp8 = root.gemm_mxfp8;
+// GGML quant kernels: pub so C-API tests (rooted here) can reference the
+// block types; no ABI effect.
+pub const gemm_q8_0 = root.gemm_q8_0;
+pub const gemm_q4_k = root.gemm_q4_k;
+pub const gemm_q5_k = root.gemm_q5_k;
+pub const gemm_q6_k = root.gemm_q6_k;
 const moe = root.moe;
 const moe_sft = root.moe_sft;
 const mla_config = root.mla_config;
@@ -1606,6 +1612,103 @@ export fn kt_dequantize_fp8_e4m3(
             }
         }
     }
+}
+
+// ============================================================================
+// GGML Quantization Types (byte-exact vs llama.cpp ggml-common.h)
+// ============================================================================
+// One-row quantize/dequantize per format. The Python layer quantizes weight
+// rows with these; the block layouts match GGUF files exactly, so weights
+// loaded directly from .gguf can be passed to the matmuls below unchanged.
+
+pub export fn kt_quantize_q8_0(src: [*]const f32, dst: *anyopaque, k: usize) void {
+    gemm_q8_0.quantizeRowQ8_0(src[0..k], @ptrCast(@alignCast(dst)), k);
+}
+
+pub export fn kt_dequantize_q8_0(src: *const anyopaque, dst: [*]f32, k: usize) void {
+    gemm_q8_0.dequantizeRowQ8_0(@ptrCast(@alignCast(src)), dst[0..k], k);
+}
+
+pub export fn kt_quantize_q4_k(src: [*]const f32, dst: *anyopaque, k: usize) void {
+    gemm_q4_k.quantizeRowQ4_K(src[0..k], @ptrCast(@alignCast(dst)), k);
+}
+
+pub export fn kt_dequantize_q4_k(src: *const anyopaque, dst: [*]f32, k: usize) void {
+    gemm_q4_k.dequantizeRowQ4_K(@ptrCast(@alignCast(src)), dst[0..k], k);
+}
+
+pub export fn kt_quantize_q5_k(src: [*]const f32, dst: *anyopaque, k: usize) void {
+    gemm_q5_k.quantizeRowQ5_K(src[0..k], @ptrCast(@alignCast(dst)), k);
+}
+
+pub export fn kt_dequantize_q5_k(src: *const anyopaque, dst: [*]f32, k: usize) void {
+    gemm_q5_k.dequantizeRowQ5_K(@ptrCast(@alignCast(src)), dst[0..k], k);
+}
+
+pub export fn kt_quantize_q6_k(src: [*]const f32, dst: *anyopaque, k: usize) void {
+    gemm_q6_k.quantizeRowQ6_K(src[0..k], @ptrCast(@alignCast(dst)), k);
+}
+
+pub export fn kt_dequantize_q6_k(src: *const anyopaque, dst: [*]f32, k: usize) void {
+    gemm_q6_k.dequantizeRowQ6_K(@ptrCast(@alignCast(src)), dst[0..k], k);
+}
+
+/// GGML GEMMs: a [m,k] BF16 activations, b [n, k/QK] blocks (row-major,
+/// ldb in BLOCKS), c [m,n] F32. On-the-fly dequant (scalar kernels).
+pub export fn kt_matmul_q8_0(
+    a: [*]const amx.bf16,
+    b: [*]const gemm_q8_0.BlockQ8_0,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    gemm_q8_0.gemmQ8_0Scalar(a, lda, b, ldb, c, ldc, m, n, k);
+}
+
+pub export fn kt_matmul_q4_k(
+    a: [*]const amx.bf16,
+    b: [*]const gemm_q4_k.BlockQ4_K,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    gemm_q4_k.gemmQ4_KScalar(a, lda, b, ldb, c, ldc, m, n, k);
+}
+
+pub export fn kt_matmul_q5_k(
+    a: [*]const amx.bf16,
+    b: [*]const gemm_q5_k.BlockQ5_K,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    gemm_q5_k.gemmQ5_KScalar(a, lda, b, ldb, c, ldc, m, n, k);
+}
+
+pub export fn kt_matmul_q6_k(
+    a: [*]const amx.bf16,
+    b: [*]const gemm_q6_k.BlockQ6_K,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    gemm_q6_k.gemmQ6_KScalar(a, lda, b, ldb, c, ldc, m, n, k);
 }
 
 // ============================================================================
