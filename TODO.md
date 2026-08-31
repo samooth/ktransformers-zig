@@ -1,14 +1,145 @@
 # ktransformers-zig TODO
 
-## Status: Alpha (Build + Tests Working)
+## Status: Alpha (Build + Tests Working — dev-feedback backlog COMPLETE)
 
 Last updated: 2026-08-31
 
-**Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
-**Tests: WORKING** - `zig build test` RUNS all suites: 60 kernels (incl. Q8_K; INT4 AMX test newly analyzed) + 11 MLA + 2 FP8 + 1 MLA C API + 7 aarch64 + 9 GGML C API = 90 total pass, 0 leaks, exit 0. (Test harness now uses a simple-mode runner, `tools/test_runner.zig` — the default Zig 0.16 `--listen=-` IPC handshake fails in this environment; see LESSONS note in build.zig.)
-**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so`, each exporting 59 C API symbols.
-**Runtime: WORKING** - work-stealing worker pool (pthread mutex/cond, threads block when idle); NUMA topology via /sys and /proc/cpuinfo.
+**Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
+**Tests: WORKING** - `zig build test` RUNS all suites: 68 kernels + 11 MLA + 2 FP8 + 1 MLA C API + 9 GGML C API + 7 aarch64 + 1 neon + 2 allocator C API = **101 total pass, 0 leaks, exit 0**. (Simple-mode runner `tools/test_runner.zig` — the default Zig 0.16 `--listen=-` IPC handshake fails in this environment; see LESSONS note in build.zig.)
+**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon, each exporting **87 C API symbols** (double-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`).
+**Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6.
+**Runtime: WORKING** - work-stealing worker pool (pthread mutex/cond, threads block when idle) + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo; **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
 **SFT/LoRA: FORWARD+BACKWARD COMPLETE** - training path done; C API exports (forward_sft/backward/update_lora_weights); smoke test passes.
+**Allocator: INJECTABLE (B1)** - `kt_set_default_allocator` C-ABI vtable; all 9 context types capture-and-free symmetrically.
+
+---
+
+## ✅ Completed (2026-08-31 — dev-feedback audit, IMPROVE.md P0-P3 ALL RESOLVED)
+
+Verified audit of external dev feedback (see IMPROVE.md: which claims were
+true vs false, with file:line evidence). All real items fixed:
+
+- [x] **A2 — AMX guard was comptime-broken (P0)** — `AmxFeatures.available`
+  used `@hasField(std.Target.Cpu.Feature.Set, "amx_int8")` which is ALWAYS
+  false in Zig 0.16 (Feature.Set is a packed bitmask, not a named-field
+  struct) — every AMX intrinsic silently no-op'd even on AMX hardware and
+  on `-Dvariant=amx` builds. Fixed with comptime
+  `std.Target.x86.featureSetHas(.amx_tile)` + runtime `detectAmxSupport()`
+  (CPUID leaf 7 EBX bits 22/25 + arch_prctl XTILEDATA permission, cached in
+  an atomic). All intrinsic guards updated. (commit ff57125)
+- [x] **D1/D2/D3 — MoE latent buffer/index bugs (P0)** — D1: sequential
+  forward allocated `expert_down_out` as `hidden` (1 token) but
+  forwardDown writes `count*hidden` (overflow when an expert got >1
+  token; hidden because tests used qlen=1). D2: `forwardParallel` used
+  `gi*h+h` — loop index as stride (corruption for qlen>1; hidden for the
+  same reason). D3: `forwardGateUp/Down` passed `ldc=inter` while the
+  scratch is `m*n` with `n=inter/tp_count` (overflow for tp>1). All
+  fixed + 2 regression tests exercising qlen=3 (multi-token-per-expert and
+  cross-expert). (commit ff57125)
+- [x] **A1 — gemmExpert was pure scalar (P1)** — hot path of
+  MoE/MLP/Linear/Gate was a triple for-loop. Vectorized the K axis with
+  `@Vector(8,f32)` (AVX2 `vmulps` verified in disassembly) + scalar tail
+  for k%8. New `amx.reduceAddFp32` helper. 2 regression tests (aligned k,
+  k=37 tail boundary) vs hand-computed reference. **Measured (B2): 5.2x
+  decode gate/up, 5.3x prefill, 2.8x decode down (memory-bound), 5.0x
+  large square; maxdiff ≤ 1.7e-6.** (commit 7515468)
+- [x] **A3 — worker pool had no NUMA pinning (P1)** — `Subpool.init` now
+  takes `?[]const usize` CPU list; every worker calls
+  `numa.setThreadAffinity` (sched_setaffinity) as its FIRST action.
+  `WorkerPoolConfig.subpool_thread_cpus` plumbs lists through.
+  `NumaAllocator.alloc` calls real `mbind` (closes the old "TODO:
+  numactl/libnuma"). Fixed Zig 0.16 comptime_int|runtime rot in
+  `bindMemory` en route. root.zig comptime fn-refs force the NUMA
+  helpers into the .so (`nm` verified). Regression test: spawned worker
+  observes itself on the pinned CPU set via getcpu. (commit c35a526)
+- [x] **D4 — kt_gate_forward ignored DeepSeek-V3 routing fields (P1)** —
+  n_group/topk_group/norm_topk_prob/routed_scaling_factor/e_score_correction_bias
+  were accepted and discarded; topk_weights were raw logits (not
+  probabilities). Implemented the full reference algorithm
+  (kt-kernel python/sft/layer.py:696-728): sigmoid scores + bias
+  correction + group-top2 sum + topk_group selection + masked final
+  top-k + sigmoid weights + optional normalize + scaling. Malformed
+  configs fall back to the legacy naive path (no panic on model load).
+  GateContext captures the routing config. 2 regression tests mirroring
+  the Python reference test (hand-computed ids+weights, normalized sum
+  == routed_scaling_factor). (commit f5443f3)
+- [x] **B2 — benchmark suite (P2)** — `bench/gemm_bench.zig` + `zig build
+  bench` step: gemmExpert vs pure-scalar reference at 4 DeepSeek-V3
+  shapes, best-of-5 CLOCK_MONOTONIC, GFLOPS + speedup + maxdiff
+  cross-check. Zig 0.16 notes: std.Timer doesn't exist (clock_gettime
+  syscall pattern); `{e:.2}` is the scientific-notation format.
+  (commit 7d2db9c)
+- [x] **A4 — no L1/L2/L3 detection (P2)** — `CpuInfo` gains
+  l1d/l1i/l2/l3_bytes populated from
+  `/sys/devices/system/cpu/cpu0/cache/index*/` (Zig 0.16 Io API:
+  `std.Io.Dir.cwd` + `readPositionalAll`; `std.fs.cwd` is gone). New
+  `selectTileParams(cpu)` derives GEMM n_block/k_block from real L2
+  (50%-of-L2 working-set budget, tile-aligned). Host measured:
+  L1d=32K L2=512K L3=16M → k_block=448 (evidence the fixed
+  K_BLOCK=1792 constant exceeds this host's L2). Kernels still use the
+  fixed constants — wiring selectTileParams in is the follow-up. 2 tests.
+  (commit ca0485a)
+- [x] **B3 — kt_cpuinfer_sync was a no-op (P2)** — `Subpool.pending_jobs`
+  atomic (incr at doWorkStealingJob entry, decr under mutex + done_cv
+  broadcast at exit) + `waitIdle(allow_n)`. `kt_cpuinfer_sync` drains
+  every subpool to the caller's allowance. Contract now holds even if
+  submit becomes fire-and-forget. Test: two job bursts drain to 0
+  pending (accounting bugs fail by deadlock). (commit ca0485a)
+- [x] **B1 — page_allocator hardcoded everywhere (P2)** — new
+  `kt_set_default_allocator(vtable|null)` C-ABI export (symbol 87):
+  userdata + alloc/free/resize fn pointers, malloc semantics. Adapter
+  bridges to std.mem.Allocator (layouts are NOT compatible — real
+  conversion, not a cast). ALL 9 context types (WorkerPool, TpMoe,
+  TpMoeSft, MlaContext, Gate, Linear, MLP, Fp8Transport) capture the
+  allocator at `*_new` and free through the CAPTURED one — swapping the
+  default between new and free is safe. Per-call scratch (MLA/Linear/
+  MLP) uses the context allocator. Bonus bug fixed: TpMoeSft.deinit
+  freed grad_inter with hardcoded page_allocator (invalid-free). 2-test
+  suite `tests/kernels/allocator_capi_tests.zig` with a tracking vtable:
+  1 alloc/1 free balanced, 0 live bytes, even after mid-lifecycle
+  default swap. (commit 15a8ea5)
+- [x] **Rejected feedback (documented in IMPROVE.md C1-C5)** —
+  kt_mla_forward is NOT a placeholder; amx.zig HAS real instructions;
+  loadWeights is NOT a no-op; there ARE 15+ numerical correctness
+  tests; the dev's kt-*.tar.gz drop-in files do NOT exist on this
+  system.
+
+---
+
+## 🟡 High Priority (Next Steps)
+
+### Runtime (follow-ups from the audit)
+
+- [ ] **Wire `selectTileParams` into the kernels** — kernels still use the
+  fixed `K_BLOCK=1792`/`N_BLOCK=256` constants; on hosts with 512K L2 that
+  exceeds the cache. The helper exists (A4) and the benchmark exists (B2)
+  to validate the change. Approach: pass TileParams into the GemmKernel
+  BufferA/B sizing at MoE init.
+- [ ] **Fix Zig 0.16 rot in the unused src/numa/ helpers** —
+  `NumaTopology.detect`, `allocNuma`, `migratePagesToNode`,
+  `getPageNodes` use dead APIs (std.fs.cwd, std.mem.page_size,
+  alignedAlloc signature). They only compile once referenced; fix on
+  first use. Wiring NumaTopology.detect would let kt_worker_pool configs
+  auto-populate `subpool_thread_cpus` from real topology.
+- [ ] **Route internal scratch through the MoE allocator** —
+  `routeExperts`' logits buffer + `routeExpertsWithOpts` scratch use
+  page_allocator (outside the B1 C-API contract, documented in the
+  allocator test). Closure: thread the captured TpMoe allocator in.
+- [ ] **`kt_mla_forward` qlen_count > 1** — paged-attention indirection
+  through page_tables is future work (panics with a clear message today).
+
+### Python Packaging
+- [x] **Minimal pybind11 wrapper — DONE (4040b5b)** — see the Tier-1 entry
+  under Completed GGML/pybind11 below. (`python/kt_kernel/` ctypes wrapper
+  remains the zero-dependency surface.)
+
+### CI/CD
+- [ ] **Run the ABI gates in CI** — `wheels.yml` builds the variants but
+  does not run `tools/verify_abi.py` (export+arity) or
+  `tools/audit_layout.py` (pybind11 layout). A symbol regression ships
+  silently otherwise.
+- [ ] **Python binding for `kt_set_default_allocator`** — symbol 87 has no
+  ctypes wrapper yet (vtable struct + install/reset).
 
 ---
 
@@ -98,7 +229,7 @@ Last updated: 2026-08-31
 - [x] **Minimal ctypes wrapper** (`python/kt_kernel/__init__.py`) — pure-Python `ctypes` wrapper that `dlopen`s the variant `.so` (auto-detected from `/proc/cpuinfo`), exposes `kt_version`, `kt_get_cpu_variant`, worker pool, CPUInfer, Linear, Gate, MLP, and bf16 conversion functions. Smoke-tested: `import kt_kernel; print(kt_kernel.kt_version())` works.
 - [x] **`pyproject.toml` + `setup.py` for `kt-kernel` wheel** — setuptools with package-data for the 6 variant `.so` files; custom `build_ext` runs `zig build all-variants` and bundles them into `python/kt_kernel/`. Verified: `python3 setup.py build_ext --inplace` → `import kt_kernel` → `kt_version()` returns `b'0.6.1-zig'`.
 - [x] **CI/CD for multi-variant wheel building** — `.github/workflows/wheels.yml` builds all 6 variants and packages the wheel.
-- [ ] Minimal pybind11 wrapper in C++ that loads Zig `.so` (optional; ctypes wrapper is functional)
+- [x] **Minimal pybind11 wrapper in C++ that loads Zig `.so`** — DONE (4040b5b): `bindings/kt_kernel_pybind.cpp` + `build.sh`, module named `kt_kernel_ext` (C++ reference drop-in), gated by `tools/audit_layout.py`. Full entry under GGML/pybind11 Tier-1 below.
 
 ### Advanced Features
 - [x] **SFT/LoRA backward pass** — forward_sft (Dev A) + backward (Dev B) complete with LoRA kernels; kt_moe_forward_sft/kt_moe_backward/kt_moe_update_lora_weights C API exports. 43/43 tests pass.
@@ -124,18 +255,19 @@ Last updated: 2026-08-31
 ## 📊 Progress Tracking
 | Component | Status | % |
 |-----------|--------|---|
-| Runtime (pool/queue/memory/cpu) | Work-stealing pool + NUMA topology + kernel wiring done (MoE + SFT paths parallel) | 100% |
-| AMX Intrinsics | Real inline asm (tile_loadconfig/loadd/stored/zero/dpbf16ps/dpbssd) | 90% |
+| Runtime (pool/queue/memory/cpu) | Work-stealing pool + sched_setaffinity pinning (A3) + waitIdle sync (B3) + mbind NumaAllocator + L1/L2/L3 detection (A4); MoE + SFT paths parallel | 100% |
+| AMX Intrinsics | Real inline asm + runtime detectAmxSupport guard (A2 fix: comptime featureSetHas + CPUID + arch_prctl) | 95% |
 | Buffer Packing | Working | 80% |
-| BF16 GEMM | Working | 70% |
+| BF16 GEMM | gemmExpert vectorized (@Vector(8,f32), A1) — 5.2x decode / 5.3x prefill measured (B2); AMX tile path verified | 85% |
 | INT8 GEMM | Working | 70% |
 | INT4/FP8/MXFP4/8 GEMM | INT4, FP8, MXFP4, MXFP8 all done (AMX + scalar fallback) | 100% |
-| MoE Orchestration | Forward + work-stealing parallel path complete (per-expert parallelism, sequential reduction); Gate C API wired; weight_ld OOB fixed | 100% |
-| SFT/LoRA Training | Forward + backward complete + work-stealing parallel forward (d1e0adb: pool-vs-sequential equivalence + backward round-trip); 4 C API exports (new_sft/forward_sft/backward/update_lora) | 100% |
-| C API | 86/86 header symbols exported by all variants; DOUBLE GATE: export check + arity audit (header prototypes match Zig export signatures exactly); all operator families + GGML + Zig extensions gated | 100% |
-| Build System | Multi-variant (6 variants, distinct .so names) | 85% |
-| Tests | 60 kernels (incl. Q8_K; INT4 AMX test newly analyzed) + 11 MLA + 2 FP8 + 1 MLA C API + 7 aarch64 + 9 GGML C API = 90 total pass, 0 leaks, zig build test exits 0 (simple-mode runner) | 100% |
-| Python Integration | ctypes wrapper incl. GGML quant bindings + pyproject.toml + CI workflow; wheel build verified | 75% |
+| GGML Quant | All 5 formats (Q8_0/Q4_K/Q5_K/Q6_K/Q8_K) byte-exact + C-API matmuls + Python bindings | 100% |
+| MoE Orchestration | Forward + work-stealing parallel + DeepSeek-V3 group-top2 routing (D4); D1/D2/D3 buffer bugs fixed with qlen>1/tp>1 regression tests | 100% |
+| SFT/LoRA Training | Forward + backward complete + work-stealing parallel forward; 4 C API exports | 100% |
+| C API | 87/87 header symbols exported by all variants; TRIPLE GATE: exports + arity (verify_abi.py) + layout (audit_layout.py); injectable allocator (B1) | 100% |
+| Build System | Multi-variant (6 x86 variants + aarch64 neon, distinct .so names) + bench step (B2) | 90% |
+| Tests | 68 kernels + 11 MLA + 2 FP8 + 1 MLA C API + 9 GGML C API + 7 aarch64 + 1 neon + 2 allocator C API = 101 total pass, 0 leaks, exit 0 | 100% |
+| Python Integration | ctypes wrapper (61+ names incl. GGML) + pybind11 drop-in (4040b5b, layout-gated) + wheel + CI; kt_set_default_allocator binding pending | 85% |
 
 ---
 
@@ -182,15 +314,21 @@ Last updated: 2026-08-31
   The reference repo are is at /ai/repos/2026/ktransformers
 
 
-### Current Status (2026-08-30)
-- **Dev A (this session)**: Linear/MLP C API wired; kt_*_config_t structs
+### Current Status (2026-08-31)
+- **Dev A (2026-08-30)**: Linear/MLP C API wired; kt_*_config_t structs
   synced with C header; MoE gemmExpert weight_ld OOB fixed (6 sites);
   multi-variant build (`zig build all-variants` → 6 .so); minimal Python
   ctypes wrapper; kt_get_cpu_variant lazy-init fixed; SFT/LoRA forward half
   (LoRA kernels, TpMoeSft, forward_sft, C API); runtime hardening (work-stealing
   worker pool, NUMA topology); allocator safety fix (TpMoe stores allocator).
-- **Dev B (concurrent)**: MXFP4/MXFP8 kernels complete; vectorized applySwiGLU
+- **Dev B (2026-08-30)**: MXFP4/MXFP8 kernels complete; vectorized applySwiGLU
   complete (bit-exact vs scalar); SFT/LoRA backward half complete (backward
   method, kt_moe_backward export).
-- **Last fully-green**: 32/32 kernels + 11/11 MLA = 43/43 total pass, 0 leaks,
-  `zig build test` exits 0.
+- **Audit session (2026-08-31)**: external-dev feedback verified against the
+  code (IMPROVE.md) and every real item fixed: P0 guard AMX + MoE buffer bugs
+  (ff57125), gemmExpert vectorization A1 (7515468, 5.2x measured), NUMA
+  pinning A3 (c35a526), DeepSeek-V3 routing D4 (f5443f3), benchmark suite B2
+  (7d2db9c), cache detection A4 + cpuinfer_sync B3 (ca0485a), injectable
+  allocator B1 (15a8ea5). ABI 86→87 symbols; tests 90→101; all P0-P3 closed.
+- **Last fully-green**: 101 tests pass, 0 leaks, `zig build test` exit 0;
+  `verify_abi.py` 87/87 + arity PASS on all variants; `zig build bench` green.
