@@ -2,6 +2,7 @@
 // Verifies basic compilation and functionality
 
 const std = @import("std");
+const builtin = @import("builtin");
 const testing = std.testing;
 
 const root = @import("kt");
@@ -147,6 +148,60 @@ test "getCpuCountPerNuma parses /proc/cpuinfo" {
     for (counts) |c| total += c;
     try testing.expect(total >= 1);
 }
+
+test "Subpool pins worker threads to the configured CPU set (A3)" {
+    // A3 regression: the worker pool claims to be NUMA-aware but the
+    // threads were never actually pinned to their NUMA node. This test
+    // spawns a Subpool with an explicit CPU list and verifies that the
+    // worker thread, once it starts, observes itself on one of the
+    // specified CPUs (via getcpu syscall). On non-Linux platforms the
+    // pinning is a no-op (comptime gate) so the test is skipped.
+    if (builtin.os.tag != .linux) return;
+
+    const allocator = testing.allocator;
+
+    // Reset the module-level observed-CPU store before each run.
+    g_observed_cpu_storage = std.atomic.Value(u32).init(std.math.maxInt(u32));
+
+    // Pin to CPUs {0, 1}. The kernel may place the worker on either
+    // (sched_setaffinity sets the allowed set, not the hard target),
+    // so the test asserts "observed CPU is in the allowed set".
+    const target_cpus = [_]usize{ 0, 1 };
+
+    const subpool = try worker_pool.Subpool.init(
+        allocator,
+        0, // idx
+        0, // numa_id
+        1, // thread_count
+        target_cpus[0..],
+        true, // enable_work_stealing
+    );
+    defer subpool.deinit(allocator);
+
+    // Run a single-task job. The task uses the getcpu syscall to read
+    // the current CPU and stores it in the module-level atomic.
+    subpool.doWorkStealingJob(1, a3ObserveCurrentCpuTask);
+
+    const observed = g_observed_cpu_storage.load(.acquire);
+    try testing.expect(observed == 0 or observed == 1);
+}
+
+/// A3 test helper: writes the current CPU (via getcpu syscall) into
+/// the module-level atomic. Pulled out as a free function because
+/// `doWorkStealingJob` takes a `*const fn(usize) void` (no context).
+fn a3ObserveCurrentCpuTask(_: usize) void {
+    var cpu: u32 = 0;
+    const rc = std.os.linux.syscall3(.getcpu, @intFromPtr(&cpu), 0, 0);
+    if (rc == 0) {
+        g_observed_cpu_storage.store(cpu, .release);
+    }
+}
+
+/// Shared storage for the A3 test above. Module-level atomic because
+/// the worker task runs in a different thread and the task signature
+/// `*const fn(usize) void` doesn't allow passing context.
+var g_observed_cpu_storage: std.atomic.Value(u32) =
+    std.atomic.Value(u32).init(std.math.maxInt(u32));
 
 test "SFT forward+backward smoke test" {
     // Verifies TpMoeSft.forward_sft + backward run without crashing and

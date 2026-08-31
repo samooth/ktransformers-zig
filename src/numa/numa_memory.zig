@@ -260,7 +260,13 @@ pub fn bindMemory(
 ) !void {
     const maxnode = 256;
     const mode = policy.toLinux();
-    const flags = if (policy == .bind) MPOL_MF_STRICT | MPOL_MF_MOVE else 0;
+    // Coerce the comptime_int flag constants to c_uint explicitly so the
+    // result is a runtime c_uint (not a comptime_int depending on a
+    // runtime conditional — which Zig 0.16 rejects).
+    const flags: c_uint = if (policy == .bind)
+        @as(c_uint, MPOL_MF_STRICT) | @as(c_uint, MPOL_MF_MOVE)
+    else
+        0;
 
     const rc = sys_mbind(addr, len, mode, node_mask.toU64Slice().ptr, maxnode, flags);
     if (rc != 0) {

@@ -99,6 +99,28 @@ comptime {
     _ = &mla_core.MlaEngine.resetCache;
 }
 
+// Force full semantic analysis of the NUMA modules. Same lazy-analysis
+// rule as MLA. A3: the runtime/worker_pool.zig imports the NUMA
+// syscalls (sched_setaffinity, mbind) at comptime, so the analysis
+// propagates naturally to setThreadAffinity and bindMemory. We force
+// those (and the NumaAllocator vtable) here so external users linking
+// against the .so can reach them without depending on internal module
+// paths. Other NUMA helpers (allocNuma, NumaTopology.detect, etc.) are
+// NOT forced — they have Zig 0.16 API rot in their implementations
+// (std.fs.cwd().access, std.mem.page_size, alignedAlloc signature) and
+// are not currently consumed by any path. They will compile when the
+// consumer is added.
+comptime {
+    _ = &numa.memory.setThreadAffinity;
+    _ = &numa.memory.pinThreadToCpu;
+    _ = &numa.memory.getThreadAffinity;
+    _ = &numa.memory.bindMemory;
+    _ = &numa.memory.setThreadNumaPolicy;
+    _ = &numa.memory.getThreadNumaPolicy;
+    _ = &numa.memory.NumaAllocator.init;
+    _ = &numa.worker.NumaWorker.spawn;
+}
+
 // Force main.zig (C API: export fn kt_*) to be semantically analyzed and
 // exported into the shared library. A plain `const _ = @import(...)` is
 // lazily stripped by the compiler and produces zero exported symbols;

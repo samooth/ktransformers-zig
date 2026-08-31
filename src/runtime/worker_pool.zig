@@ -11,16 +11,34 @@
 // Uses std.c.pthread_mutex_t/cond_t directly because Zig 0.16's std.Thread
 // has no blocking mutex/condvar (only std.atomic.Mutex spinlock). The pthread
 // primitives block the OS thread when idle — essential for a worker pool.
+//
+// NUMA pinning: each Subpool can optionally carry a CPU list (slice of
+// physical CPU indices). When set, every worker thread spawned by the
+// subpool pins itself to that set via sched_setaffinity before entering
+// the main loop. This is the A3 integration: the NUMA syscalls
+// (sched_setaffinity, mbind, set_mempolicy) are implemented in
+// src/numa/numa_memory.zig; this file is the consumer that closes the
+// "the threads aren't actually pinned" gap.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const c = std.c;
+const numa_mem = @import("../numa/numa_memory.zig");
 
 /// Worker pool configuration
 pub const WorkerPoolConfig = struct {
     subpool_count: usize = 1,
     subpool_numa_map: []usize = &.{}, // owned, freed by deinit
     subpool_thread_count: []usize = &.{}, // owned, freed by deinit
+    /// Optional per-subpool CPU lists. Indexing matches `subpool_count`; each
+    /// element is a slice of physical CPU indices the subpool's worker
+    /// threads should pin to via sched_setaffinity. Pass `null` for a
+    /// subpool to skip pinning (e.g. on a single-socket host where
+    /// pinning is a no-op). The slices themselves must outlive the
+    /// WorkerPool (they are NOT owned by WorkerPoolConfig — typically
+    /// allocated by the caller and freed in its own deinit).
+    subpool_thread_cpus: ?[]const ?[]const usize = null,
     enable_work_stealing: bool = true,
     allocator: Allocator = std.heap.page_allocator,
 
@@ -58,6 +76,11 @@ pub const Subpool = struct {
     idx: usize,
     numa_id: usize,
     thread_count: usize,
+    /// CPU list to pin all worker threads of this subpool to. `null`
+    /// means no pinning (workers run on whatever CPUs the scheduler
+    /// picks). Otherwise the slice is borrowed (not owned) and must
+    /// outlive the Subpool.
+    thread_cpus: ?[]const usize,
 
     // Work-stealing state
     task_curr: std.atomic.Value(usize),
@@ -77,6 +100,7 @@ pub const Subpool = struct {
         idx: usize,
         numa_id: usize,
         thread_count: usize,
+        thread_cpus: ?[]const usize,
         _enable_work_stealing: bool,
     ) !*Subpool {
         _ = _enable_work_stealing;
@@ -89,6 +113,7 @@ pub const Subpool = struct {
             .idx = idx,
             .numa_id = numa_id,
             .thread_count = thread_count,
+            .thread_cpus = thread_cpus,
             .task_curr = std.atomic.Value(usize).init(0),
             .task_end = 0,
             .work_fn = null,
@@ -101,13 +126,39 @@ pub const Subpool = struct {
         };
 
         for (0..thread_count) |t| {
-            threads[t] = try std.Thread.spawn(.{}, workerLoop, .{subpool});
+            threads[t] = try std.Thread.spawn(.{}, workerLoop, .{ subpool });
         }
 
         return subpool;
     }
 
+    /// First action every worker thread takes: pin itself to the
+    /// subpool's CPU list (if any) before entering the work-stealing
+    /// loop. Without this, the kernel scheduler can move the thread
+    /// between NUMA nodes mid-job, which on a dual-socket host means
+    /// ~50% of MoE weight reads go cross-socket. This is the A3 fix.
+    ///
+    /// On non-Linux (aarch64 macOS, Windows) sched_setaffinity doesn't
+    /// exist; the pinning is a no-op via comptime.
+    fn pinWorkerToSubpoolCpus(self: *Subpool) void {
+        if (comptime builtin.os.tag != .linux) return;
+        const cpus = self.thread_cpus orelse return;
+        if (cpus.len == 0) return;
+        // Best-effort: if the kernel rejects the mask (e.g. an invalid
+        // CPU index slipped in from topology detection), leave the
+        // thread un-pinned. The scheduler will still place it on a
+        // valid CPU and the work continues — at slightly reduced
+        // NUMA affinity, not at a correctness risk.
+        numa_mem.setThreadAffinity(cpus) catch {};
+    }
+
     fn workerLoop(self: *Subpool) void {
+        // A3: pin to subpool's CPUs as the very first thing the
+        // thread does. This guarantees the thread is on the right
+        // NUMA node before any work-loop work (and before any memory
+        // allocations, which would otherwise be on the wrong node).
+        self.pinWorkerToSubpoolCpus();
+
         while (true) {
             // Wait for work or shutdown
             _ = c.pthread_mutex_lock(&self.mutex);
@@ -198,12 +249,22 @@ pub const WorkerPool = struct {
     pub fn init(allocator: Allocator, config: WorkerPoolConfig) !WorkerPool {
         const subpools = try allocator.alloc(*Subpool, config.subpool_count);
 
+        // A3: if the caller provided per-subpool CPU lists, pass them
+        // through to Subpool.init so each worker can pin itself. If not
+        // provided, pass null (= no pinning) to preserve pre-A3 behavior.
+        const cpu_lists: ?[]const ?[]const usize = config.subpool_thread_cpus;
+
         for (0..config.subpool_count) |i| {
+            const subpool_cpus: ?[]const usize = if (cpu_lists) |lists|
+                if (i < lists.len) lists[i] else null
+            else
+                null;
             subpools[i] = try Subpool.init(
                 allocator,
                 i,
                 config.subpool_numa_map[i],
                 config.subpool_thread_count[i],
+                subpool_cpus,
                 config.enable_work_stealing,
             );
         }

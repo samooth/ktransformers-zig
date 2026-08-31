@@ -2,7 +2,9 @@
 // Provides aligned allocation, NUMA-aware allocation, and huge page support
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
+const numa_mem = @import("../numa/numa_memory.zig");
 
 /// Arena allocator with 64-byte alignment for SIMD/AMX buffers
 pub const SimdArena = struct {
@@ -42,18 +44,43 @@ pub const SimdArena = struct {
 };
 
 /// NUMA-aware memory allocation
+///
+/// On Linux, allocations are bound to `numa_node` via `mbind` so the
+/// kernel places the pages on the same NUMA node that will read them.
+/// On non-Linux, the `numa_node` field is ignored and the call falls
+/// through to a regular aligned alloc (the A3 fix: previously the
+/// field was stored but never used — see the old "TODO: Use
+/// numactl/libnuma" comment below).
 pub const NumaAllocator = struct {
     allocator: Allocator,
     numa_node: ?usize,
+    /// Page migration strictness: when the kernel can't satisfy the
+    /// mbind (e.g. pages already allocated elsewhere), should we
+    /// migrate them (MPOL_MF_MOVE) or fail silently? Defaults to
+    /// "migrate if possible, otherwise best-effort". This matches the
+    /// behavior of `src/numa/numa_memory.zig::bindMemory` which retries
+    /// without STRICT | MOVE if the first attempt fails.
+    migrate_on_miss: bool = true,
 
     pub fn init(allocator: Allocator, numa_node: ?usize) NumaAllocator {
         return .{ .allocator = allocator, .numa_node = numa_node };
     }
 
     pub fn alloc(self: *NumaAllocator, comptime T: type, count: usize) ![]T {
-        // TODO: Use numactl/libnuma for actual NUMA allocation
-        // For now, fall back to regular aligned alloc
         const mem = self.allocator.alignedAlloc(64, count * @sizeOf(T));
+        if (comptime builtin.os.tag == .linux) {
+            if (self.numa_node) |node| {
+                var mask = numa_mem.NumaNodeMask.init();
+                mask.set(node);
+                // best-effort: the helper retries without STRICT on
+                // failure and silently drops the binding if even that
+                // fails. Production MoE weights can be huge (GiB) and
+                // partial binding (some pages on the right node) is
+                // better than OOM. The helper already handles the
+                // MPOL_MF_MOVE flag based on the policy.
+                numa_mem.bindMemory(@ptrCast(mem.ptr), mem.len, mask, .bind) catch {};
+            }
+        }
         return @as([*]T, @ptrCast(@alignCast(mem.ptr)))[0..count];
     }
 
