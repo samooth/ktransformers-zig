@@ -671,10 +671,26 @@ const MlaContext = struct {
     engine: *mla_core.MlaEngine,
     cache: *mla_cache.MlaKvCache,
     allocator: std.mem.Allocator,
+    /// Mirrors the C++ reference's TP_MLA_Common::weights_loaded (mla-tp.hpp:39):
+    /// forward() throws "Not Loaded" unless load_weights() ran first. The Zig
+    /// engine already holds the weight pointers from kt_mla_new (no NUMA copy
+    /// pass needed), so this is a state flag set by kt_mla_load_weights.
+    weights_loaded: bool = false,
 };
 
-export fn kt_mla_new(cpuinfer: *KT_CPUInfer, config: kt_mla_config_t) *KT_MLA {
+pub export fn kt_mla_new(cpuinfer: *KT_CPUInfer, config: kt_mla_config_t) *KT_MLA {
     _ = cpuinfer; // engine is sequential-heads, no NUMA dispatch yet
+
+    // Validate the full MLA weight set up front. The C header types these as
+    // *anyopaque (non-nullable), but a Python/caller bug could still pass 0.
+    // The engine stores raw pointers — catching it here is the only sane spot.
+    if (@intFromPtr(config.q_a_proj) == 0 or @intFromPtr(config.q_a_norm) == 0 or
+        @intFromPtr(config.q_b_proj) == 0 or @intFromPtr(config.kv_a_proj_with_mqa) == 0 or
+        @intFromPtr(config.kv_a_norm) == 0 or @intFromPtr(config.kv_b_proj) == 0 or
+        @intFromPtr(config.o_proj) == 0)
+    {
+        @panic("kt_mla_new: null weight pointer(s) in MLA config");
+    }
 
     // 1. Map C config -> internal MlaConfig
     const mla_cfg = mla_config.MlaConfig{
@@ -714,13 +730,23 @@ export fn kt_mla_new(cpuinfer: *KT_CPUInfer, config: kt_mla_config_t) *KT_MLA {
     return @ptrCast(ctx);
 }
 
-export fn kt_mla_free(mla: *KT_MLA) void {
+pub export fn kt_mla_free(mla: *KT_MLA) void {
     const ctx: *MlaContext = @ptrCast(@alignCast(mla));
     ctx.engine.deinit();
     ctx.cache.deinit();
     std.heap.page_allocator.destroy(ctx.engine);
     std.heap.page_allocator.destroy(ctx.cache);
     std.heap.page_allocator.destroy(ctx);
+}
+
+/// Mark weights as loaded (C++ reference: TP_MLA_Common::load_weights sets
+/// weights_loaded=true; forward() throws "Not Loaded" without it —
+/// mla-tp.hpp:39,86). The Zig engine binds weight pointers at kt_mla_new
+/// (no separate NUMA copy pass), so this is a state flag that gates
+/// forward/prefill/decode. Null-pointer validation happens in kt_mla_new.
+pub export fn kt_mla_load_weights(mla: *KT_MLA) void {
+    const ctx: *MlaContext = @ptrCast(@alignCast(mla));
+    ctx.weights_loaded = true;
 }
 
 /// Shared implementation for forward and prefill.
@@ -734,6 +760,9 @@ fn mlaForwardImpl(
     qlen: usize,
     kvlen: usize,
 ) void {
+    if (!ctx.weights_loaded) {
+        @panic("kt_mla_forward: weights not loaded (call kt_mla_load_weights first)");
+    }
     const cfg = ctx.engine.config;
 
     // BF16 -> F32 input conversion
@@ -757,7 +786,7 @@ fn mlaForwardImpl(
     }
 }
 
-export fn kt_mla_forward(
+pub export fn kt_mla_forward(
     mla: *KT_MLA,
     input: [*]const amx.bf16,
     output: [*]amx.bf16,
@@ -770,7 +799,7 @@ export fn kt_mla_forward(
     mlaForwardImpl(ctx, input, output, @intCast(qlen), @intCast(kvlen));
 }
 
-export fn kt_mla_prefill(
+pub export fn kt_mla_prefill(
     mla: *KT_MLA,
     input: [*]const amx.bf16,
     output: [*]amx.bf16,
@@ -784,7 +813,7 @@ export fn kt_mla_prefill(
     mlaForwardImpl(ctx, input, output, @intCast(qlen), kvlen);
 }
 
-export fn kt_mla_decode(
+pub export fn kt_mla_decode(
     mla: *KT_MLA,
     input: [*]const amx.bf16,
     output: [*]amx.bf16,
@@ -795,7 +824,7 @@ export fn kt_mla_decode(
     mlaForwardImpl(ctx, input, output, 1, @as(usize, @intCast(position_id)) + 1);
 }
 
-export fn kt_mla_update_kv_cache(
+pub export fn kt_mla_update_kv_cache(
     mla: *KT_MLA,
     kv_cache: *anyopaque,
     new_kv: [*]const amx.bf16,

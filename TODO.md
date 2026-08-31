@@ -5,7 +5,7 @@
 Last updated: 2026-08-31
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`
-**Tests: WORKING** - `zig build test` RUNS all suites: 34 kernels + 11 MLA + 2 FP8 transport = 47 total pass, 0 leaks, exit 0. (Test harness now uses a simple-mode runner, `tools/test_runner.zig` — the default Zig 0.16 `--listen=-` IPC handshake fails in this environment; see LESSONS note in build.zig.)
+**Tests: WORKING** - `zig build test` RUNS all suites: 34 kernels + 11 MLA + 2 FP8 transport + 1 MLA C API = 48 total pass, 0 leaks, exit 0. (Test harness now uses a simple-mode runner, `tools/test_runner.zig` — the default Zig 0.16 `--listen=-` IPC handshake fails in this environment; see LESSONS note in build.zig.)
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so`, each exporting 59 C API symbols.
 **Runtime: WORKING** - work-stealing worker pool (pthread mutex/cond, threads block when idle); NUMA topology via /sys and /proc/cpuinfo.
 **SFT/LoRA: FORWARD+BACKWARD COMPLETE** - training path done; C API exports (forward_sft/backward/update_lora_weights); smoke test passes.
@@ -72,7 +72,7 @@ Last updated: 2026-08-31
 - [x] **Linear/MLP (`kt_linear_*`, `kt_mlp_*`)** — both wrap a real GEMM (BF16 weight + BF16 input → F32 output → BF16 output). Linear = 1 GEMM; MLP = gate GEMM + up GEMM + F32 SwiGLU + BF16 round-trip + down GEMM. Also fixed `kt_linear_config_t` / `kt_mlp_config_t` / `kt_gate_config_t` to match the C header field names (was: `weight_ptr`/`dtype`; now: `weight`/`weight_type` for Gate, `proj`/`proj_type`/`hidden_type` for Linear, `gate_proj`/`up_proj`/`down_proj`/`*_type`/`hidden_type` for MLP). Linear+MLP end-to-end test in test_kernels.zig exercises the same pipeline via `gemm_bf16` directly. 25/25 tests pass.
 - [x] **SFT/LoRA backward pass** (Dev B) — `TpMoeSft.backward` computes grad_input, 6 LoRA grads (gate/up/down × A/B), base-weight grads, routing-weight grads. `kt_moe_backward` C API export. Smoke test passes (43/43 total).
 - [x] **FP8 layerwise transport (`kt_fp8_*`) — #4 DONE (2026-08-31, verified by coordinator)** — all 10 symbols implemented in `src/main.zig` (+351 lines): `kt_fp8_layerwise_init`, `kt_fp8_transport_{new,free,close,closed,rank,tp_size,num_experts,run_producer,wait}`. Callback-only plumbing per spec (real dequant+GEMM stays in the caller via `kt_matmul_fp8`); `cuda_device`/`local_gpu_ptrs`/`timeout_ms` documented no-ops (CPU port); pointer math matches reference layout `(slot * tp_size + rank) * 4 + kind`, slot = expert % 2 (fp8_layerwise_transport.cpp:409-417); `Fp8ControlHeader` extern struct mirrors fp8_layerwise_transport.cpp:49-56. Verification (evidence standard): 6 variants build exit 0; `zig build test` 47/47 (34 kernels + 11 MLA + 2 new FP8 transport tests), 0 leaks, exit 0; `tools/verify_abi.py` confirms all 10 transport symbols exported by every variant — only `kt_mla_load_weights` remains missing (next item). Tests: `tests/kernels/fp8_transport_tests.zig` (lifecycle + exact reference pointer-math assertions + null-handle sentinels), wired as third suite in `build.zig`.
-- [ ] `kt_mla_load_weights` C API — declared in `include/kt_kernel.h`, not yet exported by any variant. **This is now the FINAL ABI gap** (10 `kt_fp8_transport_*` are done). `tools/verify_abi.py` target state: full PASS on all 6 variants.
+- [x] **`kt_mla_load_weights` C API — DONE (2026-08-31) — ABI is now 100% complete against the header.** Mirrors the C++ reference semantics (TP_MLA_Common::load_weights sets `weights_loaded`; forward() throws "Not Loaded" without it — mla-tp.hpp:39,86): `MlaContext.weights_loaded` flag set by `kt_mla_load_weights`; `mlaForwardImpl` (covers forward/prefill/decode) panics with a clear message if called before load_weights. `kt_mla_new` additionally validates all 7 weight pointers non-null up front (C header types them non-nullable `*anyopaque`, but a caller bug passing 0 would otherwise surface as a far-away segfault). All 7 `kt_mla_*` exports marked `pub` for Zig-level test access (no ABI change). Verification: `tools/verify_abi.py` **full PASS — all 53 declared symbols exported by all 6 variants** (first time); `zig build test` 48/48 (34 kernels + 11 MLA + 2 fp8 + 1 new MLA C-API lifecycle test `tests/kernels/mla_capi_tests.zig`, fourth suite), 0 leaks, exit 0; 6 variants build exit 0.
 
 ---
 
@@ -123,9 +123,9 @@ Last updated: 2026-08-31
 | INT4/FP8/MXFP4/8 GEMM | INT4, FP8, MXFP4, MXFP8 all done (AMX + scalar fallback) | 100% |
 | MoE Orchestration | Forward + work-stealing parallel path complete (per-expert parallelism, sequential reduction); Gate C API wired; weight_ld OOB fixed | 100% |
 | SFT/LoRA Training | Forward + backward complete + work-stealing parallel forward (d1e0adb: pool-vs-sequential equivalence + backward round-trip); 4 C API exports (new_sft/forward_sft/backward/update_lora) | 100% |
-| C API | MLA + MoE + Gate + Linear + MLP + SFT backward + FP8 transport complete; only `kt_mla_load_weights` missing | 95% |
+| C API | 53/53 header symbols exported by all 6 variants (verify_abi.py full PASS); MLA + MoE + Gate + Linear + MLP + SFT backward + FP8 transport + load_weights complete | 100% |
 | Build System | Multi-variant (6 variants, distinct .so names) | 85% |
-| Tests | 34/34 kernels + 11 MLA + 2 FP8 transport = 47 total pass, 0 leaks, zig build test exits 0 (simple-mode runner) | 100% |
+| Tests | 34 kernels + 11 MLA + 2 FP8 + 1 MLA C API = 48 total pass, 0 leaks, zig build test exits 0 (simple-mode runner) | 100% |
 | Python Integration | ctypes wrapper + pyproject.toml + CI workflow; wheel build verified | 60% |
 
 ---

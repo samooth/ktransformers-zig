@@ -131,4 +131,6 @@ pub fn build(b: *std.Build) void {
     // Suite 3: FP8 layerwise transport (kt from main.zig — export fn symbols
     // live in main.zig and are not re-exportable as root.zig namespace members)
     RunTest.run(b, test_step, "tests/kernels/fp8_transport_tests.zig", "src/main.zig", target, optimize);
+    // Suite 4: MLA C API lifecycle (kt_mla_new/load_weights/forward/decode/free)
+    RunTest.run(b, test_step, "tests/kernels/mla_capi_tests.zig", "src/main.zig", target, optimize);
 }
