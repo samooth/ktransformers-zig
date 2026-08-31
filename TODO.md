@@ -113,7 +113,7 @@ Last updated: 2026-08-31
 
 ### Documentation
 - [ ] API documentation (zig doc)
-- [ ] Porting guide from C++
+- [x] **Porting guide from C++** — `docs/porting-guide.md` (181 lines, committed in `e2c900d`): C++ reference file map → Zig counterpart map, lazy-analysis wiring pattern, comptime fn-ref pattern for `.so` symbol emission, AMX arch-gate, the bf16 f16 cast (Zig 0.16 native f16 vs hand-rolled bit math), and the `@Vector` indexing gotchas. Linked from AGENTS.md.
 
 ---
 
