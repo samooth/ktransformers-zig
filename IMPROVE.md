@@ -481,14 +481,14 @@ Estos no estaban en el feedback del dev pero aparecen al verificarlo:
 | P0 | A2 — Guard AMX roto: `AmxFeatures.available` siempre `false`; `-Dvariant=amx` no emite AMX | Bajo | ✅ Resuelto en `ff57125` |
 | P0 | D2 — Indexación incorrecta en `forwardParallel` | Bajo | ✅ Resuelto en `ff57125` |
 | P0 | D1, D3 — Buffer overflows latentes en path secuencial / multi-TP | Bajo | ✅ Resuelto en `ff57125` |
-| P1 | A1 — Vectorizar `gemmExpert` | Medio | ⏳ Pendiente |
-| P1 | A3 — Integrar `src/numa/` en `runtime/worker_pool.zig` (sched_setaffinity + mbind) | Medio | ⏳ Pendiente |
-| P1 | D4 — Implementar routing DeepSeek-V3 o documentar la limitación | Medio | ⏳ Pendiente |
-| P2 | A4 — Detección de L1/L2/L3 en `cpu_detect.zig` | Bajo | ⏳ Pendiente |
-| P2 | B1 — Inyección de allocator en C API | Medio | ⏳ Pendiente |
-| P2 | B2 — Benchmark suite | Medio-Alto | ⏳ Pendiente |
-| P2 | B3 — `kt_cpuinfer_sync` real o eliminar | Bajo | ⏳ Pendiente |
-| P3 | B4 — Test que `nm -D` exporta los símbolos de `include/kt_kernel.h` | Bajo | ✅ Parcialmente mitigado por `tools/verify_abi.py` en `ff57125` |
+| P1 | A1 — Vectorizar `gemmExpert` | Medio | ✅ Resuelto en `7515468` (5.2x medido en B2) |
+| P1 | A3 — Integrar `src/numa/` en `runtime/worker_pool.zig` (sched_setaffinity + mbind) | Medio | ✅ Resuelto en `c35a526` |
+| P1 | D4 — Implementar routing DeepSeek-V3 o documentar la limitación | Medio | ✅ Resuelto en `f5443f3` |
+| P2 | A4 — Detección de L1/L2/L3 en `cpu_detect.zig` | Bajo | ✅ Resuelto en `ca0485a` (L1d=32K L2=512K L3=16M medidos; `selectTileParams` deriva k_block=448) |
+| P2 | B1 — Inyección de allocator en C API | Medio | ✅ Resuelto en `15a8ea5` (`kt_set_default_allocator`, 87 símbolos ABI) |
+| P2 | B2 — Benchmark suite | Medio-Alto | ✅ Resuelto en `7d2db9c` (`zig build -Doptimize=ReleaseFast bench`) |
+| P2 | B3 — `kt_cpuinfer_sync` real o eliminar | Bajo | ✅ Resuelto en `ca0485a` (pending_jobs + waitIdle) |
+| P3 | B4 — Test que `nm -D` exporta los símbolos de `include/kt_kernel.h` | Bajo | ✅ Mitigado por `tools/verify_abi.py` en `ff57125` (doble gate) |
 
 ---
 
