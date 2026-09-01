@@ -678,4 +678,27 @@ void kt_dsv3_layer_free(KT_DSV3Layer* layer);
 void kt_dsv3_layer_forward(KT_DSV3Layer* layer, size_t qlen, size_t kv_start_pos,
                            const void* input, void* output);
 
+// --- DeepseekV3Model (N-layer loop + final RMSNorm) / ForCausalLM (+ lm_head) ---
+typedef struct kt_dsv3_model_config_t {
+    size_t num_layers;
+    kt_dsv3_layer_config_t layer;       /* per-layer template */
+    const void* final_norm_weight;     /* BF16 [hidden_size] */
+    const void* lm_head;               /* BF16 [vocab_size, hidden_size]; CausalLM only */
+    size_t vocab_size;                 /* 0 = model-only */
+} kt_dsv3_model_config_t;
+
+typedef struct KT_DSV3Model KT_DSV3Model;
+typedef struct KT_DSV3CausalLM KT_DSV3CausalLM;
+
+KT_DSV3Model* kt_dsv3_model_new(const kt_dsv3_model_config_t* config);
+void kt_dsv3_model_forward(KT_DSV3Model* model, size_t qlen, size_t kv_start_pos,
+                           const void* input, void* output);
+void kt_dsv3_model_free(KT_DSV3Model* model);
+
+KT_DSV3CausalLM* kt_dsv3_causallm_new(const kt_dsv3_model_config_t* config);
+/* logits: f32 [qlen, vocab_size] */
+void kt_dsv3_causallm_forward(KT_DSV3CausalLM* clm, size_t qlen, size_t kv_start_pos,
+                              const void* input, float* logits);
+void kt_dsv3_causallm_free(KT_DSV3CausalLM* clm);
+
 #endif // KTRANSFORMERS_C_API_H

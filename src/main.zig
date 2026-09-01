@@ -31,6 +31,7 @@ const mla_core = root.mla_core;
 // DeepseekV3DecoderLayer orchestration (WIP by the model-orchestration dev;
 // root re-exports it from kernels/moe/deepseekv3_layer.zig).
 const deepseekv3_layer = root.deepseekv3_layer;
+const deepseekv3_model = root.deepseekv3_model;
 
 // ============================================================================
 // C API Types
@@ -1248,6 +1249,79 @@ pub export fn kt_dsv3_layer_forward(
 pub export fn kt_dsv3_layer_free(layer: *KT_DSV3Layer) void {
     const l: *deepseekv3_layer.DeepseekV3DecoderLayer = @ptrCast(@alignCast(layer));
     l.deinit();
+}
+
+// ============================================================================
+// DeepseekV3Model + ForCausalLM (model-level orchestration — Zig extension)
+// ============================================================================
+// The model wraps N DecoderLayers + final RMSNorm; the CausalLM adds the
+// lm_head GEMM. Config reuses kt_dsv3_layer_config_t for the per-layer
+// template plus the model-level fields (num_layers, final_norm_weight,
+// lm_head, vocab_size).
+
+pub const kt_dsv3_model_config_t = extern struct {
+    num_layers: usize,
+    layer: kt_dsv3_layer_config_t, // per-layer template (all fields)
+    final_norm_weight: *const anyopaque, // BF16 [hidden_size]
+    lm_head: *const anyopaque, // BF16 [vocab_size, hidden_size] (CausalLM only)
+    vocab_size: usize, // 0 = Model-only (no lm_head)
+};
+
+const KT_DSV3Model = opaque {};
+const KT_DSV3CausalLM = opaque {};
+
+fn toModelConfig(c: kt_dsv3_model_config_t) deepseekv3_model.ModelConfig {
+    return .{
+        .num_layers = c.num_layers,
+        .layer = toLayerConfig(c.layer),
+        .final_norm_weight = @ptrCast(@alignCast(c.final_norm_weight)),
+    };
+}
+
+pub export fn kt_dsv3_model_new(config: *const kt_dsv3_model_config_t) *KT_DSV3Model {
+    const model = deepseekv3_model.DeepseekV3Model.init(defaultAllocator(), toModelConfig(config.*)) catch @panic("Failed to init DSV3 model");
+    return @ptrCast(model);
+}
+
+pub export fn kt_dsv3_model_forward(
+    model: *KT_DSV3Model,
+    qlen: usize,
+    kv_start_pos: usize,
+    input: [*]const amx.bf16,
+    output: [*]amx.bf16,
+) void {
+    const m: *deepseekv3_model.DeepseekV3Model = @ptrCast(@alignCast(model));
+    m.forward(qlen, kv_start_pos, input, output);
+}
+
+pub export fn kt_dsv3_model_free(model: *KT_DSV3Model) void {
+    const m: *deepseekv3_model.DeepseekV3Model = @ptrCast(@alignCast(model));
+    m.deinit();
+}
+
+pub export fn kt_dsv3_causallm_new(config: *const kt_dsv3_model_config_t) *KT_DSV3CausalLM {
+    const clm = deepseekv3_model.DeepseekV3ForCausalLM.init(defaultAllocator(), .{
+        .model = toModelConfig(config.*),
+        .lm_head = @ptrCast(@alignCast(config.lm_head)),
+        .vocab_size = config.vocab_size,
+    }) catch @panic("Failed to init DSV3 CausalLM");
+    return @ptrCast(clm);
+}
+
+pub export fn kt_dsv3_causallm_forward(
+    clm: *KT_DSV3CausalLM,
+    qlen: usize,
+    kv_start_pos: usize,
+    input: [*]const amx.bf16,
+    logits: [*]f32,
+) void {
+    const c: *deepseekv3_model.DeepseekV3ForCausalLM = @ptrCast(@alignCast(clm));
+    c.forward(qlen, kv_start_pos, input, logits);
+}
+
+pub export fn kt_dsv3_causallm_free(clm: *KT_DSV3CausalLM) void {
+    const c: *deepseekv3_model.DeepseekV3ForCausalLM = @ptrCast(@alignCast(clm));
+    c.deinit();
 }
 
 // ============================================================================
