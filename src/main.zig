@@ -28,6 +28,9 @@ const moe_sft = root.moe_sft;
 const mla_config = root.mla_config;
 const mla_cache = root.mla_cache;
 const mla_core = root.mla_core;
+// DeepseekV3DecoderLayer orchestration (WIP by the model-orchestration dev;
+// root re-exports it from kernels/moe/deepseekv3_layer.zig).
+const deepseekv3_layer = root.deepseekv3_layer;
 
 // ============================================================================
 // C API Types
@@ -283,6 +286,7 @@ pub const KT_CPUInfer = opaque {};
 pub const KT_WorkerPool = opaque {};
 pub const KT_MOE = opaque {};
 pub const KT_MLA = opaque {};
+pub const KT_DSV3Layer = opaque {};
 pub const KT_Gate = opaque {};
 pub const KT_Linear = opaque {};
 pub const KT_MLP = opaque {};
@@ -646,14 +650,34 @@ export fn kt_worker_pool_get_thread_num(pool: *KT_WorkerPool) c_int {
 // CPU Infer
 // ============================================================================
 
+/// A4 wiring: derive GEMM tile block sizes from the host's measured cache
+/// hierarchy and install them into the BF16 kernel before any operator
+/// construction. Best-effort — on detection failure the compiled-in
+/// defaults (K_BLOCK=1792/N_BLOCK=256) hold. Idempotent and cheap after
+/// the first call (CPU detect is cached by cpu_detect itself? No — detect
+/// allocates; we run it once per kt_cpuinfer_new call, which matches the
+/// reference lifecycle: one CPUInfer per process).
+fn tuneTileParamsForHost() void {
+    const allocator = defaultAllocator();
+    var cpu = cpu_detect.detectCpu(allocator) catch {
+        gemm_bf16.GemmKernel224BF.resetTileParams();
+        return;
+    };
+    defer cpu.deinit(allocator);
+    const tp = cpu_detect.selectTileParams(cpu);
+    gemm_bf16.GemmKernel224BF.setTileParams(tp.n_block, tp.k_block);
+}
+
 export fn kt_cpuinfer_new(thread_count: c_int) *KT_CPUInfer {
     detect_cpu_variant();
+    tuneTileParamsForHost();
     kt_ggml_init();
     return @ptrCast(kt_worker_pool_new(thread_count));
 }
 
 export fn kt_cpuinfer_new_config(config: kt_worker_pool_config_t) *KT_CPUInfer {
     detect_cpu_variant();
+    tuneTileParamsForHost();
     kt_ggml_init();
     return @ptrCast(kt_worker_pool_new_config(config));
 }
@@ -1125,6 +1149,105 @@ pub export fn kt_mla_update_kv_cache(
     }
 
     ctx.cache.appendToken(nope_f32.ptr, rope_f32.ptr) catch @panic("appendToken failed");
+}
+
+// ============================================================================
+// DeepseekV3 Decoder Layer (model orchestration — Zig extension)
+// ============================================================================
+// Mirrors kt_dsv3_layer_config_t in include/kt_kernel.h exactly (the C ABI
+// contract; verify with tools/audit_layout.py if extended).
+
+pub const kt_dsv3_layer_config_t = extern struct {
+    hidden_size: usize,
+    q_lora_rank: usize,
+    num_heads: usize,
+    nope_size: usize,
+    rope_size: usize,
+    kv_lora_rank: usize,
+    max_qlen: usize,
+    max_kvlen: usize,
+    token_count_in_page: usize,
+    rope_theta: f64,
+    expert_num: usize,
+    num_experts_per_tok: usize,
+    intermediate_size: usize,
+    n_group: usize,
+    topk_group: usize,
+    norm_topk_prob: c_int,
+    routed_scaling_factor: f32,
+    pool: ?*anyopaque,
+    q_a_proj: *const anyopaque,
+    q_a_norm: *const anyopaque,
+    q_b_proj: *const anyopaque,
+    kv_a_proj_with_mqa: *const anyopaque,
+    kv_a_norm: *const anyopaque,
+    kv_b_proj: *const anyopaque,
+    o_proj: *const anyopaque,
+    attn_norm_weight: *const anyopaque,
+    ffn_norm_weight: *const anyopaque,
+    gate_weight: *const anyopaque,
+    e_score_correction_bias: ?*const anyopaque,
+    gate_proj: *const anyopaque,
+    up_proj: *const anyopaque,
+    down_proj: *const anyopaque,
+};
+
+fn toLayerConfig(c: kt_dsv3_layer_config_t) deepseekv3_layer.LayerConfig {
+    return .{
+        .hidden_size = c.hidden_size,
+        .q_lora_rank = c.q_lora_rank,
+        .num_heads = c.num_heads,
+        .nope_size = c.nope_size,
+        .rope_size = c.rope_size,
+        .kv_lora_rank = c.kv_lora_rank,
+        .max_qlen = c.max_qlen,
+        .max_kvlen = c.max_kvlen,
+        .token_count_in_page = c.token_count_in_page,
+        .rope_theta = c.rope_theta,
+        .expert_num = c.expert_num,
+        .num_experts_per_tok = c.num_experts_per_tok,
+        .intermediate_size = c.intermediate_size,
+        .n_group = c.n_group,
+        .topk_group = c.topk_group,
+        .norm_topk_prob = c.norm_topk_prob != 0,
+        .routed_scaling_factor = c.routed_scaling_factor,
+        .pool = @ptrCast(@alignCast(c.pool)),
+        .q_a_proj = @ptrCast(@alignCast(c.q_a_proj)),
+        .q_a_norm = @ptrCast(@alignCast(c.q_a_norm)),
+        .q_b_proj = @ptrCast(@alignCast(c.q_b_proj)),
+        .kv_a_proj_with_mqa = @ptrCast(@alignCast(c.kv_a_proj_with_mqa)),
+        .kv_a_norm = @ptrCast(@alignCast(c.kv_a_norm)),
+        .kv_b_proj = @ptrCast(@alignCast(c.kv_b_proj)),
+        .o_proj = @ptrCast(@alignCast(c.o_proj)),
+        .attn_norm_weight = @ptrCast(@alignCast(c.attn_norm_weight)),
+        .ffn_norm_weight = @ptrCast(@alignCast(c.ffn_norm_weight)),
+        .gate_weight = @ptrCast(@alignCast(c.gate_weight)),
+        .e_score_correction_bias = if (c.e_score_correction_bias) |p| @ptrCast(@alignCast(p)) else null,
+        .gate_proj = @ptrCast(@alignCast(c.gate_proj)),
+        .up_proj = @ptrCast(@alignCast(c.up_proj)),
+        .down_proj = @ptrCast(@alignCast(c.down_proj)),
+    };
+}
+
+pub export fn kt_dsv3_layer_new(config: *const kt_dsv3_layer_config_t) *KT_DSV3Layer {
+    const layer = deepseekv3_layer.DeepseekV3DecoderLayer.init(defaultAllocator(), toLayerConfig(config.*)) catch @panic("Failed to init DSV3 layer");
+    return @ptrCast(layer);
+}
+
+pub export fn kt_dsv3_layer_forward(
+    layer: *KT_DSV3Layer,
+    qlen: usize,
+    kv_start_pos: usize,
+    input: [*]const amx.bf16,
+    output: [*]amx.bf16,
+) void {
+    const l: *deepseekv3_layer.DeepseekV3DecoderLayer = @ptrCast(@alignCast(layer));
+    l.forward(qlen, kv_start_pos, input, output);
+}
+
+pub export fn kt_dsv3_layer_free(layer: *KT_DSV3Layer) void {
+    const l: *deepseekv3_layer.DeepseekV3DecoderLayer = @ptrCast(@alignCast(layer));
+    l.deinit();
 }
 
 // ============================================================================

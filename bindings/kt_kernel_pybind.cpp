@@ -270,6 +270,12 @@ extern "C" {
     void           kt_cpuinfer_submit(KT_CPUInfer* cpuinfer, void (*func)(void*), void* arg);
     void           kt_cpuinfer_sync(KT_CPUInfer* cpuinfer, size_t allow_n_pending);
     KT_WorkerPool* kt_cpuinfer_get_backend(KT_CPUInfer* cpuinfer);
+
+    // DeepseekV3 layer (model orchestration — config BY POINTER, matches Zig)
+    void* kt_dsv3_layer_new(const void* config);
+    void  kt_dsv3_layer_forward(void* layer, size_t qlen, size_t kv_start_pos,
+                                 const void* input, void* output);
+    void  kt_dsv3_layer_free(void* layer);
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +343,57 @@ private:
 // ---------------------------------------------------------------------------
 // Module definition. Module name MUST be kt_kernel_ext to match the C++ build.
 // ---------------------------------------------------------------------------
+// ---- DeepseekV3DecoderLayer (model orchestration — Zig extension) ----
+// ABI struct mirror of kt_dsv3_layer_config_t (src/main.zig; pointer fields
+// kept as const void* — the pybind Dsv3LayerCfg below stores size_t ints and
+// converts in the constructor).
+struct kt_dsv3_layer_config_t {
+    size_t hidden_size, q_lora_rank, num_heads, nope_size, rope_size,
+           kv_lora_rank, max_qlen, max_kvlen, token_count_in_page;
+    double rope_theta;
+    size_t expert_num, num_experts_per_tok, intermediate_size,
+           n_group, topk_group;
+    int norm_topk_prob;
+    float routed_scaling_factor;
+    void* pool;
+    const void* q_a_proj, *q_a_norm, *q_b_proj, *kv_a_proj_with_mqa,
+              *kv_a_norm, *kv_b_proj, *o_proj,
+              *attn_norm_weight, *ffn_norm_weight, *gate_weight,
+              *e_score_correction_bias, *gate_proj, *up_proj, *down_proj;
+};
+
+// pybind-side config: same layout, pointer fields as size_t (Python int
+// addresses) — layout-identical (8/8), converted in the constructor.
+struct Dsv3LayerCfg {
+    size_t hidden_size = 0, q_lora_rank = 0, num_heads = 0, nope_size = 0, rope_size = 0,
+           kv_lora_rank = 0, max_qlen = 0, max_kvlen = 0, token_count_in_page = 0;
+    double rope_theta = 10000.0;   // 0.0 makes RoPE produce NaN — keep the ref default
+    size_t expert_num = 0, num_experts_per_tok = 0, intermediate_size = 0,
+           n_group = 1, topk_group = 1;
+    int norm_topk_prob = 1;
+    float routed_scaling_factor = 1.0f;
+    size_t pool;
+    size_t q_a_proj, q_a_norm, q_b_proj, kv_a_proj_with_mqa,
+           kv_a_norm, kv_b_proj, o_proj,
+           attn_norm_weight, ffn_norm_weight, gate_weight,
+           e_score_correction_bias, gate_proj, up_proj, down_proj;
+};
+
+class PyDsv3Layer {
+public:
+    explicit PyDsv3Layer(void* h) : h_(h) {}
+    ~PyDsv3Layer() { if (h_) kt_dsv3_layer_free(h_); }
+    PyDsv3Layer(const PyDsv3Layer&) = delete;
+    PyDsv3Layer& operator=(const PyDsv3Layer&) = delete;
+    void forward(size_t qlen, size_t kv_start_pos, size_t input, size_t output) {
+        kt_dsv3_layer_forward(h_, qlen, kv_start_pos,
+                              reinterpret_cast<const void*>(input),
+                              reinterpret_cast<void*>(output));
+    }
+private:
+    void* h_;
+};
+
 PYBIND11_MODULE(kt_kernel_ext, m) {
     m.doc() = "ktransformers-zig C API pybind11 drop-in wrapper";
 
@@ -481,6 +538,87 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
              py::arg("qlens"), py::arg("page_tables"),
              py::arg("page_table_lens"), py::arg("kv_lens"),
              py::arg("input"), py::arg("output"));
+
+    // ---- DeepseekV3DecoderLayer (model orchestration) ----
+    auto dsv3 = m.def_submodule("dsv3", "DeepseekV3 model orchestration");
+    py::class_<PyDsv3Layer>(dsv3, "DeepseekV3DecoderLayer")
+        .def(py::init([](const Dsv3LayerCfg& cfg) {
+            // pybind config stores pointers as size_t ints; the ABI struct
+            // uses const void*. Same layout — convert field by field.
+            kt_dsv3_layer_config_t abi{};
+            abi.hidden_size = cfg.hidden_size;
+            abi.q_lora_rank = cfg.q_lora_rank;
+            abi.num_heads = cfg.num_heads;
+            abi.nope_size = cfg.nope_size;
+            abi.rope_size = cfg.rope_size;
+            abi.kv_lora_rank = cfg.kv_lora_rank;
+            abi.max_qlen = cfg.max_qlen;
+            abi.max_kvlen = cfg.max_kvlen;
+            abi.token_count_in_page = cfg.token_count_in_page;
+            abi.rope_theta = cfg.rope_theta;
+            abi.expert_num = cfg.expert_num;
+            abi.num_experts_per_tok = cfg.num_experts_per_tok;
+            abi.intermediate_size = cfg.intermediate_size;
+            abi.n_group = cfg.n_group;
+            abi.topk_group = cfg.topk_group;
+            abi.norm_topk_prob = cfg.norm_topk_prob;
+            abi.routed_scaling_factor = cfg.routed_scaling_factor;
+            abi.pool = reinterpret_cast<void*>(cfg.pool);
+            abi.q_a_proj = reinterpret_cast<const void*>(cfg.q_a_proj);
+            abi.q_a_norm = reinterpret_cast<const void*>(cfg.q_a_norm);
+            abi.q_b_proj = reinterpret_cast<const void*>(cfg.q_b_proj);
+            abi.kv_a_proj_with_mqa = reinterpret_cast<const void*>(cfg.kv_a_proj_with_mqa);
+            abi.kv_a_norm = reinterpret_cast<const void*>(cfg.kv_a_norm);
+            abi.kv_b_proj = reinterpret_cast<const void*>(cfg.kv_b_proj);
+            abi.o_proj = reinterpret_cast<const void*>(cfg.o_proj);
+            abi.attn_norm_weight = reinterpret_cast<const void*>(cfg.attn_norm_weight);
+            abi.ffn_norm_weight = reinterpret_cast<const void*>(cfg.ffn_norm_weight);
+            abi.gate_weight = reinterpret_cast<const void*>(cfg.gate_weight);
+            abi.e_score_correction_bias = reinterpret_cast<const void*>(cfg.e_score_correction_bias);
+            abi.gate_proj = reinterpret_cast<const void*>(cfg.gate_proj);
+            abi.up_proj = reinterpret_cast<const void*>(cfg.up_proj);
+            abi.down_proj = reinterpret_cast<const void*>(cfg.down_proj);
+            return std::unique_ptr<PyDsv3Layer>(new PyDsv3Layer(
+                kt_dsv3_layer_new(&abi)));
+        }), py::arg("config"))
+        .def("forward", &PyDsv3Layer::forward,
+             py::arg("qlen"), py::arg("kv_start_pos"),
+             py::arg("input"), py::arg("output"));
+
+    py::class_<Dsv3LayerCfg>(dsv3, "LayerConfig")
+        .def(py::init<>())
+        .def_readwrite("hidden_size", &Dsv3LayerCfg::hidden_size)
+        .def_readwrite("q_lora_rank", &Dsv3LayerCfg::q_lora_rank)
+        .def_readwrite("num_heads", &Dsv3LayerCfg::num_heads)
+        .def_readwrite("nope_size", &Dsv3LayerCfg::nope_size)
+        .def_readwrite("rope_size", &Dsv3LayerCfg::rope_size)
+        .def_readwrite("kv_lora_rank", &Dsv3LayerCfg::kv_lora_rank)
+        .def_readwrite("max_qlen", &Dsv3LayerCfg::max_qlen)
+        .def_readwrite("max_kvlen", &Dsv3LayerCfg::max_kvlen)
+        .def_readwrite("token_count_in_page", &Dsv3LayerCfg::token_count_in_page)
+        .def_readwrite("rope_theta", &Dsv3LayerCfg::rope_theta)
+        .def_readwrite("expert_num", &Dsv3LayerCfg::expert_num)
+        .def_readwrite("num_experts_per_tok", &Dsv3LayerCfg::num_experts_per_tok)
+        .def_readwrite("intermediate_size", &Dsv3LayerCfg::intermediate_size)
+        .def_readwrite("n_group", &Dsv3LayerCfg::n_group)
+        .def_readwrite("topk_group", &Dsv3LayerCfg::topk_group)
+        .def_readwrite("norm_topk_prob", &Dsv3LayerCfg::norm_topk_prob)
+        .def_readwrite("routed_scaling_factor", &Dsv3LayerCfg::routed_scaling_factor)
+        .def_readwrite("pool", &Dsv3LayerCfg::pool)
+        .def_readwrite("q_a_proj", &Dsv3LayerCfg::q_a_proj)
+        .def_readwrite("q_a_norm", &Dsv3LayerCfg::q_a_norm)
+        .def_readwrite("q_b_proj", &Dsv3LayerCfg::q_b_proj)
+        .def_readwrite("kv_a_proj_with_mqa", &Dsv3LayerCfg::kv_a_proj_with_mqa)
+        .def_readwrite("kv_a_norm", &Dsv3LayerCfg::kv_a_norm)
+        .def_readwrite("kv_b_proj", &Dsv3LayerCfg::kv_b_proj)
+        .def_readwrite("o_proj", &Dsv3LayerCfg::o_proj)
+        .def_readwrite("attn_norm_weight", &Dsv3LayerCfg::attn_norm_weight)
+        .def_readwrite("ffn_norm_weight", &Dsv3LayerCfg::ffn_norm_weight)
+        .def_readwrite("gate_weight", &Dsv3LayerCfg::gate_weight)
+        .def_readwrite("e_score_correction_bias", &Dsv3LayerCfg::e_score_correction_bias)
+        .def_readwrite("gate_proj", &Dsv3LayerCfg::gate_proj)
+        .def_readwrite("up_proj", &Dsv3LayerCfg::up_proj)
+        .def_readwrite("down_proj", &Dsv3LayerCfg::down_proj);
 
     // ---- kvcache submodule (minimal: expose ggml_type enum) ----
     auto kvcache = m.def_submodule("kvcache", "KV cache utilities");

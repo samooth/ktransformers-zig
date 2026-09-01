@@ -77,6 +77,7 @@ typedef struct KT_CPUInfer KT_CPUInfer;
 typedef struct KT_WorkerPool KT_WorkerPool;
 typedef struct KT_MOE KT_MOE;
 typedef struct KT_MLA KT_MLA;
+typedef struct KT_DSV3Layer KT_DSV3Layer;
 typedef struct KT_Linear KT_Linear;
 typedef struct KT_MLP KT_MLP;
 typedef struct KT_Gate KT_Gate;
@@ -627,5 +628,54 @@ typedef struct kt_allocator_vtable {
                   size_t new_size, size_t alignment); /* 0 ok, -1 unsupported */
 } kt_allocator_vtable;
 void kt_set_default_allocator(const kt_allocator_vtable* vtable);
+
+// ============================================================================
+// DeepseekV3 Decoder Layer — model orchestration (Zig extension)
+// ============================================================================
+// Ports examples/modeling_deepseek_v3.py's DeepseekV3DecoderLayer: single
+// sequence, continuous KV. Weight pointers are caller-owned (borrowed).
+
+typedef struct kt_dsv3_layer_config_t {
+    /* dims */
+    size_t hidden_size;
+    size_t q_lora_rank;
+    size_t num_heads;
+    size_t nope_size;
+    size_t rope_size;
+    size_t kv_lora_rank;
+    size_t max_qlen;
+    size_t max_kvlen;
+    size_t token_count_in_page;
+    double rope_theta;
+    size_t expert_num;
+    size_t num_experts_per_tok;
+    size_t intermediate_size;
+    size_t n_group;
+    size_t topk_group;
+    int norm_topk_prob;
+    float routed_scaling_factor;
+    void* pool;                       /* KT_WorkerPool* or NULL */
+    /* weights (BF16 unless noted) */
+    const void* q_a_proj;
+    const void* q_a_norm;
+    const void* q_b_proj;
+    const void* kv_a_proj_with_mqa;
+    const void* kv_a_norm;
+    const void* kv_b_proj;
+    const void* o_proj;
+    const void* attn_norm_weight;
+    const void* ffn_norm_weight;
+    const void* gate_weight;
+    const void* e_score_correction_bias;  /* f32 [expert_num]; NULL = no bias */
+    const void* gate_proj;
+    const void* up_proj;
+    const void* down_proj;
+} kt_dsv3_layer_config_t;
+
+KT_DSV3Layer* kt_dsv3_layer_new(const kt_dsv3_layer_config_t* config);
+void kt_dsv3_layer_free(KT_DSV3Layer* layer);
+/* qlen tokens at kv_start_pos context positions; input/output BF16 [qlen, hidden] */
+void kt_dsv3_layer_forward(KT_DSV3Layer* layer, size_t qlen, size_t kv_start_pos,
+                           const void* input, void* output);
 
 #endif // KTRANSFORMERS_C_API_H
