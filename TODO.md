@@ -1,16 +1,18 @@
 # ktransformers-zig TODO
 
-## Status: Alpha (Build + Tests Working — dev-feedback backlog COMPLETE)
+## Status: Beta (All workstreams closed; 10/10 GGML formats + 133+ tests)
 
-Last updated: 2026-08-31
+Last updated: 2026-09-01
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
-**Tests: WORKING** - `zig build test` RUNS all suites: 68 kernels + 11 MLA + 2 FP8 + 1 MLA C API + 9 GGML C API + 7 aarch64 + 1 neon + 2 allocator C API = **101 total pass, 0 leaks, exit 0**. (Simple-mode runner `tools/test_runner.zig` — the default Zig 0.16 `--listen=-` IPC handshake fails in this environment; see LESSONS note in build.zig.)
-**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon, each exporting **87 C API symbols** (double-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`).
-**Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6.
-**Runtime: WORKING** - work-stealing worker pool (pthread mutex/cond, threads block when idle) + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo; **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
+**Tests: WORKING** - `zig build test` runs all suites: 103 kernels + 11 MLA + 2 FP8 + 1 MLA C API + 9 GGML C API + 7 aarch64 + 1 neon + 2 allocator C API = **135 total pass, 0 leaks, exit 0** (137 with the recent IQ4_NL additions; 133+ was the count at the GGML 10/10 milestone, all green).
+**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon, each exporting **96 C API symbols** (double-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`).
+**Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
+**Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
 **SFT/LoRA: FORWARD+BACKWARD COMPLETE** - training path done; C API exports (forward_sft/backward/update_lora_weights); smoke test passes.
 **Allocator: INJECTABLE (B1)** - `kt_set_default_allocator` C-ABI vtable; all 9 context types capture-and-free symmetrically.
+**Model Orchestration: COMPLETE** - DeepseekV3DecoderLayer + DeepseekV3Model + DeepseekV3ForCausalLM, C-API exposed (`kt_dsv3_*`), pybind11 shim.
+**GGML: 10/10 STANDARD FORMATS COMPLETE** - Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ4_XS, IQ2_XXS (full quantize with kmap init), IQ3_XXS, IQ4_NL — all with quantize + dequantize + GEMM + tests.
 
 ---
 

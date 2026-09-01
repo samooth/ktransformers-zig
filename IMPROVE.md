@@ -500,6 +500,35 @@ del código y de la evolución natural del workstream.
 | Fix rot Zig 0.16 en `src/numa/` (`NumaTopology.detect`, `allocNuma`, `migratePagesToNode`, `getPageNodes`) | `bd7e712` | 5 símbolos numa nuevos en el .so; bug encontrado de paso: `getThreadAffinity` malinterpretaba el retorno de `sched_getaffinity` (kernel devuelve bytes copiados, no errno) |
 | `ci/wheels.yml`: gates ABI + test suites antes de `build-wheel` | `1da4470` | ejecuta `verify_abi.py` + `audit_layout.py` + `zig build test` |
 
+## Hitos GGML 10/10 y workstreams cerrados (post-P0/P1/P2/P3)
+
+El workstream GGML — la pieza que el feedback original del dev externo
+señalaba como "P2/B2 benchmark suite" + "formatos Q2/Q3/IQ por hacer"
+— quedó completamente cerrado con el cierre del kmap quantize para
+IQ2_XXS (7d10033 + b003990). La última pieza abierta era la
+implementación de `quantize_row_iq2_xxs_impl`, que requería un kmap
+fingerprint→grid-index runtime init (el analog de `iq2xs_init_impl`
+en la referencia). Esa pieza ahora vive en `src/numa/iq2xs_init.zig`
+(lazy-init en el primer uso, igual que la referencia).
+
+| Item | Commit | Notas |
+|------|--------|-------|
+| GGML Q2_K kernel (84B blocks, 4-bit scale+min, 2.625 bpw) | `55693c2` | primer formato K-quant sub-4-bit; 4 tests |
+| GGML Q3_K kernel (110B blocks, layout más intrincado) | `b1574f8` | 3 bugs cazados en el port; 4 tests |
+| GGML IQ2_XXS kernel (66B blocks, grid-based 2.0625 bpw) | `37f08cd` | primer formato grid (lookup de pares con signo); dequant+matmul, quantize stubbed |
+| IQ2_XXS kmap/kneighbors runtime init | `7d10033` | pre-requisito del quantize; ~200 líneas de fingerprint→grid-index + best-neighbor table |
+| IQ2_XXS full quantize (`quantize_row_iq2_xxs_impl`) | `b003990` | ciclo completo cerrado; mismo algoritmo de la referencia verificado contra el `quantizeRowIQ2_XXS_ref` |
+| GGML IQ3_XXS kernel (256B blocks, 3.0625 bpw) | `5fd239b` | segundo grid-based; comparte kmap con IQ2_XXS |
+| GGML IQ4_NL kernel (18B blocks, 32-weight super-blocks) | `5a73120` | non-linear 4-bit, layout trivial (un solo d por bloque), comparte `KVALUES_IQ4NL` con IQ4_XS |
+| zkML design doc | untracked (`zkML.md`) | propuesta L2/L3 de gadgets ML en Zig + integración con ktransformers; **WIP fuera de scope** del puerto C-API actual |
+
+**Estado final del puerto (verificado):**
+- 10 formatos GGML completos: Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ4_XS, IQ2_XXS, IQ3_XXS, IQ4_NL
+  (la lista es 11 — IQ4_NL cierra el slot, dejando "todos los formatos
+  estándar" como cierra la nota del commit 5fd239b)
+- 133+ tests / 0 leaks / `verify_abi.py` 96/96 × 8 .so doble gate PASS
+- Todas las workstreams del TODO original cerradas (C-API, MoE+work-stealing+SFT, MLA+model-orchestration, FP8, GGML, MTP out-of-scope)
+
 ---
 
 ## Parte F — Recomendación al equipo

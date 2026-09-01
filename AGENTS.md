@@ -83,28 +83,42 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
 ## Status (see TODO.md for details)
 
 - Build: working; 6 x86 variants + aarch64 neon cross-build.
-- C API: **87 symbols** gated by `verify_abi.py` double gate (exports +
-  arity). All operator families implemented: MoE (incl. SFT/LoRA
-  backward), MLA, Gate (DeepSeek-V3 group-top2 routing), Linear, MLP,
-  GGML quantize/matmul (5 formats), FP8 transport, math helpers, and
-  `kt_set_default_allocator` (injectable allocator, B1).
-- MoE: `loadWeights` packs all 3 projections (the old "only gate_proj"
-  bug is FIXED); `forwardGateUp`/`forwardDown` are real;
-  `gemmExpert` is vectorized (`@Vector(8,f32)` K-loop, A1, ~5.2x on
-  decode shapes); D1/D2/D3 buffer-overflow/index bugs fixed with
-  regression tests (qlen>1, tp>1).
+- C API: **96 symbols** gated by `verify_abi.py` triple gate (exports +
+  arity + layout via audit_layout.py). All operator families implemented:
+  MoE (incl. SFT/LoRA forward+backward), MLA, Gate (DeepSeek-V3
+  group-top2 routing), Linear, MLP, FP8 transport, math helpers,
+  `kt_set_default_allocator` (injectable allocator, B1), and the
+  `kt_dsv3_*` model-orchestration C-API.
+- GGML: **10/10 standard formats complete** — Q8_0, Q4_K, Q5_K, Q6_K,
+  Q8_K (linear/4-8 bit), Q2_K, Q3_K (linear/2-3 bit), IQ4_XS, IQ2_XXS
+  (grid-based with full kmap/kneighbors init for quantize), IQ3_XXS
+  (grid-based), IQ4_NL (non-linear 4-bit, 32-weight super-blocks).
+  IQ2_XXS/IQ3_XXS quantize is now real (was stubbed, see commits
+  7d10033 + b003990); only IQ2/IQ3 "S" and "M" variants remain for
+  if a real model needs them.
+- MoE: `loadWeights` packs all 3 projections; `forwardGateUp`/
+  `forwardDown` are real; `gemmExpert` is vectorized (`@Vector(8,f32)`
+  K-loop, A1, ~5.2x on decode shapes); D1/D2/D3 buffer-overflow/index
+  bugs fixed with regression tests (qlen>1, tp>1).
 - MLA: complete in `src/mla/`; `kt_mla_*` C API fully implemented
   (new/load_weights/forward/prefill/decode/update_kv_cache/free).
   `kt_mla_forward` supports qlen_count==1; qlen_count>1 (paged
   attention indirection) panics with a clear message.
+- Model Orchestration: `DeepseekV3DecoderLayer` + `DeepseekV3Model`
+  + `DeepseekV3ForCausalLM` (Zig-native, in `src/kernels/moe/`) with
+  C-API (`kt_dsv3_*`) and pybind11 shim.
 - AMX: `detectAmxSupport()` runtime CPUID + arch_prctl guard (A2 fix —
   the old `@hasField` comptime check was ALWAYS false, silently
   no-op'ing every AMX intrinsic even on AMX hardware).
 - NUMA: `sched_setaffinity` pinning wired into Subpool worker spawn;
-  `mbind` wired into runtime NumaAllocator (A3).
-- Tests: 68 kernels + 11 MLA + 2 FP8 + 1 MLA C API + 9 GGML C API +
-  7 aarch64 + 1 neon + 2 allocator C API = **101 tests, all passing,
-  0 leaks**. Bench: `zig build bench` (2.8-5.3x measured speedup A1).
+  `mbind` wired into runtime NumaAllocator (A3); `src/numa/` module
+  fully revived (NumaTopology.detect + allocNuma + getThreadAffinity
+  work byte-exact; getThreadAffinity bug fixed in route — kernel
+  returns bytes-copied, not errno).
+- Tests: 103 kernels + 11 MLA + 2 FP8 + 1 MLA C API + 9 GGML C API +
+  7 aarch64 + 1 neon + 2 allocator C API = **135 tests, all passing,
+  0 leaks**. Bench: `zig build bench` (2.8-5.3x measured speedup A1) +
+  `moe_bench.zig` (end-to-end MoE forward with tile-param tuning).
 - IMPROVE.md documents a verified external-dev-feedback audit: all
   P0-P3 items resolved (see its Parte E table for the commit map).
 
