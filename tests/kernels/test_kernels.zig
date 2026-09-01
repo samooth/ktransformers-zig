@@ -3237,3 +3237,94 @@ test "IQ4_XS scalar GEMM vs dequantized reference" {
         }
     }
 }
+
+// ============================================================================
+// GGML IQ2_XXS (grid-based 2.0625-bpw; 66-byte blocks, byte-exact vs ggml)
+// ============================================================================
+
+test "IQ2_XXS block layout byte-exact (66 bytes)" {
+    const iq2 = root.gemm_iq2_xxs;
+    try testing.expectEqual(@as(usize, 66), @sizeOf(iq2.BlockIQ2_XXS));
+    const blk = std.mem.zeroes(iq2.BlockIQ2_XXS);
+    const bytes: [*]const u8 = @ptrCast(&blk);
+    // d [0,2), qs [2,66)
+    try testing.expectEqual(@as(u8, 0), bytes[0]);
+    try testing.expectEqual(@as(u8, 0), bytes[1]);
+    try testing.expectEqual(@as(u8, 0), bytes[2]);
+    try testing.expectEqual(@as(u8, 0), bytes[65]);
+}
+
+test "IQ2_XXS lookup tables byte-exact vs ggml" {
+    const iq2 = root.gemm_iq2_xxs;
+    // kmask: bit j applies to weight j
+    try testing.expect(iq2.KMASK_IQ2XS[0] == 1);
+    try testing.expect(iq2.KMASK_IQ2XS[7] == 128);
+    // ksigns: sign palette — entries are ~bitwise-complement pairs
+    try testing.expect(iq2.KSIGNS_IQ2XS[0] == 0);
+    try testing.expect(iq2.KSIGNS_IQ2XS[1] == 129);
+    try testing.expect(iq2.KSIGNS_IQ2XS[127] == 255);
+    // grid: 256 entries; byte alphabet is {0x08, 0x19, 0x2b}
+    try testing.expect(iq2.IQ2XXS_GRID[0] == 0x0808080808080808);
+    try testing.expect(iq2.IQ2XXS_GRID[255] == 0x2b2b2b1908081908);
+}
+
+test "IQ2_XXS zero block dequantizes to zero" {
+    const iq2 = root.gemm_iq2_xxs;
+    const k = iq2.QK_K;
+    const blk = std.mem.zeroes(iq2.BlockIQ2_XXS);
+    var dst: [k]f32 = undefined;
+    iq2.dequantizeRowIQ2_XXS(@ptrCast(&blk), &dst, k);
+    for (dst) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "IQ2_XXS hand-crafted block produces known values" {
+    const iq2 = root.gemm_iq2_xxs;
+    const k = iq2.QK_K;
+    var blk = std.mem.zeroes(iq2.BlockIQ2_XXS);
+    // d = f16(1.0) = 0x3C00
+    blk.d = 0x3C00;
+    // Group 0: aux32[0] byte 0 = 1 (grid entry 1 = 0x...08080808_0808082b);
+    //          aux32[1] top nibble = 1 (db factor) via qs[3] = 0x1000.
+    // On little-endian, grid64 byte 0 = LSB = 0x2b for grid[1].
+    blk.qs[0] = 1; // aux32[0] low 16: grid index byte 0 = 1
+    blk.qs[3] = 0x1000; // aux32[1] high 16, top nibble = 1
+    // With d=1.0: db = 1.0 * (0.5 + 1) * 0.25 = 0.375
+    // Grid[1] LE bytes: 0x2b, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08
+    // sign palette entry 0 = 0x00 -> all signs +
+    // y[0] = 0.375 * 0x2b = 16.125, y[1..7] = 0.375 * 8 = 3.0
+    var dst: [k]f32 = undefined;
+    iq2.dequantizeRowIQ2_XXS(@ptrCast(&blk), &dst, k);
+    // weights 0..7 are sub-block 0 of group 0
+    try testing.expectApproxEqAbs(@as(f32, 16.125), dst[0], 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), dst[1], 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), dst[7], 0.01);
+    // weights 8..15 (sub-block 1, grid entry 0 = 0x0808080808080808) all 3.0
+    try testing.expectApproxEqAbs(@as(f32, 3.0), dst[8], 0.01);
+}
+
+test "IQ2_XXS scalar GEMM with a zero block" {
+    const iq2 = root.gemm_iq2_xxs;
+    const M = 2;
+    const N = 2;
+    const K = iq2.QK_K;
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+    var b: [2]iq2.BlockIQ2_XXS = undefined;
+    b[0] = std.mem.zeroes(iq2.BlockIQ2_XXS);
+    b[1] = std.mem.zeroes(iq2.BlockIQ2_XXS);
+    b[0].d = 0x3C00;
+    b[0].qs[0] = 1;
+    b[0].qs[3] = 0x1000;
+    var c: [M * N]f32 = undefined;
+    iq2.gemmIQ2_XXSScalar(&a, @ptrCast(&b), &c, M, N, K, K, 1, N);
+    // GEMM row 0: sum of all 256 dequantized weights from b[0]
+    var expected: f32 = 0;
+    var scratch: [K]f32 = undefined;
+    iq2.dequantizeRowIQ2_XXS(@ptrCast(&b[0]), &scratch, K);
+    for (scratch) |v| expected += v;
+    // Column 0 uses b[0] (has values); column 1 uses b[1] (zeroed) -> 0
+    for (0..M) |i| {
+        try testing.expectApproxEqAbs(expected, c[i * N + 0], 0.5);
+        try testing.expectApproxEqAbs(@as(f32, 0), c[i * N + 1], 0.5);
+    }
+}
