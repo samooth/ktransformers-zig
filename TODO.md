@@ -127,8 +127,7 @@ true vs false, with file:line evidence). All real items fixed:
   `routeExperts`' logits buffer + `routeExpertsWithOpts` scratch use
   page_allocator (outside the B1 C-API contract, documented in the
   allocator test). Closure: thread the captured TpMoe allocator in.
-- [ ] **`kt_mla_forward` qlen_count > 1** — paged-attention indirection
-  through page_tables is future work (panics with a clear message today).
+- [x] **`kt_mla_forward` qlen_count > 1 — CLOSED (139bf63 + 2e8ce43)** — paged/batched path: qlen_count==1 keeps the legacy sequential route; >1 loops per sequence through `MlaEngine.forwardPaged` with per-sequence page tables (mla-tp.hpp:84 contract), page_table_lens validated (>= ceil(kv_len/tokens_per_page)). `MlaKvCache` gained paged accessors (`pagedGetPageInfo/pagedWriteToken/pagedGetNopePtr/pagedGetRopePtr/ensurePageCount`) + save/load/dump/fromDump (32-byte "KVCA" header; page_table NOT serialized — scheduler's job, same as kvcache_load_dump.cpp). **Equivalence tests (2e8ce43 — the coverage 139bf63 shipped without)**: (a) scrambled==identity — same logical content on different physical pages, bit-for-bit (non-zero weights + non-zero-output guard = non-vacuous); (b) paged==legacy — single sequence through identity table == sequential path bit-for-bit. **Test (a) caught a real OOB on first run**: forwardPagedSequence sized the page pool from the LAST table entry only; a scrambled table with its max page index earlier (e.g. {7,6}) read past the pool (`index 7, len 7` in pagedGetRopePtr). Fixed: scan all n_pt_entries for max_page. 143 tests, 0 leaks, ABI 96/96 triple gate PASS.
 
 ### Python Packaging
 - [x] **Minimal pybind11 wrapper — DONE (4040b5b)** — see the Tier-1 entry

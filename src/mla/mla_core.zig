@@ -894,11 +894,14 @@ pub const MlaEngine = struct {
             @memcpy(dst[0..cfg.rope_size], (kv_output + cfg.kv_lora_rank)[0..cfg.rope_size]);
             applyRopeKpe(dst, kv_start_pos + i, cfg.rope_size, cfg.rope_theta);
         }
-        // Grow the page pool if the caller's table references pages we
-        // haven't allocated yet (kt_mla_new sized it from max_kvlen, but a
-        // table could exceed that if the caller re-uses slots).
-        const pages_needed: usize = @intCast(page_table[(kv_len - 1) / cfg.token_count_in_page] + 1);
-        _ = try self.cache.ensurePageCount(pages_needed);
+        // Grow the page pool to cover EVERY page the table references —
+        // not just the last position's page (a scrambled table can have
+        // its max page index anywhere; caught by the scrambled-pages
+        // equivalence test).
+        const n_pt_entries = (kv_len + cfg.token_count_in_page - 1) / cfg.token_count_in_page;
+        var max_page: c_int = -1;
+        for (0..n_pt_entries) |e| max_page = @max(max_page, page_table[e]);
+        _ = try self.cache.ensurePageCount(@intCast(max_page + 1));
         for (0..qlen) |i| {
             try self.cache.pagedWriteToken(
                 page_table,
