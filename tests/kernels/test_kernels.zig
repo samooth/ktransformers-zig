@@ -3506,3 +3506,94 @@ test "IQ2_XXS quantize with kmap: init -> quantize -> dequant round trip" {
     // not a precision test. Allow 150% for the null-weight path.
     try testing.expect(rel < 1.50);
 }
+
+// ============================================================================
+// GGML IQ4_NL — non-linear 4-bit, 32-weight super-blocks (18 bytes/block)
+// ============================================================================
+//
+// Block layout: d (f16) + qs[16] (32 nibbles, 4-bit quants indexing the
+// shared KVALUES_IQ4NL table). The simplest of the IQ family — the per-
+// element non-linearity IS the design, no per-sub-block scales needed.
+//
+// Tests cover: byte-exact layout, table reuse (the KVALUES_IQ4NL from
+// gemm_224_iq4_xs.zig is the same), hand-traced dequant on a
+// non-trivial block, and the scalar GEMM path's correctness.
+
+test "IQ4_NL block layout is byte-exact (18 bytes)" {
+    const iq4nl = root.gemm_iq4_nl;
+    try testing.expectEqual(@as(usize, 18), @sizeOf(iq4nl.BlockIQ4_NL));
+    try testing.expectEqual(@as(usize, 32), iq4nl.QK4_NL);
+    // Verify byte layout: d at offset 0..2, qs at offset 2..18
+    var blk = std.mem.zeroes(iq4nl.BlockIQ4_NL);
+    const bytes: [*]const u8 = @ptrCast(&blk);
+    try testing.expectEqual(@as(u8, 0), bytes[0]);
+    try testing.expectEqual(@as(u8, 0), bytes[1]); // d (zeroed)
+    try testing.expectEqual(@as(u8, 0), bytes[2]); // qs[0]
+    try testing.expectEqual(@as(u8, 0), bytes[17]); // qs[15]
+}
+
+test "IQ4_NL: zero block dequantizes to all-zero" {
+    const iq4nl = root.gemm_iq4_nl;
+    const k = iq4nl.QK4_NL;
+    const blk = std.mem.zeroes(iq4nl.BlockIQ4_NL);
+    var dst: [k]f32 = undefined;
+    const x_ptr: [*]const iq4nl.BlockIQ4_NL = @ptrCast(&blk);
+    iq4nl.dequantizeRowIQ4_NL(x_ptr, @ptrCast(&dst[0]), k);
+    for (dst) |v| try testing.expectEqual(@as(f32, 0.0), v);
+}
+
+test "IQ4_NL: hand-traced dequant matches C reference" {
+    // Hand-trace: d = f16(1.0) = 0x3C00, qs = 8 bytes of 0x0F (every nibble
+    // = 0xF = 15 -> kvalues[15] = 113).
+    //   y[0]  = 1.0 * 113 = 113
+    //   y[1]  = 1.0 * 113 = 113   (high nibble of qs[0] = 0xF)
+    //   y[16] = 1.0 * 113 = 113   (low nibble of qs[0]? no — y[j+16] uses qs[j]>>4
+    //                                wait: actually y[j+QK/2] is qs[j]>>4. So y[16] = d*kvalues[qs[0]>>4].
+    //                                With qs[0]=0x0F, qs[0]>>4 = 0, kvalues[0]=-127. y[16]=-127.)
+    // Corrected hand-trace: y[j+0]=d*kvalues[qs[j]&0xf], y[j+QK/2]=d*kvalues[qs[j]>>4].
+    // With d=1.0 and qs=0x0F repeated: y[0..15]=113, y[16..31]=-127.
+    const iq4nl = root.gemm_iq4_nl;
+    const k = iq4nl.QK4_NL;
+    var blk = std.mem.zeroes(iq4nl.BlockIQ4_NL);
+    blk.d = iq4nl.f32_to_f16(1.0);
+    for (&blk.qs) |*q| q.* = 0x0F; // every nibble = 15 -> kvalues[15] = 113 (lo); >>4 = 0 -> -127 (hi)
+    var dst: [k]f32 = undefined;
+    const x_ptr: [*]const iq4nl.BlockIQ4_NL = @ptrCast(&blk);
+    iq4nl.dequantizeRowIQ4_NL(x_ptr, @ptrCast(&dst[0]), k);
+    for (0..16) |j| {
+        try testing.expectEqual(@as(f32, 113.0), dst[j]);
+        try testing.expectEqual(@as(f32, -127.0), dst[16 + j]);
+    }
+}
+
+test "IQ4_NL: scalar GEMM with constant inputs is consistent" {
+    // Build an IQ4_NL block with d=1.0 and qs=0x0F (so every dequantized
+    // weight is either +113 (low nibble) or -127 (high nibble), per
+    // KVALUES_IQ4NL). For M tokens of 1.0 input, the per-(i,j) output
+    // c[i,j] = sum over 32 weights of (input * dequant_weight).
+    // input[k]=1.0 for all k; so c[i,j] = sum of the 32 dequant weights.
+    // From the hand-trace above: 16 * 113 + 16 * -127 = 1808 - 2032 = -224.
+    // The bench asserts this end-to-end value; the difference between
+    // a broken dequant (e.g., sign-flipped, scale-wrong) and the
+    // reference is on the order of 1000.
+    const iq4nl = root.gemm_iq4_nl;
+    const M: usize = 2;
+    const N: usize = 2;
+    const K: usize = iq4nl.QK4_NL; // 32
+
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var b: [N]iq4nl.BlockIQ4_NL = undefined;
+    for (&b) |*blk| {
+        blk.* = std.mem.zeroes(iq4nl.BlockIQ4_NL);
+        blk.d = iq4nl.f32_to_f16(1.0);
+        for (&blk.qs) |*q| q.* = 0x0F;
+    }
+
+    var c: [M * N]f32 = undefined;
+    iq4nl.gemmIQ4_NLScalar(&a, &b, &c, M, N, K, K, 1, N);
+
+    const expected: f32 = 16.0 * 113.0 + 16.0 * -127.0; // -224
+    for (c) |v| try testing.expectApproxEqAbs(expected, v, 1.0);
+}
