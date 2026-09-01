@@ -3148,3 +3148,92 @@ test "Q3_K scalar GEMM vs dequantized reference" {
         }
     }
 }
+
+// ============================================================================
+// GGML IQ4_XS (non-linear 4-bit; 136-byte blocks, byte-exact vs ggml)
+// ============================================================================
+
+test "IQ4_XS block layout byte-exact (136 bytes)" {
+    const iq4xs = root.gemm_iq4_xs;
+    try testing.expectEqual(@as(usize, 136), @sizeOf(iq4xs.BlockIQ4_XS));
+    const blk = std.mem.zeroes(iq4xs.BlockIQ4_XS);
+    const bytes: [*]const u8 = @ptrCast(&blk);
+    // d [0,2), scales_h [2,4), scales_l [4,8), qs [8,136)
+    try testing.expectEqual(@as(u8, 0), bytes[0]);
+    try testing.expectEqual(@as(u8, 0), bytes[3]);
+    try testing.expectEqual(@as(u8, 0), bytes[4]);
+    try testing.expectEqual(@as(u8, 0), bytes[7]);
+    try testing.expectEqual(@as(u8, 0), bytes[8]);
+    try testing.expectEqual(@as(u8, 0), bytes[135]);
+}
+
+test "IQ4_XS best_index_int8 known values" {
+    const iq4xs = root.gemm_iq4_xs;
+    try testing.expect(iq4xs.kvalues_iq4nl[0] == -127);
+    try testing.expect(iq4xs.kvalues_iq4nl[15] == 113);
+    try testing.expect(iq4xs.kvalues_iq4nl[8] == 1);
+    try testing.expect(iq4xs.kvalues_iq4nl[7] == -10);
+}
+
+test "IQ4_XS quantize/dequantize round trip accuracy" {
+    const iq4xs = root.gemm_iq4_xs;
+    const k = iq4xs.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+    var blk: [1]iq4xs.BlockIQ4_XS = undefined;
+    iq4xs.quantizeRowIQ4_XS(&src, &blk, k);
+    var dst: [k]f32 = undefined;
+    iq4xs.dequantizeRowIQ4_XS(&blk, &dst, k);
+    var max_abs_err: f32 = 0;
+    var sum_abs_x: f32 = 0;
+    for (0..k) |i| {
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+        sum_abs_x += @abs(src[i]);
+    }
+    const rel = max_abs_err / (sum_abs_x / k);
+    // 4.5 bpw but the non-linear table + 6-bit per-32 scales have their
+    // own noise floor: measured 0.21 on this data (debug-verified; the
+    // sub-block scales come out tiny on smooth sinusoids). Allow 25%.
+    try testing.expect(rel < 0.25);
+}
+
+test "IQ4_XS all-zero input dequantizes to near-zero" {
+    const iq4xs = root.gemm_iq4_xs;
+    const k = iq4xs.QK_K;
+    var src: [k]f32 = [_]f32{0.0} ** k;
+    var blk: [1]iq4xs.BlockIQ4_XS = undefined;
+    iq4xs.quantizeRowIQ4_XS(&src, &blk, k);
+    var dst: [k]f32 = undefined;
+    iq4xs.dequantizeRowIQ4_XS(&blk, &dst, k);
+    for (dst) |v| try testing.expect(@abs(v) < 1e-30);
+}
+
+test "IQ4_XS scalar GEMM vs dequantized reference" {
+    const iq4xs = root.gemm_iq4_xs;
+    const M = 4;
+    const N = 4;
+    const K = iq4xs.QK_K;
+
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var src: [K]f32 = undefined;
+    for (&src) |*v| v.* = 1.0;
+    var b: [N]iq4xs.BlockIQ4_XS = undefined;
+    for (0..N) |j| iq4xs.quantizeRowIQ4_XS(&src, @ptrCast(&b[j]), K);
+
+    var c: [M * N]f32 = undefined;
+    iq4xs.gemmIQ4_XSScalar(&a, K, &b, 1, &c, N, M, N, K);
+
+    var w: [K]f32 = undefined;
+    iq4xs.dequantizeRowIQ4_XS(@ptrCast(&b[0]), &w, K);
+    var expected: f32 = 0;
+    for (w) |v| expected += v;
+    for (0..M) |i| {
+        for (0..N) |j| {
+            try testing.expectApproxEqAbs(expected, c[i * N + j], 1.0);
+        }
+    }
+}
