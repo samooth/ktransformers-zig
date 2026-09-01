@@ -39,9 +39,38 @@ jobs:
           name: libkt_kernel_ext_${{ matrix.variant }}
           path: zig-out/lib/libkt_kernel_ext_*.so
 
+  abi-gate:
+    name: "ABI gates + test suites"
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.16.0-dev
+
+      - name: Build all variants
+        run: zig build all-variants
+
+      # The ABI is a contract: every prototype in include/kt_kernel.h
+      # must have a matching Zig export in EVERY variant .so, with the
+      # exact arity (verify_abi.py) — and the pybind11 shim's struct
+      # layouts must match byte-for-byte (audit_layout.py). A silent
+      # symbol regression otherwise ships in the wheel.
+      - name: "ABI gate: exports + arity (all variants)"
+        run: python3 tools/verify_abi.py
+
+      - name: "ABI gate: pybind11 struct layouts"
+        run: python3 tools/audit_layout.py
+
+      - name: "Test suites"
+        run: zig build test
+
   build-wheel:
     name: Build Python Wheel
-    needs: build-variants
+    needs: [build-variants, abi-gate]
     runs-on: ubuntu-latest
 
     steps:
