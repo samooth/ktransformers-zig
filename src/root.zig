@@ -35,6 +35,7 @@ pub const gemm_q6_k = @import("kernels/amx/gemm_224_q6_k.zig");
 pub const gemm_q5_k = @import("kernels/amx/gemm_224_q5_k.zig");
 pub const gemm_q8_k = @import("kernels/amx/gemm_224_q8_k.zig");
 pub const gemm_q2_k = @import("kernels/amx/gemm_224_q2_k.zig");
+pub const gemm_q3_k = @import("kernels/amx/gemm_224_q3_k.zig");
 comptime {
     _ = &gemm_q8_0.BlockQ8_0;
     _ = &gemm_q8_0.f32_to_f16;
@@ -83,6 +84,14 @@ comptime {
     _ = &gemm_q2_k.dequantizeRowQ2_K;
     _ = &gemm_q2_k.dequantizeRowQ2_KToBF16;
     _ = &gemm_q2_k.gemmQ2_KScalar;
+    _ = &gemm_q3_k.BlockQ3_K;
+    _ = &gemm_q3_k.f32_to_f16;
+    _ = &gemm_q3_k.f16_to_f32;
+    _ = &gemm_q3_k.nearestInt;
+    _ = &gemm_q3_k.quantizeRowQ3_K;
+    _ = &gemm_q3_k.dequantizeRowQ3_K;
+    _ = &gemm_q3_k.dequantizeRowQ3_KToBF16;
+    _ = &gemm_q3_k.gemmQ3_KScalar;
 }
 comptime {
     _ = &gemm_mxfp4.GemmKernel224MXFP4.gemmFullTile;

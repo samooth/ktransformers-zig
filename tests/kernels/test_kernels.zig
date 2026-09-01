@@ -3063,3 +3063,88 @@ test "Q2_K scalar GEMM vs dequantized reference" {
         }
     }
 }
+
+// ============================================================================
+// GGML Q3_K (kernel-layer; 110-byte blocks, byte-exact vs ggml)
+// ============================================================================
+
+test "Q3_K block layout byte-exact (110 bytes)" {
+    const q3k = root.gemm_q3_k;
+    try testing.expectEqual(@as(usize, 110), @sizeOf(q3k.BlockQ3_K));
+    const blk = std.mem.zeroes(q3k.BlockQ3_K);
+    const bytes: [*]const u8 = @ptrCast(&blk);
+    // hmask [0,32), qs [32,96), scales [96,108), d [108,110)
+    try testing.expectEqual(@as(u8, 0), bytes[0]);
+    try testing.expectEqual(@as(u8, 0), bytes[31]);
+    try testing.expectEqual(@as(u8, 0), bytes[32]);
+    try testing.expectEqual(@as(u8, 0), bytes[95]);
+    try testing.expectEqual(@as(u8, 0), bytes[96]);
+    try testing.expectEqual(@as(u8, 0), bytes[107]);
+    try testing.expectEqual(@as(u8, 0), bytes[108]);
+    try testing.expectEqual(@as(u8, 0), bytes[109]);
+}
+
+test "Q3_K quantize/dequantize round trip accuracy" {
+    const q3k = root.gemm_q3_k;
+    const k = q3k.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+    var blk: [1]q3k.BlockQ3_K = undefined;
+    q3k.quantizeRowQ3_K(&src, &blk, k);
+    var dst: [k]f32 = undefined;
+    q3k.dequantizeRowQ3_K(&blk, &dst, k);
+    var max_abs_err: f32 = 0;
+    var sum_abs_x: f32 = 0;
+    for (0..k) |i| {
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+        sum_abs_x += @abs(src[i]);
+    }
+    const rel = max_abs_err / (sum_abs_x / k);
+    // ~3.4375 bits/weight (incl. the sign-like high bit): the make_q3
+    // coordinate-descent scales + the hmask sign-like inversion make
+    // this looser than Q4_K despite more bits. Measured 0.33 on this
+    // data (debug-verified against a Python port); honest floor ~35%.
+    try testing.expect(rel < 0.35);
+}
+
+test "Q3_K all-zero input dequantizes to zero" {
+    const q3k = root.gemm_q3_k;
+    const k = q3k.QK_K;
+    var src: [k]f32 = [_]f32{0.0} ** k;
+    var blk: [1]q3k.BlockQ3_K = undefined;
+    q3k.quantizeRowQ3_K(&src, &blk, k);
+    try testing.expectEqual(@as(u16, 0), blk[0].d);
+    var dst: [k]f32 = undefined;
+    q3k.dequantizeRowQ3_K(&blk, &dst, k);
+    for (dst) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "Q3_K scalar GEMM vs dequantized reference" {
+    const q3k = root.gemm_q3_k;
+    const M = 4;
+    const N = 4;
+    const K = q3k.QK_K;
+
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var src: [K]f32 = undefined;
+    for (&src) |*v| v.* = 1.0;
+    var b: [N]q3k.BlockQ3_K = undefined;
+    for (0..N) |j| q3k.quantizeRowQ3_K(&src, @ptrCast(&b[j]), K);
+
+    var c: [M * N]f32 = undefined;
+    q3k.gemmQ3_KScalar(&a, K, &b, 1, &c, N, M, N, K);
+
+    var w: [K]f32 = undefined;
+    q3k.dequantizeRowQ3_K(@ptrCast(&b[0]), &w, K);
+    var expected: f32 = 0;
+    for (w) |v| expected += v;
+    for (0..M) |i| {
+        for (0..N) |j| {
+            try testing.expectApproxEqAbs(expected, c[i * N + j], 1.0);
+        }
+    }
+}
