@@ -3413,3 +3413,55 @@ test "IQ3_XXS scalar GEMM with hand-crafted block" {
         try testing.expectApproxEqAbs(@as(f32, 0), c[i * N + 1], 0.5);
     }
 }
+
+// ============================================================================
+// IQ2_XXS kmap/kneighbors init (the quantize prerequisite)
+// ============================================================================
+
+test "iq2xs kmap init: exact grid entries map correctly" {
+    const init_mod = @import("kt").iq2xs_init;
+    const allocator = testing.allocator;
+    var data = init_mod.initIq2XsData(allocator);
+    defer init_mod.freeIq2XsData(allocator, data);
+
+    // Every grid entry's fingerprint should map back to itself
+    for (0..256) |k| {
+        const packed_val = init_mod.KGRID_2BIT_256[k];
+        var index: usize = 0;
+        for (0..8) |i| {
+            const l: usize = (packed_val >> @intCast(2 * i)) & 0x3;
+            index |= (l << @intCast(2 * i));
+        }
+        try testing.expectEqual(@as(i32, @intCast(k)), data.kmap[index]);
+    }
+    // The number of exact matches should equal 256 (all grid entries distinct)
+    var exact_count: usize = 0;
+    for (0..init_mod.KMAP_SIZE) |i| {
+        if (data.kmap[i] >= 0) exact_count += 1;
+    }
+    try testing.expectEqual(@as(usize, 256), exact_count);
+}
+
+test "iq2xs kmap init: off-grid entries have valid neighbor offsets" {
+    const init_mod = @import("kt").iq2xs_init;
+    const allocator = testing.allocator;
+    var data = init_mod.initIq2XsData(allocator);
+    defer init_mod.freeIq2XsData(allocator, data);
+
+    var off_grid_count: usize = 0;
+    for (0..init_mod.KMAP_SIZE) |i| {
+        if (data.kmap[i] < 0) {
+            off_grid_count += 1;
+            // Negative value encodes -(offset+1)
+            const encoded = data.kmap[i];
+            try testing.expect(encoded < 0);
+            // The offset must be valid
+            const offset: usize = @intCast(-(encoded + 1));
+            try testing.expect(offset < data.kneighbors.len);
+            // The first u16 at that offset is the neighbor count (>0)
+            try testing.expect(data.kneighbors[offset] > 0);
+        }
+    }
+    // 43692 - 256 = 43436 off-grid entries
+    try testing.expectEqual(@as(usize, 43436), off_grid_count);
+}
