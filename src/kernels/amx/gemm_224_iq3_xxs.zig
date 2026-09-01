@@ -233,9 +233,24 @@ pub fn gemmIQ3_XXSScalar(
 }
 
 // ============================================================================
-// Quantize — NOT IMPLEMENTED (out of scope)
+// Quantize — thin wrapper over the real quantizer (iq3_quantize.zig).
 // ============================================================================
 
-pub fn quantizeRowIQ3_XXS(_: [*]const f32, _: [*]BlockIQ3_XXS, _: usize) void {
-    @panic("quantizeRowIQ3_XXS: not implemented — requires the runtime kmap/kneighbors init (iq3xs_init_impl), a separate workstream. The dequant+matmul path handles pre-quantized GGUF weights.");
+/// Lazily-initialized shared kmap data for the convenience wrapper below.
+var g_iq3_data: ?*@import("iq3xs_init.zig").Iq3GridData = null;
+var g_iq3_init_mutex: std.Thread.Mutex = .{};
+
+/// Quantize a row of f32 into IQ3_XXS blocks. On first call (per process)
+/// this builds the 4096-entry kmap + kneighbors tables (expensive, ~4M
+/// distance evals); pass the data explicitly via
+/// iq3_quantize.quantizeRowIQ3_XXS_WithInit to control the lifetime.
+pub fn quantizeRowIQ3_XXS(src: [*]const f32, dst: [*]BlockIQ3_XXS, k: usize) void {
+    const init = @import("iq3xs_init.zig");
+    const quant = @import("iq3_quantize.zig");
+    g_iq3_init_mutex.lock();
+    defer g_iq3_init_mutex.unlock();
+    if (g_iq3_data == null) {
+        g_iq3_data = init.initIq3XsData(std.heap.page_allocator);
+    }
+    quant.quantizeRowIQ3_XXS_WithInit(g_iq3_data.?, src[0..k], dst, k, null);
 }

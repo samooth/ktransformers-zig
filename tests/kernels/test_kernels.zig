@@ -3597,3 +3597,101 @@ test "IQ4_NL: scalar GEMM with constant inputs is consistent" {
     const expected: f32 = 16.0 * 113.0 + 16.0 * -127.0; // -224
     for (c) |v| try testing.expectApproxEqAbs(expected, v, 1.0);
 }
+
+// ============================================================================
+// IQ3_XXS kmap init + full quantize (with kmap) — round trip
+// ============================================================================
+
+test "iq3xs kmap init: exact grid entries map correctly + grid correspondence" {
+    const init_mod = root.iq3xs_init;
+    const iq3 = root.gemm_iq3_xxs;
+    const allocator = testing.allocator;
+
+    const data = init_mod.initIq3XsData(allocator);
+    defer init_mod.freeIq3XsData(allocator, data);
+
+    // All 256 grid entries must map to themselves in the kmap: the
+    // fingerprint of grid entry i is unique, so kmap[fingerprint(i)] == i.
+    var n_exact: usize = 0;
+    for (0..256) |i| {
+        var index: u16 = 0;
+        for (0..4) |k| {
+            const q: u16 = @intCast(@divTrunc(data.grid[i][k] - 1, 2));
+            index |= q << @intCast(3 * k);
+        }
+        try testing.expect(data.kmap[index] == @as(i32, @intCast(i)));
+        n_exact += 1;
+    }
+    try testing.expectEqual(@as(usize, 256), n_exact);
+
+    // Grid correspondence: IQ3XXS_GRID[gi] bytes must be ALPHABET[nibble]
+    // for the nibbles of grid[gi] — bijection {0..7} -> {4,12,20,28,36,44,52,62}.
+    // This proves a kmap grid_index is a valid IQ3XXS_GRID dequant index.
+    const alphabet = [8]u8{ 4, 12, 20, 28, 36, 44, 52, 62 };
+    for (0..256) |gi| {
+        const packed_grid: u32 = iq3.IQ3XXS_GRID[gi];
+        const grid_bytes: [*]const u8 = @ptrCast(&packed_grid);
+        for (0..4) |k| {
+            const l: u8 = @intCast(@divTrunc(data.grid[gi][k] - 1, 2));
+            try testing.expectEqual(alphabet[l], grid_bytes[k]);
+        }
+    }
+}
+
+test "iq3xs kmap init: off-grid entries have valid neighbor offsets" {
+    const init_mod = root.iq3xs_init;
+    const allocator = testing.allocator;
+
+    const data = init_mod.initIq3XsData(allocator);
+    defer init_mod.freeIq3XsData(allocator, data);
+
+    var n_off: usize = 0;
+    for (0..init_mod.KMAP_SIZE) |i| {
+        const enc = data.kmap[i];
+        if (enc >= 0) continue;
+        n_off += 1;
+        const start: usize = @intCast(-(enc + 1));
+        const count = data.kneighbors[start];
+        try testing.expect(count > 0);
+        for (1..count + 1) |j| {
+            try testing.expect(data.kneighbors[start + j] < 256);
+        }
+    }
+    // 4096 - 256 = 3840 off-grid entries expected
+    try testing.expectEqual(@as(usize, 3840), n_off);
+}
+
+test "IQ3_XXS quantize with kmap: init -> quantize -> dequant round trip" {
+    const init_mod = root.iq3xs_init;
+    const quant_mod = root.iq3_quantize;
+    const iq3 = root.gemm_iq3_xxs;
+    const allocator = testing.allocator;
+
+    const k = iq3.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+
+    const data = init_mod.initIq3XsData(allocator);
+    defer init_mod.freeIq3XsData(allocator, data);
+
+    var blk: [1]iq3.BlockIQ3_XXS = undefined;
+    quant_mod.quantizeRowIQ3_XXS_WithInit(data, &src, &blk, k, null);
+
+    var dst: [k]f32 = undefined;
+    iq3.dequantizeRowIQ3_XXS(&blk, &dst, k);
+
+    var max_abs_err: f32 = 0;
+    var sum_abs_x: f32 = 0;
+    for (0..k) |i| {
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+        sum_abs_x += @abs(src[i]);
+    }
+    const rel = max_abs_err / (sum_abs_x / k);
+    // Same rationale as the IQ2_XXS test: null importance weights (the
+    // reference always passes quant_weights) make low-|x| values poorly
+    // quantized BY DESIGN. Algorithm-correctness gate, not precision.
+    // IQ3_XXS is 3.0625 bpw (finer grid than IQ2's 2.0625) — 100% bound.
+    try testing.expect(rel < 1.0);
+}
