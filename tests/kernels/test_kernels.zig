@@ -3328,3 +3328,88 @@ test "IQ2_XXS scalar GEMM with a zero block" {
         try testing.expectApproxEqAbs(@as(f32, 0), c[i * N + 1], 0.5);
     }
 }
+
+// ============================================================================
+// GGML IQ3_XXS (grid-based 3.0625-bpw; 98-byte blocks, byte-exact vs ggml)
+// ============================================================================
+
+test "IQ3_XXS block layout byte-exact (98 bytes)" {
+    const iq3 = root.gemm_iq3_xxs;
+    try testing.expectEqual(@as(usize, 98), @sizeOf(iq3.BlockIQ3_XXS));
+    const blk = std.mem.zeroes(iq3.BlockIQ3_XXS);
+    const bytes: [*]const u8 = @ptrCast(&blk);
+    // d [0,2), qs [2,98)
+    try testing.expectEqual(@as(u8, 0), bytes[0]);
+    try testing.expectEqual(@as(u8, 0), bytes[97]);
+}
+
+test "IQ3_XXS lookup tables byte-exact vs ggml" {
+    const iq3 = root.gemm_iq3_xxs;
+    // grid: 256 u32 entries, byte alphabet {0x04..0x3e}
+    try testing.expect(iq3.IQ3XXS_GRID[0] == 0x04040404);
+    try testing.expect(iq3.IQ3XXS_GRID[1] == 0x04040414);
+    try testing.expect(iq3.IQ3XXS_GRID[255] == 0x3e341c04);
+    // ksigns shared with IQ2_XXS
+    try testing.expect(iq3.KSIGNS_IQ2XS[0] == 0);
+    try testing.expect(iq3.KSIGNS_IQ2XS[127] == 255);
+}
+
+test "IQ3_XXS zero block dequantizes to zero" {
+    const iq3 = root.gemm_iq3_xxs;
+    const k = iq3.QK_K;
+    const blk = std.mem.zeroes(iq3.BlockIQ3_XXS);
+    var dst: [k]f32 = undefined;
+    iq3.dequantizeRowIQ3_XXS(@ptrCast(&blk), &dst, k);
+    for (dst) |v| try testing.expectEqual(@as(f32, 0), v);
+}
+
+test "IQ3_XXS hand-crafted block produces known values" {
+    const iq3 = root.gemm_iq3_xxs;
+    const k = iq3.QK_K;
+    var blk = std.mem.zeroes(iq3.BlockIQ3_XXS);
+    blk.d = 0x3C00; // f16(1.0)
+    // Group 0: grid indices at qs[0..8], scale+sign at qs[64..68]
+    // Set grid indices 1,0,0,0 for sub-block l=0 (first two weights groups)
+    blk.qs[0] = 1; // grid1 index for l=0 = 1 (bytes: 0x14,0x04,0x04,0x04)
+    blk.qs[1] = 0; // grid2 index for l=0 = 0 (bytes: 0x04,0x04,0x04,0x04)
+    // Set aux32 top nibble = 1 (scale factor) via qs[64+3] = 0x10
+    blk.qs[64 + 3] = 0x10; // top nibble of the 4th byte of group 0's scale area
+    // db = 1.0 * (0.5 + 1) * 0.5 = 0.75
+    // Grid1[1] = 0x04040414 → LE bytes: 0x14, 0x04, 0x04, 0x04
+    // signs = KSIGNS[0] = 0 → all positive
+    // y[0] = 0.75 * 0x14 = 0.75 * 20 = 15.0
+    // y[1] = 0.75 * 0x04 = 0.75 * 4 = 3.0
+    // y[2] = 3.0, y[3] = 3.0
+    // y[4..7] from grid2[0] = all 0x04 → 3.0 each
+    var dst: [k]f32 = undefined;
+    iq3.dequantizeRowIQ3_XXS(@ptrCast(&blk), &dst, k);
+    try testing.expectApproxEqAbs(@as(f32, 15.0), dst[0], 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), dst[1], 0.01);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), dst[7], 0.01);
+}
+
+test "IQ3_XXS scalar GEMM with hand-crafted block" {
+    const iq3 = root.gemm_iq3_xxs;
+    const M = 2;
+    const N = 2;
+    const K = iq3.QK_K;
+    var a: [M * K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+    var b: [2]iq3.BlockIQ3_XXS = undefined;
+    b[0] = std.mem.zeroes(iq3.BlockIQ3_XXS);
+    b[1] = std.mem.zeroes(iq3.BlockIQ3_XXS);
+    b[0].d = 0x3C00;
+    b[0].qs[0] = 1;
+    b[0].qs[64 + 3] = 0x10;
+    var c: [M * N]f32 = undefined;
+    iq3.gemmIQ3_XXSScalar(&a, @ptrCast(&b), &c, M, N, K, K, 1, N);
+    // Column 0 uses b[0]; column 1 uses b[1] (all-zero -> 0)
+    var expected: f32 = 0;
+    var scratch: [K]f32 = undefined;
+    iq3.dequantizeRowIQ3_XXS(@ptrCast(&b[0]), &scratch, K);
+    for (scratch) |v| expected += v;
+    for (0..M) |i| {
+        try testing.expectApproxEqAbs(expected, c[i * N + 0], 0.5);
+        try testing.expectApproxEqAbs(@as(f32, 0), c[i * N + 1], 0.5);
+    }
+}
