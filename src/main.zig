@@ -25,8 +25,10 @@ pub const gemm_q6_k = root.gemm_q6_k;
 pub const gemm_q8_k = root.gemm_q8_k;
 const moe = root.moe;
 const moe_sft = root.moe_sft;
-const mla_config = root.mla_config;
-const mla_cache = root.mla_cache;
+// MLA: pub so C-API tests (rooted here) can reference the config/cache
+// types; no ABI effect.
+pub const mla_config = root.mla_config;
+pub const mla_cache = root.mla_cache;
 const mla_core = root.mla_core;
 // DeepseekV3DecoderLayer orchestration (WIP by the model-orchestration dev;
 // root re-exports it from kernels/moe/deepseekv3_layer.zig).
@@ -1069,33 +1071,85 @@ fn mlaForwardImpl(
 }
 
 // Matches the C++ kt_kernel.h paged/batched contract: qlens, page_tables,
-// kv_lens are parallel arrays of length qlen_count. The Zig engine is
-// single-sequence with an internal sequential KV cache layout, so:
-//   - qlen_count == 1: full forward (kvlen = kv_lens[0])
-//   - qlen_count >  1: paged/batched MLA not yet supported (paged attention
-//     indirection into a per-sequence paged cache is a separate feature);
-//     call once per sequence and concatenate the outputs externally.
-// page_tables / page_table_lens are accepted to match the C ABI but are
-// currently unused (the engine's cache uses sequential token positions).
+// kv_lens are parallel arrays of length qlen_count. Two paths:
+//   - qlen_count == 1 && page_tables == null: sequential forward into the
+//     engine's internal cache (unchanged legacy behavior — the C header
+//     types page_tables as a pointer, so null means "no indirection").
+//   - otherwise: paged/batched forward — every sequence's page table
+//     indexes the engine's page pool (page_table[logical_pos /
+//     token_count_in_page] = page idx). New KVs are written at logical
+//     positions [kv_len - qlen, kv_len) through the table; attention
+//     reads [0, kv_len) through the same indirection (mla-tp.hpp:84).
+// page_table_lens is validated against the per-sequence requirement
+// ceil(kv_len / token_count_in_page) when tables are provided.
 pub export fn kt_mla_forward(
     mla: *KT_MLA,
     qlens: [*]const c_int,
     qlen_count: c_int,
-    page_tables: [*]const [*]const c_int,
-    page_table_lens: [*]const c_int,
+    page_tables: ?[*]const [*]const c_int,
+    page_table_lens: ?[*]const c_int,
     kv_lens: [*]const c_int,
     input: [*]const amx.bf16,
     output: [*]amx.bf16,
 ) void {
-    _ = page_tables;
-    _ = page_table_lens;
-    if (qlen_count != 1) {
-        @panic("kt_mla_forward: batched/paged MLA (qlen_count > 1) not yet supported; call once per sequence");
-    }
     const ctx: *MlaContext = @ptrCast(@alignCast(mla));
-    const qlen: usize = @intCast(qlens[0]);
-    const kvlen: usize = @intCast(kv_lens[0]);
-    mlaForwardImpl(ctx, input, output, qlen, kvlen);
+    if (!ctx.weights_loaded) {
+        @panic("kt_mla_forward: weights not loaded (call kt_mla_load_weights first)");
+    }
+    const count: usize = @intCast(qlen_count);
+    if (count == 0) return;
+    const cfg = ctx.engine.config;
+    const allocator = ctx.allocator;
+
+    // Legacy sequential path: qlen_count == 1 uses the engine's own
+    // sequential cache (no page_table needed). The paged path is only
+    // required when qlen_count > 1 (the "batch of sequences" case).
+    if (count == 1) {
+        const qlen: usize = @intCast(qlens[0]);
+        const kvlen: usize = @intCast(kv_lens[0]);
+        mlaForwardImpl(ctx, input, output, qlen, kvlen);
+        return;
+    }
+
+    // Paged/batched path. Required from here on.
+    const tables = page_tables orelse
+        @panic("kt_mla_forward: qlen_count > 1 requires page_tables");
+    const lens = page_table_lens orelse
+        @panic("kt_mla_forward: qlen_count > 1 requires page_table_lens");
+    for (0..count) |seq| {
+        const kv_len: usize = @intCast(kv_lens[seq]);
+        const need = (kv_len + cfg.token_count_in_page - 1) / cfg.token_count_in_page;
+        if (kv_len > cfg.max_kvlen) {
+            @panic("kt_mla_forward: kv_lens exceeds max_kvlen");
+        }
+        if (@as(usize, @intCast(lens[seq])) < need) {
+            @panic("kt_mla_forward: page_table too short for kv_lens");
+        }
+    }
+
+    // Sum the batch's qlens for the F32 conversion buffers.
+    var qlen_sum: usize = 0;
+    for (0..count) |seq| qlen_sum += @intCast(qlens[seq]);
+
+    const input_f32 = allocator.alloc(f32, qlen_sum * cfg.hidden_size) catch @panic("OOM");
+    defer allocator.free(input_f32);
+    for (0..qlen_sum * cfg.hidden_size) |i| {
+        input_f32[i] = amx.bf16_to_f32(input[i]);
+    }
+    const output_f32 = allocator.alloc(f32, qlen_sum * cfg.hidden_size) catch @panic("OOM");
+    defer allocator.free(output_f32);
+
+    ctx.engine.forwardPaged(
+        input_f32.ptr,
+        output_f32.ptr,
+        qlens[0..count],
+        tables[0..count],
+        kv_lens[0..count],
+    ) catch @panic("forwardPaged failed");
+
+    for (0..qlen_sum * cfg.hidden_size) |i| {
+        output[i] = amx.f32_to_bf16(output_f32[i]);
+    }
 }
 
 pub export fn kt_mla_prefill(

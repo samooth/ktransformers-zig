@@ -723,6 +723,236 @@ pub const MlaEngine = struct {
     pub fn resetCache(self: *MlaEngine) void {
         self.cache.clear();
     }
+
+    // ===================================================================
+    // Paged / batched forward (kt_mla_forward, qlen_count > 1)
+    // ===================================================================
+    //
+    // Mirrors the C++ TP_MLA_Common::forward contract (mla-tp.hpp:84):
+    //   forward(qlens, page_tables, kv_lens, input, output)
+    // — a batch of sequences, each with its own page table and KV length.
+    // Pages are the engine's own MlaKvCache pages (the C++ registers
+    // external pages via set_pages; the Zig C API's kt_mla_new pre-allocates
+    // config.page_count pages and the page tables index into those).
+    //
+    // Page-table format (C ABI, c_int per entry):
+    //   page_table[logical_pos / token_count_in_page] = physical page idx
+    //
+    // The new KVs (qlen tokens per sequence) are written at logical
+    // positions [kv_len - qlen, kv_len) — the scheduler is expected to have
+    // reserved those slots — and attention attends over [0, kv_len).
+    //
+    // Sequences are processed sequentially through the shared engine
+    // (weights and scratch are reused; attention is per-sequence so
+    // there is no cross-sequence interference).
+
+    /// Paged variant of computePeScores: q_pe @ k_pe^T with the k_pe read
+    /// through the page table.
+    fn pagedComputePeScores(
+        self: *MlaEngine,
+        page_table: [*]const c_int,
+        qlen: usize,
+        kvlen: usize,
+        head_idx: usize,
+    ) void {
+        const cfg = self.config;
+        const q_pe_head = self.q_pe.ptr + head_idx * qlen * cfg.rope_size;
+        const attn_weights_head = self.attention_weights.ptr + head_idx * qlen * cfg.max_kvlen;
+
+        for (0..qlen) |q_pos| {
+            for (0..kvlen) |kv_pos| {
+                const k_pe = self.cache.pagedGetRopePtr(page_table, kv_pos);
+
+                var score: f32 = 0;
+                var i: usize = 0;
+                while (i + 16 <= cfg.rope_size) : (i += 16) {
+                    const qv: Vec16f32 = loadVec16(q_pe_head + q_pos * cfg.rope_size + i);
+                    const kv = loadVec16(k_pe + i);
+                    score += @reduce(.Add, qv * kv);
+                }
+                while (i < cfg.rope_size) : (i += 1) {
+                    score += q_pe_head[q_pos * cfg.rope_size + i] * k_pe[i];
+                }
+
+                attn_weights_head[q_pos * cfg.max_kvlen + kv_pos] = score;
+            }
+        }
+    }
+
+    /// Paged variant of computeNopeScores: q_absorb @ compressed_kv^T
+    /// through the page table, accumulating onto the PE scores.
+    fn pagedComputeNopeScores(
+        self: *MlaEngine,
+        page_table: [*]const c_int,
+        qlen: usize,
+        kvlen: usize,
+        head_idx: usize,
+    ) void {
+        const cfg = self.config;
+        const q_absorb_head = self.q_absorb.ptr + head_idx * qlen * cfg.kv_lora_rank;
+        const attn_weights_head = self.attention_weights.ptr + head_idx * qlen * cfg.max_kvlen;
+
+        for (0..qlen) |q_pos| {
+            const q_abs = q_absorb_head + q_pos * cfg.kv_lora_rank;
+            for (0..kvlen) |kv_pos| {
+                const ckv = self.cache.pagedGetNopePtr(page_table, kv_pos);
+
+                var score: f32 = 0;
+                var i: usize = 0;
+                while (i + 16 <= cfg.kv_lora_rank) : (i += 16) {
+                    const qv: Vec16f32 = loadVec16(q_abs + i);
+                    const kv = loadVec16(ckv + i);
+                    score += @reduce(.Add, qv * kv);
+                }
+                while (i < cfg.kv_lora_rank) : (i += 1) {
+                    score += q_abs[i] * ckv[i];
+                }
+
+                attn_weights_head[q_pos * cfg.max_kvlen + kv_pos] += score;
+            }
+        }
+    }
+
+    /// Paged variant of computeOAbsorb: o_absorb = weights @ compressed_kv
+    /// through the page table.
+    fn pagedComputeOAbsorb(
+        self: *MlaEngine,
+        page_table: [*]const c_int,
+        qlen: usize,
+        kvlen: usize,
+        head_idx: usize,
+    ) void {
+        const cfg = self.config;
+        const attn_weights_head = self.attention_weights.ptr + head_idx * qlen * cfg.max_kvlen;
+        const o_absorb_head = self.o_absorb.ptr + head_idx * qlen * cfg.kv_lora_rank;
+
+        for (0..qlen) |q_pos| {
+            const dst_row = o_absorb_head + q_pos * cfg.kv_lora_rank;
+            @memset(dst_row[0..cfg.kv_lora_rank], 0);
+
+            for (0..kvlen) |kv_pos| {
+                const weight = attn_weights_head[q_pos * cfg.max_kvlen + kv_pos];
+                const ckv = self.cache.pagedGetNopePtr(page_table, kv_pos);
+
+                var i: usize = 0;
+                while (i + 16 <= cfg.kv_lora_rank) : (i += 16) {
+                    const w: Vec16f32 = @splat(weight);
+                    var dst: Vec16f32 = loadVec16(dst_row + i);
+                    const src = loadVec16(ckv + i);
+                    dst += w * src;
+                    (dst_row + i)[0..16].* = dst;
+                }
+                while (i < cfg.kv_lora_rank) : (i += 1) {
+                    dst_row[i] += weight * ckv[i];
+                }
+            }
+        }
+    }
+
+    /// Paged forward for ONE sequence of the batch: projects Q and the new
+    /// KVs, writes the KVs through the page table, attends over [0, kv_len),
+    /// writes [qlen, hidden_size] into `output`.
+    fn forwardPagedSequence(
+        self: *MlaEngine,
+        input: [*]const f32, // [qlen, hidden_size]
+        output: [*]f32, // [qlen, hidden_size]
+        page_table: [*]const c_int,
+        qlen: usize,
+        kv_len: usize,
+    ) !void {
+        const cfg = self.config;
+        const num_heads = cfg.numHeadsPerTp();
+        const kv_start_pos = kv_len - qlen;
+
+        // 1. Project Q (RoPE at absolute positions kv_start_pos..kv_len)
+        self.projectQ(input, qlen, kv_start_pos);
+
+        // 2. Project the new KVs (kv_a_proj + RMSNorm + RoPE at absolute
+        //    positions) into the engine scratch, same as projectKV does,
+        //    but write through the page table instead of appendToken.
+        matmulF32(
+            input,
+            cfg.hidden_size,
+            cfg.kv_a_proj_with_mqa,
+            cfg.hidden_size,
+            self.kv_a_proj_output.ptr,
+            cfg.kv_lora_rank + cfg.rope_size,
+            qlen,
+            cfg.kv_lora_rank + cfg.rope_size,
+            cfg.hidden_size,
+        );
+        for (0..qlen) |i| {
+            const kv_output = self.kv_a_proj_output.ptr + i * (cfg.kv_lora_rank + cfg.rope_size);
+            rmsNorm(
+                kv_output,
+                cfg.kv_a_norm,
+                self.compressed_kv.ptr + i * cfg.kv_lora_rank,
+                cfg.kv_lora_rank,
+                1e-6,
+            );
+            const dst = self.k_pe_buffer.ptr + i * cfg.rope_size;
+            @memcpy(dst[0..cfg.rope_size], (kv_output + cfg.kv_lora_rank)[0..cfg.rope_size]);
+            applyRopeKpe(dst, kv_start_pos + i, cfg.rope_size, cfg.rope_theta);
+        }
+        // Grow the page pool if the caller's table references pages we
+        // haven't allocated yet (kt_mla_new sized it from max_kvlen, but a
+        // table could exceed that if the caller re-uses slots).
+        const pages_needed: usize = @intCast(page_table[(kv_len - 1) / cfg.token_count_in_page] + 1);
+        _ = try self.cache.ensurePageCount(pages_needed);
+        for (0..qlen) |i| {
+            try self.cache.pagedWriteToken(
+                page_table,
+                kv_start_pos + i,
+                self.compressed_kv.ptr + i * cfg.kv_lora_rank,
+                self.k_pe_buffer.ptr + i * cfg.rope_size,
+            );
+        }
+
+        // 3. Attention per head (paged reads)
+        for (0..num_heads) |h| {
+            self.absorbWuk(qlen, h);
+            self.pagedComputePeScores(page_table, qlen, kv_len, h);
+            self.pagedComputeNopeScores(page_table, qlen, kv_len, h);
+            self.softmaxWeights(qlen, kv_len, h);
+            self.pagedComputeOAbsorb(page_table, qlen, kv_len, h);
+            self.absorbWuv(qlen, h);
+        }
+
+        // 4. Combine heads and project
+        self.combineAndProject(output, qlen);
+    }
+
+    /// Batched paged forward — the full kt_mla_forward contract.
+    /// input/output are the concatenation of the batch's sequences
+    /// ([sum(qlens), hidden_size]); each sequence attends over its own
+    /// page table / KV length. Sequences are processed sequentially
+    /// through the shared engine (correct, single-threaded semantics).
+    pub fn forwardPaged(
+        self: *MlaEngine,
+        input: [*]const f32,
+        output: [*]f32,
+        qlens: []const c_int,
+        page_tables: []const [*]const c_int,
+        kv_lens: []const c_int,
+    ) !void {
+        var in_off: usize = 0;
+        var out_off: usize = 0;
+        for (qlens, 0..) |qlen_c, seq| {
+            const qlen: usize = @intCast(qlen_c);
+            const kv_len: usize = @intCast(kv_lens[seq]);
+            if (qlen == 0) continue;
+            if (kv_len < qlen) return error.InvalidKvLen;
+            try self.forwardPagedSequence(
+                input + in_off * self.config.hidden_size,
+                output + out_off * self.config.hidden_size,
+                page_tables[seq],
+                qlen,
+                kv_len,
+            );
+            in_off += qlen;
+            out_off += qlen;
+        }
+    }
 };
 
 // ============================================================================
