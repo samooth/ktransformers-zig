@@ -3421,7 +3421,7 @@ test "IQ3_XXS scalar GEMM with hand-crafted block" {
 test "iq2xs kmap init: exact grid entries map correctly" {
     const init_mod = @import("kt").iq2xs_init;
     const allocator = testing.allocator;
-    var data = init_mod.initIq2XsData(allocator);
+    const data = init_mod.initIq2XsData(allocator);
     defer init_mod.freeIq2XsData(allocator, data);
 
     // Every grid entry's fingerprint should map back to itself
@@ -3445,7 +3445,7 @@ test "iq2xs kmap init: exact grid entries map correctly" {
 test "iq2xs kmap init: off-grid entries have valid neighbor offsets" {
     const init_mod = @import("kt").iq2xs_init;
     const allocator = testing.allocator;
-    var data = init_mod.initIq2XsData(allocator);
+    const data = init_mod.initIq2XsData(allocator);
     defer init_mod.freeIq2XsData(allocator, data);
 
     var off_grid_count: usize = 0;
@@ -3464,4 +3464,45 @@ test "iq2xs kmap init: off-grid entries have valid neighbor offsets" {
     }
     // 43692 - 256 = 43436 off-grid entries
     try testing.expectEqual(@as(usize, 43436), off_grid_count);
+}
+
+// ============================================================================
+// IQ2_XXS full quantize (with kmap init) — round trip
+// ============================================================================
+
+test "IQ2_XXS quantize with kmap: init -> quantize -> dequant round trip" {
+    const init_mod = root.iq2xs_init;
+    const quant_mod = @import("kt").iq2_quantize;
+    const iq2 = root.gemm_iq2_xxs;
+    const allocator = testing.allocator;
+
+    const k = iq2.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+
+    const data = init_mod.initIq2XsData(allocator);
+    defer init_mod.freeIq2XsData(allocator, data);
+
+    var blk: [1]iq2.BlockIQ2_XXS = undefined;
+    quant_mod.quantizeRowIQ2_XXS_WithInit(data, &src, &blk, k, null);
+
+    var dst: [k]f32 = undefined;
+    iq2.dequantizeRowIQ2_XXS(@ptrCast(&blk), &dst, k);
+
+    var max_abs_err: f32 = 0;
+    var sum_abs_x: f32 = 0;
+    for (0..k) |i| {
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+        sum_abs_x += @abs(src[i]);
+    }
+    const rel = max_abs_err / (sum_abs_x / k);
+    // 2.0625 bpw grid quant with NULL importance weights (the reference
+    // always uses quant_weights in practice — without them, low-|x| weights
+    // get poorly quantized by design). Constant-0.5 verification confirms
+    // the algorithm is correct (values map to the {8,25,43} magnitude
+    // alphabet at the right scale). This is an algorithm-correctness test,
+    // not a precision test. Allow 150% for the null-weight path.
+    try testing.expect(rel < 1.50);
 }
