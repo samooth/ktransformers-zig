@@ -92,3 +92,11 @@ See [TODO.md](TODO.md) for current status and roadmap.
 ## License
 
 Apache-2.0 (same as ktransformers)
+
+## Attribution / NOTICE
+
+This project is a Zig port of KTransformers (https://github.com/kvcache-ai/KTransformers),
+originally developed by MADSys Lab @ Tsinghua University, Approaching.AI, and 9#AISoft.
+The original work is licensed under the Apache License, Version 2.0.
+
+See [LICENSE](LICENSE) and [NOTICE](NOTICE) for details.
