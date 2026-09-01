@@ -259,7 +259,13 @@ fn quantizeRowIq4Xs(
 pub fn dequantizeRowIQ4_XS(x: [*]const BlockIQ4_XS, y: [*]f32, k: usize) void {
     // k must be a multiple of QK_K; the caller (dequantize_row wrapper) ensures
     // this. The block is QK_K=256 F32 outputs per BlockIQ4_XS input.
+    // Zig 0.16: `y` is a many-pointer ([*]f32) — to advance the cursor
+    // by N elements across sub-blocks, we carry an index counter
+    // (`yoff`) instead of doing `y += 32` directly. This is the same
+    // pattern Q4_K/Q5_K/Q6_K use (their authors ran into the same
+    // compiler rule on many-pointer arithmetic).
     const nb = k / QK_K;
+    var yoff: usize = 0;
 
     for (0..nb) |i| {
         const blk = &x[i];
@@ -282,10 +288,10 @@ pub fn dequantizeRowIQ4_XS(x: [*]const BlockIQ4_XS, y: [*]f32, k: usize) void {
             for (0..16) |j| {
                 const v_lo = KVALUES_IQ4NL[qso[j] & 0xf];
                 const v_hi = KVALUES_IQ4NL[qso[j] >> 4];
-                y[j + 0] = dl * @as(f32, @floatFromInt(v_lo));
-                y[j + 16] = dl * @as(f32, @floatFromInt(v_hi));
+                y[yoff + j + 0] = dl * @as(f32, @floatFromInt(v_lo));
+                y[yoff + j + 16] = dl * @as(f32, @floatFromInt(v_hi));
             }
-            y += 32;
+            yoff += 32;
         }
     }
 }
@@ -295,8 +301,15 @@ pub fn dequantizeRowIQ4_XS(x: [*]const BlockIQ4_XS, y: [*]f32, k: usize) void {
 // ============================================================================
 
 pub fn quantizeRowIQ4_XS(x: [*]const f32, y: [*]BlockIQ4_XS, k: usize) void {
+    // Zig 0.16: arithmetic on a many-pointer (`y + i`) is rejected
+    // for the same reason as in dequantizeRowIQ4_XS. The internal
+    // quantizeRowIq4Xs takes a single-block *BlockIQ4_XS, so we
+    // @ptrCast the many-pointer to a single pointer.
     const nb = k / QK_K;
-    for (0..nb) |i| quantizeRowIq4Xs(x + i * QK_K, y + i);
+    for (0..nb) |i| {
+        const blk: *BlockIQ4_XS = @ptrCast(@alignCast(y + i));
+        quantizeRowIq4Xs(x + i * QK_K, blk);
+    }
 }
 
 // ============================================================================

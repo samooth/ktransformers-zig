@@ -94,10 +94,9 @@ comptime {
     _ = &gemm_q3_k.dequantizeRowQ3_KToBF16;
     _ = &gemm_q3_k.gemmQ3_KScalar;
     _ = &gemm_iq4_xs.BlockIQ4_XS;
-    _ = &gemm_iq4_xs.kvalues_iq4nl;
+    _ = &gemm_iq4_xs.KVALUES_IQ4NL;
     _ = &gemm_iq4_xs.f32_to_f16;
     _ = &gemm_iq4_xs.f16_to_f32;
-    _ = &gemm_iq4_xs.nearestInt;
     _ = &gemm_iq4_xs.quantizeRowIQ4_XS;
     _ = &gemm_iq4_xs.dequantizeRowIQ4_XS;
     _ = &gemm_iq4_xs.dequantizeRowIQ4_XSToBF16;

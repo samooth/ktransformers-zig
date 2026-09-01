@@ -3169,10 +3169,10 @@ test "IQ4_XS block layout byte-exact (136 bytes)" {
 
 test "IQ4_XS best_index_int8 known values" {
     const iq4xs = root.gemm_iq4_xs;
-    try testing.expect(iq4xs.kvalues_iq4nl[0] == -127);
-    try testing.expect(iq4xs.kvalues_iq4nl[15] == 113);
-    try testing.expect(iq4xs.kvalues_iq4nl[8] == 1);
-    try testing.expect(iq4xs.kvalues_iq4nl[7] == -10);
+    try testing.expect(iq4xs.KVALUES_IQ4NL[0] == -127);
+    try testing.expect(iq4xs.KVALUES_IQ4NL[15] == 113);
+    try testing.expect(iq4xs.KVALUES_IQ4NL[8] == 1);
+    try testing.expect(iq4xs.KVALUES_IQ4NL[7] == -10);
 }
 
 test "IQ4_XS quantize/dequantize round trip accuracy" {
@@ -3225,7 +3225,7 @@ test "IQ4_XS scalar GEMM vs dequantized reference" {
     for (0..N) |j| iq4xs.quantizeRowIQ4_XS(&src, @ptrCast(&b[j]), K);
 
     var c: [M * N]f32 = undefined;
-    iq4xs.gemmIQ4_XSScalar(&a, K, &b, 1, &c, N, M, N, K);
+    iq4xs.gemmIQ4_XSScalar(&a, &b, &c, M, N, K, K, 1, N);
 
     var w: [K]f32 = undefined;
     iq4xs.dequantizeRowIQ4_XS(@ptrCast(&b[0]), &w, K);
