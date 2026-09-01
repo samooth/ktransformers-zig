@@ -177,6 +177,24 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(neon_test_obj).step);
 
+    // Suite 6b: NEON Phase-2 — BF16 GEMM kernel correctness on x86_64.
+    // The test imports everything via the single `kt` (root) module,
+    // which re-exports gemm_bf16_neon and amx. Direct imports of the
+    // underlying files would create a "file exists in two modules"
+    // error since the test module already has them via root.kt.
+    const neon_kt_mod = b.createModule(.{ .root_source_file = b.path("src/root.zig"), .target = target, .optimize = optimize });
+    // The test module's `kt` import transitively pulls in pthread
+    // (worker_pool, kt_cpuinfer_sync). link_libc is required so the
+    // test build resolves the @cImport for pthread_mutex_* / pthread_cond_*.
+    neon_kt_mod.link_libc = true;
+    const neon_kernel_test_mod = b.createModule(.{ .root_source_file = b.path("tests/kernels/neon_kernel_test.zig"), .target = target, .optimize = optimize });
+    neon_kernel_test_mod.addImport("kt", neon_kt_mod);
+    const neon_kernel_test_obj = b.addTest(.{
+        .root_module = neon_kernel_test_mod,
+        .test_runner = .{ .path = b.path("tools/test_runner.zig"), .mode = .simple },
+    });
+    test_step.dependOn(&b.addRunArtifact(neon_kernel_test_obj).step);
+
     // --- Bench step (B2) ---
     //
     // `zig build -Doptimize=ReleaseFast bench` runs both micro-benchmarks

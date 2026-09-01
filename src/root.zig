@@ -20,6 +20,7 @@ pub const mla_config = @import("mla/mla_config.zig");
 pub const mla_cache = @import("mla/mla_cache.zig");
 pub const mla_core = @import("mla/mla_core.zig");
 pub const lora_kernels = @import("kernels/amx/lora_kernels.zig");
+pub const gemm_bf16_neon = @import("kernels/arch/gemm_224_bf16_neon.zig");
 
 // MXFP4/MXFP8 kernels: re-exports alone are not enough — without a
 // `comptime { _ = &fn; }` block the .so contains zero MXFP code (lazy
@@ -201,4 +202,21 @@ comptime {
     _ = &deepseekv3_model.DeepseekV3ForCausalLM.init;
     _ = &deepseekv3_model.DeepseekV3ForCausalLM.forward;
     _ = &deepseekv3_model.DeepseekV3ForCausalLM.deinit;
+}
+
+// NEON Phase-2: force analysis of the NEON-vectorized BF16 GEMM. The
+// cross-build (`zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu`)
+// lowers the comptime @Vector(4,f32) to native NEON fmul/fmla. On
+// x86_64 the same source lowers to SSE 128-bit (half the lane count
+// of the x86 A1 kernel, but algorithmically correct — the
+// comptime gate `if (neon.NeonFeatures.available)` ensures only
+// the relevant path emits). Without these fn-refs the .so contains
+// zero NEON code (lazy analysis strips the module on aarch64 just
+// like it does for MLA / lora_kernels).
+comptime {
+    _ = &gemm_bf16_neon.GemmExpertBF16NEON.gemmExpert;
+    _ = &gemm_bf16_neon.GemmExpertBF16NEON.gemmExpertNeon;
+    _ = &gemm_bf16_neon.GemmExpertBF16NEON.gemmExpertScalar;
+    _ = &gemm_bf16_neon.GemmExpertBF16NEON.VecF32;
+    _ = &gemm_bf16_neon.GemmExpertBF16NEON.reduceAdd;
 }
