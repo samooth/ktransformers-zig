@@ -490,6 +490,16 @@ Estos no estaban en el feedback del dev pero aparecen al verificarlo:
 | P2 | B3 — `kt_cpuinfer_sync` real o eliminar | Bajo | ✅ Resuelto en `ca0485a` (pending_jobs + waitIdle) |
 | P3 | B4 — Test que `nm -D` exporta los símbolos de `include/kt_kernel.h` | Bajo | ✅ Mitigado por `tools/verify_abi.py` en `ff57125` (doble gate) |
 
+## Partes P2/P3 que aparecieron post-auditoría y fueron trabajadas
+
+Estos ítems no estaban en el feedback original; emergieron de la auditoría
+del código y de la evolución natural del workstream.
+
+| Item | Commit | Notas |
+|------|--------|-------|
+| Fix rot Zig 0.16 en `src/numa/` (`NumaTopology.detect`, `allocNuma`, `migratePagesToNode`, `getPageNodes`) | `bd7e712` | 5 símbolos numa nuevos en el .so; bug encontrado de paso: `getThreadAffinity` malinterpretaba el retorno de `sched_getaffinity` (kernel devuelve bytes copiados, no errno) |
+| `ci/wheels.yml`: gates ABI + test suites antes de `build-wheel` | `1da4470` | ejecuta `verify_abi.py` + `audit_layout.py` + `zig build test` |
+
 ---
 
 ## Parte F — Recomendación al equipo
