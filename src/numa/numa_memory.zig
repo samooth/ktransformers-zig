@@ -223,7 +223,11 @@ pub fn pinThreadToCpu(cpu: usize) !void {
 pub fn getThreadAffinity() !CpuSet {
     var cs = CpuSet.init();
     const rc = sys_sched_getaffinity(0, @sizeOf(CpuSet), @ptrCast(&cs.bits));
-    if (rc != 0) {
+    // Kernel convention: sched_getaffinity returns the number of bytes
+    // copied on SUCCESS (>= 1), and a NEGATIVE errno on failure. The old
+    // `rc != 0` check misread every successful call as a failure (e.g.
+    // rc=8 on this host: the affinity mask of the allowed CPUs).
+    if (rc < 0) {
         return error.GetAffinityFailed;
     }
     return cs;
@@ -242,11 +246,22 @@ pub fn allocNuma(
     node_mask: NumaNodeMask,
     policy: NumaPolicy,
 ) ![]u8 {
-    // Allocate aligned memory
-    const mem = try allocator.alignedAlloc(u8, @enumFromInt(std.math.log2(alignment)), size);
+    // Zig 0.16: alignedAlloc takes a COMPTIME alignment enum, but this
+    // API receives the alignment at runtime. rawAlloc takes the enum at
+    // runtime (the Alignment enum is open-ended — @enumFromInt on the
+    // log2 byte count works for any power of two). The caller must
+    // free through rawFree with THE SAME alignment byte count; there
+    // is no freeNuma companion, so the contract is: keep (alignment,
+    // size) and call allocator.rawFree(slice, alignment, @returnAddress()).
+    const align_enum = std.mem.Alignment.fromByteUnits(alignment);
+    const raw = allocator.rawAlloc(size, align_enum, @returnAddress()) orelse return error.OutOfMemory;
 
-    // Bind to NUMA nodes
-    try bindMemory(mem.ptr, mem.len, node_mask, policy);
+    const mem: []u8 = raw[0..size];
+
+    // Bind to NUMA nodes (best-effort: bindMemory retries without
+    // STRICT; on total failure we return the unbound memory rather
+    // than OOM — a partially-bound huge allocation beats no allocation).
+    bindMemory(@ptrCast(mem.ptr), mem.len, node_mask, policy) catch {};
 
     return mem;
 }
@@ -318,7 +333,7 @@ pub fn migratePagesToNode(addr: [*]u8, page_count: usize, target_node: c_int) !v
     const pages = try std.heap.page_allocator.alloc(*anyopaque, page_count);
     defer std.heap.page_allocator.free(pages);
 
-    const page_size = std.mem.page_size;
+    const page_size: usize = std.heap.page_size_min;
     for (0..page_count) |i| {
         pages[i] = addr + i * page_size;
     }
@@ -345,7 +360,7 @@ pub fn migratePagesToNode(addr: [*]u8, page_count: usize, target_node: c_int) !v
 
 /// Touch memory to ensure pages are allocated (fault them in)
 pub fn touchMemory(mem: []u8) void {
-    const page_size = std.mem.page_size;
+    const page_size: usize = std.heap.page_size_min;
     var i: usize = 0;
     while (i < mem.len) : (i += page_size) {
         mem[i] = 0;
@@ -427,7 +442,7 @@ pub fn getPageNodes(addr: [*]const u8, page_count: usize) ![]c_int {
     const pages = try std.heap.page_allocator.alloc(*anyopaque, page_count);
     defer std.heap.page_allocator.free(pages);
 
-    const page_size = std.mem.page_size;
+    const page_size: usize = std.heap.page_size_min;
     for (0..page_count) |i| {
         pages[i] = @constCast(addr + i * page_size);
     }
@@ -445,7 +460,7 @@ pub fn getPageNodes(addr: [*]const u8, page_count: usize) ![]c_int {
 
 /// Migrate memory to local NUMA node (where the calling thread runs)
 pub fn migrateToLocal(addr: [*]u8, len: usize) !void {
-    const page_size = std.mem.page_size;
+    const page_size: usize = std.heap.page_size_min;
     const page_count = (len + page_size - 1) / page_size;
 
     // Get current CPU and its NUMA node

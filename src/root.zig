@@ -15,6 +15,7 @@ pub const gemm_int8 = @import("kernels/amx/gemm_224_int8.zig");
 pub const moe = @import("kernels/moe/moe.zig");
 pub const moe_sft = @import("kernels/moe/moe_sft.zig");
 pub const deepseekv3_layer = @import("kernels/moe/deepseekv3_layer.zig");
+pub const deepseekv3_model = @import("kernels/moe/deepseekv3_model.zig");
 pub const mla_config = @import("mla/mla_config.zig");
 pub const mla_cache = @import("mla/mla_cache.zig");
 pub const mla_core = @import("mla/mla_core.zig");
@@ -106,11 +107,10 @@ comptime {
 // propagates naturally to setThreadAffinity and bindMemory. We force
 // those (and the NumaAllocator vtable) here so external users linking
 // against the .so can reach them without depending on internal module
-// paths. Other NUMA helpers (allocNuma, NumaTopology.detect, etc.) are
-// NOT forced — they have Zig 0.16 API rot in their implementations
-// (std.fs.cwd().access, std.mem.page_size, alignedAlloc signature) and
-// are not currently consumed by any path. They will compile when the
-// consumer is added.
+// paths. The topology detector and NUMA allocator helpers were revived
+// from Zig 0.16 API rot (std.fs.cwd → std.Io, std.mem.page_size →
+// std.heap.page_size_min, runtime-aligned rawAlloc) — they now compile
+// and are forced here as well.
 comptime {
     _ = &numa.memory.setThreadAffinity;
     _ = &numa.memory.pinThreadToCpu;
@@ -118,7 +118,12 @@ comptime {
     _ = &numa.memory.bindMemory;
     _ = &numa.memory.setThreadNumaPolicy;
     _ = &numa.memory.getThreadNumaPolicy;
+    _ = &numa.memory.allocNuma;
     _ = &numa.memory.NumaAllocator.init;
+    _ = &numa.topology.NumaTopology.detect;
+    _ = &numa.topology.NumaTopology.deinit;
+    _ = &numa.topology.NumaTopology.nodeForCpu;
+    _ = &numa.topology.NumaTopology.cpusForNode;
     _ = &numa.worker.NumaWorker.spawn;
 }
 
@@ -135,4 +140,10 @@ comptime {
     _ = &deepseekv3_layer.DeepseekV3DecoderLayer.init;
     _ = &deepseekv3_layer.DeepseekV3DecoderLayer.forward;
     _ = &deepseekv3_layer.DeepseekV3DecoderLayer.deinit;
+    _ = &deepseekv3_model.DeepseekV3Model.init;
+    _ = &deepseekv3_model.DeepseekV3Model.forward;
+    _ = &deepseekv3_model.DeepseekV3Model.deinit;
+    _ = &deepseekv3_model.DeepseekV3ForCausalLM.init;
+    _ = &deepseekv3_model.DeepseekV3ForCausalLM.forward;
+    _ = &deepseekv3_model.DeepseekV3ForCausalLM.deinit;
 }

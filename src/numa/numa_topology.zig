@@ -1,6 +1,12 @@
 // NUMA Topology Detection for ktransformers-zig
 // Discovers NUMA node layout, CPU affinity, and memory topology
 // via /sys/devices/system/node/ and /proc/cpuinfo
+//
+// Zig 0.16 note: all filesystem access goes through the std.Io interface
+// (std.fs.cwd / File.readToEndAlloc are gone in this toolchain). The
+// pattern matches runtime/cpu_detect.zig: a std.Io.Threaded instance,
+// std.Io.Dir.cwd(), and readStreaming into a fixed buffer (sysfs
+// attributes are tiny — a few hundred bytes max).
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -8,10 +14,10 @@ const Allocator = std.mem.Allocator;
 /// NUMA node information
 pub const NumaNode = struct {
     id: usize,
-    cpus: []usize,           // CPU indices belonging to this node
-    memory_total: usize,      // Total memory in bytes
-    memory_free: usize,       // Free memory in bytes
-    distance: []usize,        // Distance to other nodes (SLIT table)
+    cpus: []usize, // CPU indices belonging to this node
+    memory_total: usize, // Total memory in bytes
+    memory_free: usize, // Free memory in bytes
+    distance: []usize, // Distance to other nodes (SLIT table)
 };
 
 /// System NUMA topology
@@ -22,26 +28,32 @@ pub const NumaTopology = struct {
     allocator: Allocator,
 
     pub fn detect(allocator: Allocator) !NumaTopology {
-        // Count NUMA nodes
+        var io = std.Io.Threaded.init(allocator, .{ .environ = std.process.Environ.empty });
+        defer io.deinit();
+
+        // Count NUMA nodes: probe /sys/devices/system/node/nodeN until
+        // the open fails. A single-socket host has only node0.
         var num_nodes: usize = 0;
         while (true) : (num_nodes += 1) {
-            const path = try std.fmt.allocPrint(allocator, "/sys/devices/system/node/node{d}", .{num_nodes});
-            defer allocator.free(path);
-            std.fs.cwd().access(path, .{}) catch break;
+            var path_buf: [96]u8 = undefined;
+            const path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/node/node{d}", .{num_nodes}) catch break;
+            const dir = std.Io.Dir.cwd();
+            const f = dir.openFile(std.Io.Threaded.io(&io), path, .{}) catch break;
+            f.close(std.Io.Threaded.io(&io));
         }
 
         if (num_nodes == 0) {
-            // No NUMA - single node system
+            // No sysfs NUMA info (container, non-NUMA kernel) — single node.
             num_nodes = 1;
         }
 
         const nodes = try allocator.alloc(NumaNode, num_nodes);
         errdefer allocator.free(nodes);
 
-        const num_cpus = try countCpus(allocator);
+        const num_cpus = try countCpus(allocator, &io);
 
         for (0..num_nodes) |node_id| {
-            nodes[node_id] = try detectNode(allocator, node_id, num_nodes, num_cpus);
+            nodes[node_id] = try detectNode(allocator, &io, node_id, num_nodes, num_cpus);
         }
 
         return NumaTopology{
@@ -58,6 +70,7 @@ pub const NumaTopology = struct {
             self.allocator.free(node.distance);
         }
         self.allocator.free(self.nodes);
+        self.* = undefined;
     }
 
     /// Get the NUMA node for a given CPU
@@ -105,12 +118,21 @@ pub const NumaTopology = struct {
     }
 };
 
-fn countCpus(allocator: Allocator) !usize {
-    const file = try std.fs.cwd().openFile("/proc/cpuinfo", .{});
-    defer file.close();
+/// Read a small file fully into a fixed buffer; returns the trimmed
+/// content. Returns null when the file can't be opened.
+fn readSmallFile(io: *std.Io.Threaded, path: [:0]const u8, buf: []u8) ?[]u8 {
+    const dir = std.Io.Dir.cwd();
+    const f = dir.openFile(std.Io.Threaded.io(io), path, .{}) catch return null;
+    defer f.close(std.Io.Threaded.io(io));
+    // readStreaming reads until the buffer is full or EOF; returns the
+    // number of bytes placed in the (single) iovec.
+    const n = std.Io.File.readStreaming(f, std.Io.Threaded.io(io), &.{buf}) catch return null;
+    return buf[0..n];
+}
 
-    const content = try file.readToEndAlloc(allocator, 1_000_000);
-    defer allocator.free(content);
+fn countCpus(allocator: Allocator, io: *std.Io.Threaded) !usize {
+    var buf: [65536]u8 = undefined;
+    const content = readSmallFile(io, "/proc/cpuinfo", &buf) orelse return 1;
 
     var max_cpu: usize = 0;
     var lines = std.mem.splitScalar(u8, content, '\n');
@@ -118,114 +140,99 @@ fn countCpus(allocator: Allocator) !usize {
         if (std.mem.startsWith(u8, line, "processor")) {
             if (std.mem.indexOf(u8, line, ":")) |colon| {
                 const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
-                const cpu = try std.fmt.parseInt(usize, val, 10);
+                const cpu = std.fmt.parseInt(usize, val, 10) catch continue;
                 if (cpu >= max_cpu) max_cpu = cpu + 1;
+                _ = allocator;
             }
         }
     }
-    return max_cpu;
+    return @max(max_cpu, 1);
 }
 
-fn detectNode(allocator: Allocator, node_id: usize, num_nodes: usize, num_cpus: usize) !NumaNode {
-    // Read cpulist
-    const cpulist_path = try std.fmt.allocPrint(allocator, "/sys/devices/system/node/node{d}/cpulist", .{node_id});
-    defer allocator.free(cpulist_path);
+fn detectNode(allocator: Allocator, io: *std.Io.Threaded, node_id: usize, num_nodes: usize, num_cpus: usize) !NumaNode {
+    // Zig 0.16: ArrayList is unmanaged (.empty + append(allocator, x)).
+    var cpus: std.ArrayList(usize) = .empty;
+    errdefer cpus.deinit(allocator);
 
-    var cpus = std.ArrayList(usize).init(allocator);
-    errdefer cpus.deinit();
-
-    const cpulist_file = std.fs.cwd().openFile(cpulist_path, .{}) catch {
-        // If file doesn't exist, assume all CPUs on node 0
-        if (node_id == 0) {
+    // Read cpulist (e.g., "0-15,32-47")
+    {
+        var path_buf: [96]u8 = undefined;
+        const cpulist_path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/node/node{d}/cpulist", .{node_id}) catch unreachable;
+        var cl_buf: [256]u8 = undefined;
+        if (readSmallFile(io, cpulist_path, &cl_buf)) |cpulist| {
+            const trimmed = std.mem.trim(u8, cpulist, " \t\n\r");
+            var ranges = std.mem.splitScalar(u8, trimmed, ',');
+            while (ranges.next()) |range| {
+                const r = std.mem.trim(u8, range, " \t");
+                if (std.mem.indexOf(u8, r, "-")) |dash| {
+                    const start = std.fmt.parseInt(usize, r[0..dash], 10) catch continue;
+                    const end = std.fmt.parseInt(usize, r[dash + 1 ..], 10) catch continue;
+                    for (start..end + 1) |c| {
+                        try cpus.append(allocator, c);
+                    }
+                } else if (r.len > 0) {
+                    const cpu = std.fmt.parseInt(usize, r, 10) catch continue;
+                    try cpus.append(allocator, cpu);
+                }
+            }
+        } else if (node_id == 0) {
+            // No sysfs cpulist (container): all CPUs on node 0.
             for (0..num_cpus) |c| {
-                try cpus.append(c);
+                try cpus.append(allocator, c);
             }
-        }
-        return NumaNode{
-            .id = node_id,
-            .cpus = try cpus.toOwnedSlice(),
-            .memory_total = 0,
-            .memory_free = 0,
-            .distance = try allocator.alloc(usize, num_nodes),
-        };
-    };
-    defer cpulist_file.close();
-
-    const cpulist = try cpulist_file.readToEndAlloc(allocator, 4096);
-    defer allocator.free(cpulist);
-
-    // Parse cpulist (e.g., "0-15,32-47")
-    var ranges = std.mem.splitScalar(u8, std.mem.trim(u8, cpulist, "\n"), ',');
-    while (ranges.next()) |range| {
-        const trimmed = std.mem.trim(u8, range, " \t");
-        if (std.mem.indexOf(u8, trimmed, "-")) |dash| {
-            const start = try std.fmt.parseInt(usize, trimmed[0..dash], 10);
-            const end = try std.fmt.parseInt(usize, trimmed[dash + 1 ..], 10);
-            for (start..end + 1) |c| {
-                try cpus.append(c);
-            }
-        } else if (trimmed.len > 0) {
-            const cpu = try std.fmt.parseInt(usize, trimmed, 10);
-            try cpus.append(cpu);
         }
     }
 
     // Read memory info
-    const memtotal_path = try std.fmt.allocPrint(allocator, "/sys/devices/system/node/node{d}/meminfo", .{node_id});
-    defer allocator.free(memtotal_path);
-
     var memory_total: usize = 0;
     var memory_free: usize = 0;
-
-    const meminfo_file = std.fs.cwd().openFile(memtotal_path, .{}) catch null;
-    if (meminfo_file) |f| {
-        defer f.close();
-        const meminfo = try f.readToEndAlloc(allocator, 4096);
-        defer allocator.free(meminfo);
-
-        var mem_lines = std.mem.splitScalar(u8, meminfo, '\n');
-        while (mem_lines.next()) |line| {
-            if (std.mem.indexOf(u8, line, "MemTotal")) |_| {
-                if (std.mem.indexOf(u8, line, "kB")) |kb| {
-                    const val_str = std.mem.trim(u8, line[0..kb], " \tMemTotal:");
-                    memory_total = (try std.fmt.parseInt(usize, val_str, 10)) * 1024;
-                }
-            } else if (std.mem.indexOf(u8, line, "MemFree")) |_| {
-                if (std.mem.indexOf(u8, line, "kB")) |kb| {
-                    const val_str = std.mem.trim(u8, line[0..kb], " \tMemFree:");
-                    memory_free = (try std.fmt.parseInt(usize, val_str, 10)) * 1024;
+    {
+        var path_buf: [96]u8 = undefined;
+        const meminfo_path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/node/node{d}/meminfo", .{node_id}) catch unreachable;
+        var mem_buf: [4096]u8 = undefined;
+        if (readSmallFile(io, meminfo_path, &mem_buf)) |meminfo| {
+            var mem_lines = std.mem.splitScalar(u8, meminfo, '\n');
+            while (mem_lines.next()) |line| {
+                if (std.mem.indexOf(u8, line, "MemTotal")) |_| {
+                    if (std.mem.indexOf(u8, line, "kB")) |kb| {
+                        const val_str = std.mem.trim(u8, line[0..kb], " \tMemTotal:");
+                        memory_total = (std.fmt.parseInt(usize, val_str, 10) catch 0) * 1024;
+                    }
+                } else if (std.mem.indexOf(u8, line, "MemFree")) |_| {
+                    if (std.mem.indexOf(u8, line, "kB")) |kb| {
+                        const val_str = std.mem.trim(u8, line[0..kb], " \tMemFree:");
+                        memory_free = (std.fmt.parseInt(usize, val_str, 10) catch 0) * 1024;
+                    }
                 }
             }
         }
     }
 
     // Read distance table (SLIT)
-    const distance_path = try std.fmt.allocPrint(allocator, "/sys/devices/system/node/node{d}/distance", .{node_id});
-    defer allocator.free(distance_path);
-
     var distance = try allocator.alloc(usize, num_nodes);
+    errdefer allocator.free(distance);
     @memset(distance, 10); // Default distance
-
-    const dist_file = std.fs.cwd().openFile(distance_path, .{}) catch null;
-    if (dist_file) |f| {
-        defer f.close();
-        const dist_content = try f.readToEndAlloc(allocator, 4096);
-        defer allocator.free(dist_content);
-
-        var vals = std.mem.splitScalar(u8, std.mem.trim(u8, dist_content, "\n"), ' ');
-        var idx: usize = 0;
-        while (vals.next()) |val| {
-            const trimmed = std.mem.trim(u8, val, " \t");
-            if (trimmed.len > 0 and idx < num_nodes) {
-                distance[idx] = try std.fmt.parseInt(usize, trimmed, 10);
-                idx += 1;
+    {
+        var path_buf: [96]u8 = undefined;
+        const dist_path = std.fmt.bufPrintZ(&path_buf, "/sys/devices/system/node/node{d}/distance", .{node_id}) catch unreachable;
+        var dist_buf: [512]u8 = undefined;
+        if (readSmallFile(io, dist_path, &dist_buf)) |dist_content| {
+            const trimmed = std.mem.trim(u8, dist_content, " \t\n\r");
+            var vals = std.mem.splitScalar(u8, trimmed, ' ');
+            var idx: usize = 0;
+            while (vals.next()) |val| {
+                const v = std.mem.trim(u8, val, " \t");
+                if (v.len > 0 and idx < num_nodes) {
+                    distance[idx] = std.fmt.parseInt(usize, v, 10) catch 10;
+                    idx += 1;
+                }
             }
         }
     }
 
     return NumaNode{
         .id = node_id,
-        .cpus = try cpus.toOwnedSlice(),
+        .cpus = try cpus.toOwnedSlice(allocator),
         .memory_total = memory_total,
         .memory_free = memory_free,
         .distance = distance,

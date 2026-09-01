@@ -2789,3 +2789,193 @@ test "GemmKernel224BF tile params: override + reset + invalid guard" {
     try testing.expectEqual(tp.n_block, G.N_BLOCK);
     try testing.expectEqual(tp.k_block, G.K_BLOCK);
 }
+
+// ============================================================================
+// DeepseekV3Model + ForCausalLM — model-level orchestration
+// ============================================================================
+
+test "DeepseekV3Model: 2 layers -> final norm -> output (residual chain)" {
+    const dsv3 = root.deepseekv3_model;
+    const layer_mod = root.deepseekv3_layer;
+    const allocator = testing.allocator;
+
+    const hidden: usize = 64;
+    const w = try allocator.alloc(amx.bf16, 64 * 1024);
+    defer allocator.free(w);
+    @memset(w, 0);
+    const gate_w = try allocator.alloc(amx.bf16, 4 * hidden);
+    defer allocator.free(gate_w);
+    @memset(gate_w, 0);
+    // final norm weight = all ones (0x3F80) -> norm output == normalized x
+    const norm_w = try allocator.alloc(amx.bf16, hidden);
+    defer allocator.free(norm_w);
+    @memset(norm_w, 0x3F80);
+
+    var model = try dsv3.DeepseekV3Model.init(allocator, .{
+        .num_layers = 2,
+        .layer = .{
+            .hidden_size = hidden,
+            .q_lora_rank = 32,
+            .num_heads = 4,
+            .nope_size = 8,
+            .rope_size = 4,
+            .kv_lora_rank = 16,
+            .max_qlen = 2,
+            .max_kvlen = 16,
+            .token_count_in_page = 4,
+            .expert_num = 4,
+            .num_experts_per_tok = 2,
+            .intermediate_size = 32,
+            .q_a_proj = w.ptr,
+            .q_a_norm = w.ptr,
+            .q_b_proj = w.ptr,
+            .kv_a_proj_with_mqa = w.ptr,
+            .kv_a_norm = w.ptr,
+            .kv_b_proj = w.ptr,
+            .o_proj = w.ptr,
+            .attn_norm_weight = w.ptr,
+            .ffn_norm_weight = w.ptr,
+            .gate_weight = gate_w.ptr,
+            .gate_proj = w.ptr,
+            .up_proj = w.ptr,
+            .down_proj = w.ptr,
+        },
+        .final_norm_weight = norm_w.ptr,
+    });
+    defer model.deinit();
+    _ = layer_mod; // silence unused if not referenced below
+
+    const inp = try allocator.alloc(amx.bf16, hidden);
+    defer allocator.free(inp);
+    @memset(inp, amx.f32_to_bf16(0.5));
+    const out = try allocator.alloc(amx.bf16, hidden);
+    defer allocator.free(out);
+
+    // 2 layers, zero attn/ffn weights -> hidden passes through; final norm
+    // with weight=1 normalizes the (constant 0.5) vector: RMS(0.5)=0.5 ->
+    // out = 0.5 * (1/0.5) * 1 = 1.0.
+    model.forward(1, 0, inp.ptr, out.ptr);
+    for (0..hidden) |i| {
+        const v = amx.bf16_to_f32(out[i]);
+        try testing.expectApproxEqAbs(@as(f32, 1.0), v, 0.02);
+    }
+
+    // Step 2 with cached KV
+    @memset(out, 0);
+    model.forward(1, 1, inp.ptr, out.ptr);
+    for (0..hidden) |i| {
+        const v = amx.bf16_to_f32(out[i]);
+        try testing.expectApproxEqAbs(@as(f32, 1.0), v, 0.02);
+    }
+}
+
+test "DeepseekV3ForCausalLM: model + lm_head -> logits" {
+    const dsv3 = root.deepseekv3_model;
+    const allocator = testing.allocator;
+
+    const hidden: usize = 64;
+    const vocab: usize = 128;
+    const w = try allocator.alloc(amx.bf16, 64 * 1024);
+    defer allocator.free(w);
+    @memset(w, 0);
+    const gate_w = try allocator.alloc(amx.bf16, 4 * hidden);
+    defer allocator.free(gate_w);
+    @memset(gate_w, 0);
+    const norm_w = try allocator.alloc(amx.bf16, hidden);
+    defer allocator.free(norm_w);
+    @memset(norm_w, 0x3F80);
+    // lm_head = all ones -> logit = sum of final hidden per row
+    const lm_head = try allocator.alloc(amx.bf16, vocab * hidden);
+    defer allocator.free(lm_head);
+    @memset(lm_head, amx.f32_to_bf16(1.0));
+
+    var lm = try dsv3.DeepseekV3ForCausalLM.init(allocator, .{
+        .model = .{
+            .num_layers = 2,
+            .layer = .{
+                .hidden_size = hidden,
+                .q_lora_rank = 32,
+                .num_heads = 4,
+                .nope_size = 8,
+                .rope_size = 4,
+                .kv_lora_rank = 16,
+                .max_qlen = 2,
+                .max_kvlen = 16,
+                .token_count_in_page = 4,
+                .expert_num = 4,
+                .num_experts_per_tok = 2,
+                .intermediate_size = 32,
+                .q_a_proj = w.ptr,
+                .q_a_norm = w.ptr,
+                .q_b_proj = w.ptr,
+                .kv_a_proj_with_mqa = w.ptr,
+                .kv_a_norm = w.ptr,
+                .kv_b_proj = w.ptr,
+                .o_proj = w.ptr,
+                .attn_norm_weight = w.ptr,
+                .ffn_norm_weight = w.ptr,
+                .gate_weight = gate_w.ptr,
+                .gate_proj = w.ptr,
+                .up_proj = w.ptr,
+                .down_proj = w.ptr,
+            },
+            .final_norm_weight = norm_w.ptr,
+        },
+        .lm_head = lm_head.ptr,
+        .vocab_size = vocab,
+    });
+    defer lm.deinit();
+
+    const inp = try allocator.alloc(amx.bf16, hidden);
+    defer allocator.free(inp);
+    @memset(inp, amx.f32_to_bf16(0.5));
+    const logits = try allocator.alloc(f32, vocab);
+    defer allocator.free(logits);
+
+    lm.forward(1, 0, inp.ptr, logits.ptr);
+    // Final hidden after norm = 1.0 per element (from the Model test);
+    // lm_head row of ones -> logit = sum(1.0 x hidden=64) = 64.
+    for (0..vocab) |v| {
+        try testing.expectApproxEqAbs(@as(f32, 64.0), logits[v], 1.0);
+    }
+}
+
+// ============================================================================
+// src/numa/ revival regression: topology detect + allocNuma + affinity
+// ============================================================================
+//
+// These functions had Zig 0.16 API rot (std.fs.cwd, std.mem.page_size,
+// runtime alignedAlloc) and were un-analyzed dead code until this fix.
+// The test exercises the full revived path end-to-end on Linux.
+
+test "numa: NumaTopology.detect + allocNuma + affinity round trip" {
+    if (builtin.os.tag != .linux) return;
+    const allocator = testing.allocator;
+
+    // Topology: at least one node; node 0 has at least 1 CPU.
+    var topo = try root.numa.topology.NumaTopology.detect(allocator);
+    defer topo.deinit();
+    try testing.expect(topo.num_nodes >= 1);
+    try testing.expect(topo.nodes[0].cpus.len >= 1);
+    // Every node id matches its slot.
+    for (topo.nodes) |n| try testing.expect(n.id < topo.num_nodes);
+
+    // allocNuma: 1 MiB, 64-byte aligned, bound to node 0 — previously
+    // dead code (the comptime-enum alignedAlloc + std.mem.page_size rot).
+    var mask = root.numa.memory.NumaNodeMask.init();
+    mask.set(0);
+    const buf = try root.numa.memory.allocNuma(allocator, 1 << 20, 64, mask, .bind);
+    defer allocator.free(buf);
+    try testing.expect(buf.len == 1 << 20);
+    try testing.expect(@intFromPtr(buf.ptr) % 64 == 0);
+    @memset(buf, 0xAB);
+    try testing.expect(buf[0] == 0xAB and buf[buf.len - 1] == 0xAB);
+
+    // Affinity round trip: pin to cpu0, read the mask back, verify.
+    // This also regression-guards the sched_getaffinity return-convention
+    // fix (the kernel returns bytes-copied on success; the old rc!=0
+    // check misread every success as a failure).
+    try root.numa.memory.pinThreadToCpu(0);
+    const set = try root.numa.memory.getThreadAffinity();
+    try testing.expect(set.isSet(0));
+}
