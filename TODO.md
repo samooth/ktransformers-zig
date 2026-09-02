@@ -119,10 +119,7 @@ true vs false, with file:line evidence). All real items fixed:
   alignedAlloc signature). They only compile once referenced; fix on
   first use. Wiring NumaTopology.detect would let kt_worker_pool configs
   auto-populate `subpool_thread_cpus` from real topology.
-- [ ] **Route internal scratch through the MoE allocator** —
-  `routeExperts`' logits buffer + `routeExpertsWithOpts` scratch use
-  page_allocator (outside the B1 C-API contract, documented in the
-  allocator test). Closure: thread the captured TpMoe allocator in.
+- [x] **Route internal scratch through the MoE allocator — CLOSED (58b0cb1)** — `routeExperts`/`routeExpertsDeepSeek`/`routeExpertsWithOpts` scratch (logits + score rows + group scores/mask) now allocates through the caller-threaded allocator: `GateContext.allocator` at kt_gate_forward (B1-captured), `self.allocator` in DeepseekV3DecoderLayer.forward, testing-allocator at test sites. Buffers no longer escape a kt_set_default_allocator-installed tracker. No ABI change (internal API). Routing tests green: Gate+MoE e2e, group-top2 vs Python reference, both fallbacks.
 - [x] **`kt_mla_forward` qlen_count > 1 — CLOSED (139bf63 + 2e8ce43)** — paged/batched path: qlen_count==1 keeps the legacy sequential route; >1 loops per sequence through `MlaEngine.forwardPaged` with per-sequence page tables (mla-tp.hpp:84 contract), page_table_lens validated (>= ceil(kv_len/tokens_per_page)). `MlaKvCache` gained paged accessors (`pagedGetPageInfo/pagedWriteToken/pagedGetNopePtr/pagedGetRopePtr/ensurePageCount`) + save/load/dump/fromDump (32-byte "KVCA" header; page_table NOT serialized — scheduler's job, same as kvcache_load_dump.cpp). **Equivalence tests (2e8ce43 — the coverage 139bf63 shipped without)**: (a) scrambled==identity — same logical content on different physical pages, bit-for-bit (non-zero weights + non-zero-output guard = non-vacuous); (b) paged==legacy — single sequence through identity table == sequential path bit-for-bit. **Test (a) caught a real OOB on first run**: forwardPagedSequence sized the page pool from the LAST table entry only; a scrambled table with its max page index earlier (e.g. {7,6}) read past the pool (`index 7, len 7` in pagedGetRopePtr). Fixed: scan all n_pt_entries for max_page. 143 tests, 0 leaks, ABI 96/96 triple gate PASS.
 
 ### Python Packaging
