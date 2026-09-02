@@ -34,6 +34,7 @@ zig test src/mla/mla_tests.zig             # standalone MLA suite
 zig build -Doptimize=ReleaseFast bench     # GEMM micro-benchmark (B2)
 python3 tools/verify_abi.py                 # ABI double gate: exports + arity
 python3 tools/audit_layout.py               # ABI layout gate (pybind11 shim)
+sentrux check .                            # architecture rules gate (see below)
 ```
 
 Caveats (verified the hard way — see LESSONS_ZIG.md for details):
@@ -90,13 +91,13 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
   `kt_set_default_allocator` (injectable allocator, B1),
   `kt_dsv3_*` (DeepseekV3 model-orchestration), and
   `kt_qwen3moe_*` (Qwen3 model-orchestration).
-- GGML: **10/10 standard formats complete** — Q8_0, Q4_K, Q5_K, Q6_K,
-  Q8_K (linear/4-8 bit), Q2_K, Q3_K (linear/2-3 bit), IQ4_XS, IQ2_XXS
-  (grid-based with full kmap/kneighbors init for quantize), IQ3_XXS
-  (grid-based), IQ4_NL (non-linear 4-bit, 32-weight super-blocks).
-  IQ2_XXS/IQ3_XXS quantize is now real (was stubbed, see commits
-  7d10033 + b003990); only IQ2/IQ3 "S" and "M" variants remain for
-  if a real model needs them.
+- GGML: **15/15 — every kt_type_t format complete** — Q8_0 + the 7
+  K-quants (Q2_K..Q8_K), IQ4_XS + IQ4_NL (non-linear 4-bit),
+  IQ2_XXS/IQ2_XS/IQ2_S (2-bit grid family, full kmap/kneighbors
+  quantize), IQ3_XXS/IQ3_S (3-bit grid family), IQ1_S/IQ1_M (1-bit +
+  delta code). Each has quantize + dequantize + scalar GEMM + tests.
+  The kmap init is histogram-based (22x faster than the qsort port,
+  d0b0211) and process-cached. Commits: 7d10033..d0b0211.
 - MoE: `loadWeights` packs all 3 projections; `forwardGateUp`/
   `forwardDown` are real; `gemmExpert` is vectorized (`@Vector(8,f32)`
   K-loop, A1, ~5.2x on decode shapes); D1/D2/D3 buffer-overflow/index
@@ -132,9 +133,9 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
   fully revived (NumaTopology.detect + allocNuma + getThreadAffinity
   work byte-exact; getThreadAffinity bug fixed in route — kernel
   returns bytes-copied, not errno).
-- Tests: 73 kernels + 11 MLA + 9 MLA C-API + 2 FP8 + 9 GGML C API +
-  7 aarch64 + 4 NEON kernel + 2 allocator C API + 9 Qwen3 MoE =
-  **156 tests, all passing, 0 leaks**. Bench: `zig build bench`
+- Tests: **187+ across the suites, 0 leaks** (134 in the kernels suite
+  incl. all 15 GGML formats, 11 MLA + 4 MLA C-API + 2 FP8 + 9 GGML C
+  API + 7 aarch64 + NEON + allocator + Qwen3 + NUMA pool). Bench: `zig build bench`
   (2.8-9.3x measured speedup A1) + `moe_bench.zig` (end-to-end MoE
   forward with tile-param tuning: -20.3% on prefill 8×4 at K=448
   vs the 1792 default on this Ryzen 512K-L2 — validates the A4
@@ -192,6 +193,73 @@ custom ops (e.g. alternate SwiGLU variants). Pattern: iterate `tp_count`
 ranks, slice per-rank output offsets, accumulate down-proj in FP32 -> BF16.
 Both are real implementations (the guarded no-op era ended with the
 loadWeights fix); D3 fixed the `ldc` for tp_count > 1.
+
+## sentrux (architecture sensor — MCP + CLI)
+
+`.sentrux/rules.toml` is the **layering contract** for this repo, enforced by
+the sentrux rules engine. In this environment sentrux is exposed via the
+**MCP tools** (`sentrux_scan`, `sentrux_check_rules`, ...); the standalone
+CLI (`sentrux check .`) exists upstream via `brew install sentrux/tap/sentrux`
+/ the install.sh script if you want the gate in CI.
+
+### The contract (know this before adding imports)
+Layer order (lower may be imported by higher, **never** the reverse):
+`numa/io leaves(0) -> arch intrinsics(1) -> mla engine(2) -> kernels(3) ->
+runtime(4) -> root hub(5) -> C exports(6) -> tests/bench(7) -> bindings(8)`.
+
+Hard boundaries: `src/**` never imports `tests/**` or `bench/**`;
+`src/main.zig` reaches kernels only through `root.zig` (direct kernel imports
+bypass the comptime fn-ref wiring); kernels never import `main.zig`;
+`src/numa/**` is a std-only leaf; `src/kernels/arch/**` is imported-by-all and
+must not import any specific kernel.
+
+**Two INTENTIONAL exceptions — do NOT "fix" them** (documented inline in
+rules.toml):
+1. `root.zig <-> main.zig` cycle: `root.zig:241` forces `main.zig` analysis
+   so the `export fn kt_*` are EMITTED into the `.so` (Zig drops exports
+   nothing references — the LAZY-ANALYSIS trap). Hence `max_cycles = 1`.
+2. `root.zig` fan-out 47: it IS the designated module hub + comptime fn-ref
+   block. Hence `no_god_files = false`.
+
+Also intentional: grid/lookup tables have a single owner file that sibling
+kernels import (`gemm_224_iq1_s.zig` owns `IQ1S_GRID`; `gemm_224_iq2_xxs.zig`
+owns `KSIGNS`/`KMASK`). Same-layer data sharing is fine — don't split it.
+
+### How to use the MCP tools (agent workflow)
+
+1. **Session start**: `sentrux_session_start` BEFORE your first edit (saves
+   the baseline). At the end, `sentrux_session_end` reports whether your
+   session degraded anything. If you don't have the MCP, the CLI equivalents
+   are `sentrux gate --save .` before / `sentrux gate .` after.
+2. **After adding/removing imports or new files**: `sentrux_rescan` then
+   `sentrux_check_rules`. The check FAILs on any new cycle, any layer
+   inversion, or any boundary break — fix it or, if the change is a
+   legitimate new pattern, update rules.toml WITH a comment explaining why
+   (the file's comments are the source of truth for intent).
+3. **`sentrux_health`**: `quality_signal` 0-10000. Useful for *deltas* over
+   your session (it went 4976 -> 5388 when a real import cycle was removed);
+   do NOT chase the absolute number — root.zig's fan-out keeps it structurally
+   capped, and that's by design.
+4. **Ignore `sentrux_test_gaps` entirely** for this repo: it reports 0%
+   coverage because it can't follow the `@import("kt")` module alias that
+   build.zig wires for every test suite. The real count is `zig build test`
+   (160+ across the suites). Decisions about what to test come from TODO.md
+   and the coverage of the file you're touching, NOT from this tool.
+
+### Proven value (why this gate exists)
+First run with a correct layer model (b3f2916): found a REAL circular import
+`gemm_224_iq3_xxs <-> iq3_quantize` (introduced with the IQ3_XXS quantize
+work, a8f7455) sitting inside a dead wrapper that also declared the
+nonexistent `std.Thread.Mutex`. Cycle removed, wrapper deleted, signal +412.
+That's the class of bug the rules gate now catches at commit time instead
+of two sessions later.
+
+### Rules format gotcha
+The schema is `[constraints]` + `[[layers]]` + `[[boundaries]]` (from the
+sentrux upstream docs) — a `[[rules]]` table parses as ZERO rules and
+silently passes. If `check_rules` ever reports `rules_checked: 0` after a
+rules.toml edit, that's what happened.
+
 
 ## Documentation
 
