@@ -45,6 +45,7 @@ pub const iq2xs_init = @import("kernels/amx/iq2xs_init.zig");
 pub const iq2_quantize = @import("kernels/amx/iq2_quantize.zig");
 pub const gemm_iq2_xs = @import("kernels/amx/gemm_224_iq2_xs.zig");
 pub const gemm_iq2_s = @import("kernels/amx/gemm_224_iq2_s.zig");
+pub const gemm_iq3_s = @import("kernels/amx/gemm_224_iq3_s.zig");
 pub const iq3xs_init = @import("kernels/amx/iq3xs_init.zig");
 pub const iq3_quantize = @import("kernels/amx/iq3_quantize.zig");
 comptime {
@@ -150,6 +151,14 @@ comptime {
     _ = &gemm_iq2_s.quantizeRowIQ2_S_WithInit;
     _ = &iq2xs_init.KGRID_2BIT_1024;
     _ = &iq2xs_init.initIq2SData;
+    _ = &gemm_iq3_s.BlockIQ3_S;
+    _ = &gemm_iq3_s.IQ3S_GRID;
+    _ = &gemm_iq3_s.dequantizeRowIQ3_S;
+    _ = &gemm_iq3_s.dequantizeRowIQ3_SToBF16;
+    _ = &gemm_iq3_s.gemmIQ3_SScalar;
+    _ = &gemm_iq3_s.quantizeRowIQ3_S_WithInit;
+    _ = &iq3xs_init.KGRID_Q3XS_512;
+    _ = &iq3xs_init.initIq3SData;
     _ = &iq3xs_init.initIq3XsData;
     _ = &iq3xs_init.freeIq3XsData;
     _ = &iq3xs_init.KGRID_Q3XS_256;

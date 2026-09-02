@@ -4031,3 +4031,135 @@ test "iq2xs kmap1024 init: exact grid entries map correctly (nwant=1)" {
     }
     try testing.expectEqual(@as(usize, 1024), n_ok);
 }
+
+// ============================================================================
+// IQ3_S (3.4375 bpw, 512-entry 3-bit grid, raw signs) — layout/dequant/quantize
+// ============================================================================
+
+test "IQ3_S block layout is byte-exact (110 bytes)" {
+    const iq3s = root.gemm_iq3_s;
+    try testing.expectEqual(@as(usize, 110), @sizeOf(iq3s.BlockIQ3_S));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(iq3s.BlockIQ3_S, "d"));
+    try testing.expectEqual(@as(usize, 2), @offsetOf(iq3s.BlockIQ3_S, "qs"));
+    try testing.expectEqual(@as(usize, 66), @offsetOf(iq3s.BlockIQ3_S, "qh"));
+    try testing.expectEqual(@as(usize, 74), @offsetOf(iq3s.BlockIQ3_S, "signs"));
+    try testing.expectEqual(@as(usize, 106), @offsetOf(iq3s.BlockIQ3_S, "scales"));
+    // 2 + 64 + 8 + 32 + 4 = 110
+}
+
+test "IQ3_S dequant: hand-traced block matches C reference math" {
+    const iq3s = root.gemm_iq3_s;
+    const QK_K = iq3s.QK_K;
+    var blk: [1]iq3s.BlockIQ3_S = .{std.mem.zeroes(iq3s.BlockIQ3_S)};
+
+    // d = 1.0; scales[0] = 3 (lo: group pair 0a db1 = 1+2*3 = 7; hi: db2 = 1+2*0 = 1)
+    blk[0].d = iq3s.f32_to_f16(1.0);
+    blk[0].scales[0] = 3;
+
+    // Group 0 (ib32=0, uses db1=7): l=0 sub-block pair, grid entries 1.
+    // grid[1] = 0x01010103 — LE bytes: {3,1,1,1}
+    // signs[0] = 0b0000_0001 -> y[0] negative (bit 0), rest positive.
+    blk[0].qs[0] = 1; // grid1 (first 4 weights)
+    blk[0].qs[1] = 1; // grid2 (next 4)
+    blk[0].signs[0] = 1;
+
+    var y: [QK_K]f32 = undefined;
+    iq3s.dequantizeRowIQ3_S(&blk, &y, QK_K);
+
+    const db1: f32 = 7.0;
+    // grid bytes LE: byte0 = 3, bytes1..3 = 1
+    try testing.expectApproxEqAbs(-db1 * 3, y[0], 1e-6); // sign bit 0
+    try testing.expectApproxEqAbs(db1 * 1, y[1], 1e-6);
+    try testing.expectApproxEqAbs(db1 * 1, y[2], 1e-6);
+    try testing.expectApproxEqAbs(db1 * 1, y[3], 1e-6);
+    // weights 4..7: signs bit 4 mask (j+4: kmask[4]=16 -> bit 4 of signs=0) positive
+    try testing.expectApproxEqAbs(db1 * 3, y[4], 1e-6);
+    try testing.expectApproxEqAbs(db1 * 1, y[5], 1e-6);
+    // Everything zeroed: grid[0] = all-1s (0x01010101) at db1 -> y = 7
+    // for weights 8..31 (same group 0, zeroed qs).
+    for (8..32) |j| {
+        try testing.expectApproxEqAbs(db1 * 1, y[j], 1e-6);
+    }
+    // Groups 1..7: scales bytes 1..3 zero -> db = 1 -> y = 1
+    for (32..QK_K) |j| {
+        try testing.expectApproxEqAbs(@as(f32, 1.0), y[j], 1e-6);
+    }
+}
+
+test "IQ3_S quantize with kmap512(3bit, nwant=3): init -> quantize -> dequant round trip" {
+    const init_mod = root.iq3xs_init;
+    const iq3s = root.gemm_iq3_s;
+    const allocator = testing.allocator;
+
+    const k = iq3s.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+
+    const data = init_mod.initIq3SData(allocator);
+    defer init_mod.freeIq3XsData(allocator, data);
+
+    var blk: [1]iq3s.BlockIQ3_S = undefined;
+    iq3s.quantizeRowIQ3_S_WithInit(data, &src, &blk, k, null);
+
+    var dst: [k]f32 = undefined;
+    iq3s.dequantizeRowIQ3_S(&blk, &dst, k);
+
+    var max_abs_err: f32 = 0;
+    var sum_abs_x: f32 = 0;
+    for (0..k) |i| {
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+        sum_abs_x += @abs(src[i]);
+    }
+    const rel = max_abs_err / (sum_abs_x / k);
+    // IQ3_S is 3.4375 bpw (finest grid format after IQ4_XS) with RAW
+    // signs — 100% bound (IQ3_XXS at 3.0625 bpw passed at ~0.79).
+    try testing.expect(rel < 1.0);
+}
+
+test "IQ3_S scalar GEMM with constant inputs is consistent" {
+    const iq3s = root.gemm_iq3_s;
+    const QK_K = iq3s.QK_K;
+    const M: usize = 2;
+    const N: usize = 2;
+
+    var a: [M * QK_K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var b: [N]iq3s.BlockIQ3_S = undefined;
+    for (&b) |*blk| {
+        blk.* = std.mem.zeroes(iq3s.BlockIQ3_S);
+        blk.d = iq3s.f32_to_f16(1.0);
+        // all-zero qs/qh -> grid[0] (all-1s) everywhere, zero scale
+        // nibbles -> db = 1 -> y = 1
+    }
+
+    var c: [M * N]f32 = undefined;
+    iq3s.gemmIQ3_SScalar(&a, &b, &c, M, N, QK_K, QK_K, 1, N);
+
+    var ref_col: [QK_K]f32 = undefined;
+    iq3s.dequantizeRowIQ3_S(&b, &ref_col, QK_K);
+    var ref_sum: f32 = 0;
+    for (ref_col) |v| ref_sum += v;
+
+    for (c) |v| try testing.expectApproxEqAbs(ref_sum, v, 1e-3);
+}
+
+test "iq3xs kmap512(3bit) init: exact grid entries map correctly (nwant=3)" {
+    const init_mod = root.iq3xs_init;
+    const allocator = testing.allocator;
+
+    const data = init_mod.initIq3SData(allocator);
+    defer init_mod.freeIq3XsData(allocator, data);
+
+    // All 512 entries map to themselves.
+    for (0..512) |i| {
+        var index: u16 = 0;
+        for (0..4) |kk| {
+            const q: u16 = @intCast(@divTrunc(data.grid[i][kk] - 1, 2));
+            index |= q << @intCast(3 * kk);
+        }
+        try testing.expect(data.kmap[index] == @as(i32, @intCast(i)));
+    }
+}
