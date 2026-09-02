@@ -56,6 +56,33 @@ pub const Iq2GridData = struct {
     kneighbors: []u16,
 };
 
+/// Process-wide cache: the kmap builds are expensive (the 2048-entry
+/// grid takes ~6s in Debug) and several call sites (quantize wrappers,
+/// multiple tests) need the SAME table. Keyed by the comptime table
+/// pointer — stable for the lifetime of the process. The cached data
+/// is allocated once through page_allocator and never freed (same
+/// lifetime pattern as g_tile_params_tuned / g_iq3_data).
+var g_cache_mutex: std.atomic.Mutex = .unlocked;
+
+fn lockCache() void {
+    while (!g_cache_mutex.tryLock()) {
+        std.Thread.yield() catch {};
+    }
+}
+var g_cache_iq2xxs: ?*Iq2GridData = null;
+var g_cache_iq2xs: ?*Iq2GridData = null;
+var g_cache_iq2s: ?*Iq2GridData = null;
+var g_cache_iq1s: ?*Iq2GridData = null;
+
+fn cachedInit(slot: *?*Iq2GridData, comptime table: []const u16, grid_size: usize, nwant: usize) *Iq2GridData {
+    lockCache();
+    defer g_cache_mutex.unlock();
+    if (slot.*) |existing| return existing;
+    const built = initIq2GridData(std.heap.page_allocator, table, grid_size, nwant);
+    slot.* = built;
+    return built;
+}
+
 fn iq2CompareFunc(a: [*]const i32, b: [*]const i32) c_int {
     if (a[0] < b[0]) return -1;
     if (a[0] > b[0]) return 1;
@@ -92,49 +119,72 @@ fn buildKmapExact(kmap: []i32, grid: []const [8]i32, grid_size: usize) void {
     }
 }
 
-/// For an off-grid fingerprint index, compute the Hamming-positions
-/// and find its nwant nearest grid entries. dist2 is [2*grid_size].
-fn findNeighbors(
+/// Top-nwant-levels neighbor selection — EXACT equivalent of the C's
+/// qsort-then-scan, in O(grid_size) via a DISTANCE HISTOGRAM.
+///
+/// The d2 between any fingerprint and any grid entry is bounded: both
+/// live in the position alphabet {1,3,5,7}^8, so d2 <= 8 * 36 = 288.
+/// The C sorts all (d2, index) pairs and scans until the nwant-th
+/// distinct distance level completes — i.e. it takes exactly the set
+/// {j : d2(j) <= cutoff} where cutoff is the nwant-th smallest
+/// DISTINCT d2. We find that cutoff by histogram (one pass), then
+/// collect the qualifying entries and sort only those (by d2, then
+/// index — the C's tie order). Same neighbor set, same order.
+const MAX_D2: usize = 289;
+
+fn collectNeighbors(
     grid: []const [8]i32,
     grid_size: usize,
     fingerprint: usize,
-    dist2: []i32,
     nwant: usize,
+    d2_buf: []i32, // scratch, grid_size long
+    out: [][2]i32,
 ) usize {
     var pos: [8]i32 = undefined;
     for (0..8) |k| {
         const l: i32 = @intCast((fingerprint >> @intCast(2 * k)) & 0x3);
         pos[k] = 2 * l + 1;
     }
+    // ONE distance pass: d2 into the scratch, histogram on the fly.
+    var hist: [MAX_D2]u32 = @splat(0);
     for (0..grid_size) |j| {
         var d2: i32 = 0;
         for (0..8) |k| {
             const diff = grid[j][k] - pos[k];
             d2 += diff * diff;
         }
-        dist2[2 * j] = d2;
-        dist2[2 * j + 1] = @intCast(j);
+        d2_buf[j] = d2;
+        hist[@intCast(d2)] += 1;
     }
-    // qsort by dist2 then index
-    std.mem.sort([2]i32, @as([][2]i32, @ptrCast(@alignCast(dist2[0 .. 2 * grid_size]))), {}, struct {
-        fn lt(_: void, a: [2]i32, b: [2]i32) bool {
-            if (a[0] != b[0]) return a[0] < b[0];
-            return a[1] < b[1];
+    // Cutoff: the d2 of the nwant-th distinct non-empty level (take
+    // everything if fewer levels exist).
+    var levels: usize = 0;
+    var cutoff: usize = MAX_D2 - 1;
+    for (0..MAX_D2) |d| {
+        if (hist[d] == 0) continue;
+        levels += 1;
+        if (levels == nwant) {
+            cutoff = d;
+            break;
         }
-    }.lt);
-    // Count neighbors at nwant distinct distance levels
-    var n: usize = 0;
-    var d2 = dist2[0];
-    var nhave: usize = 1;
-    for (0..grid_size) |j| {
-        if (dist2[2 * j] > d2) {
-            if (nhave == nwant) break;
-            d2 = dist2[2 * j];
-            nhave += 1;
-        }
-        n += 1;
     }
-    return n;
+    // Collect qualifying (d2, index) pairs in the C's qsort order
+    // (d2 asc, then index asc). Within each level our j-loop is already
+    // index-ascending; walk levels 0..cutoff in order and skip empty
+    // ones via the histogram — the result is the exact sorted order.
+    var m: usize = 0;
+    for (0..cutoff + 1) |d| {
+        if (hist[d] == 0) continue;
+        for (0..grid_size) |j| {
+            const dj: usize = @intCast(d2_buf[j]);
+            if (dj == d) {
+                out[m] = .{ d2_buf[j], @intCast(j) };
+                m += 1;
+            }
+        }
+        // Early exit: nothing beyond the last non-empty level can match.
+    }
+    return m;
 }
 
 /// Full lazy-init of a 2-bit kmap + kneighbors (the shared core for
@@ -152,27 +202,40 @@ fn initIq2GridData(
     self.kmap = allocator.alloc(i32, KMAP_SIZE) catch @panic("OOM");
     buildKmapExact(self.kmap, self.grid, grid_size);
 
-    // Pass 1: count neighbors for each off-grid fingerprint
+    // SINGLE PASS with the NeighborCollector: one O(grid_size) selection
+    // per fingerprint replaces the old design's TWO full O(grid log grid)
+    // sorts per fingerprint (the cause of the multi-minute grid-2048 init
+    // in Debug builds). The neighbor sets and their order are IDENTICAL
+    // to the qsort version — see NeighborCollector's exactness note.
     var n_per_i = allocator.alloc(usize, KMAP_SIZE) catch @panic("OOM");
     defer allocator.free(n_per_i);
     var num_neighbors: usize = 0;
     var num_not_in_map: usize = 0;
-    var dist2 = allocator.alloc(i32, 2 * grid_size) catch @panic("OOM");
-    defer allocator.free(dist2);
+    // neighbor_buf must hold up to grid_size qualifying entries (when a
+    // fingerprint has fewer than nwant distinct distance levels, ALL
+    // grid entries qualify). Max grid in the 2-bit family: 2048.
+    var neighbor_buf: [2048][2]i32 = undefined;
+    var d2_scratch: [2048]i32 = undefined;
+
+    // Store each off-grid fingerprint's neighbors while counting.
+    const neighbors_store = allocator.alloc([2048][2]i32, KMAP_SIZE) catch @panic("OOM");
+    defer allocator.free(neighbors_store);
+
     for (0..KMAP_SIZE) |i| {
         if (self.kmap[i] >= 0) {
             n_per_i[i] = 0;
             continue;
         }
         num_not_in_map += 1;
-        n_per_i[i] = findNeighbors(self.grid, grid_size, i, dist2, nwant);
+        n_per_i[i] = collectNeighbors(self.grid, grid_size, i, nwant, d2_scratch[0..grid_size], neighbor_buf[0..]);
         num_neighbors += n_per_i[i];
+        @memcpy(neighbors_store[i][0..n_per_i[i]], neighbor_buf[0..n_per_i[i]]);
     }
 
     // Allocate kneighbors
     self.kneighbors = allocator.alloc(u16, num_neighbors + num_not_in_map) catch @panic("OOM");
 
-    // Build the offsets and fill
+    // Build the offsets and fill from the stashed results (no recompute).
     var offsets = allocator.alloc(i32, KMAP_SIZE) catch @panic("OOM");
     defer allocator.free(offsets);
     var counter: i32 = 0;
@@ -187,46 +250,15 @@ fn initIq2GridData(
 
     for (0..KMAP_SIZE) |i| {
         if (self.kmap[i] >= 0) continue;
-        var pos: [8]i32 = undefined;
-        for (0..8) |k| {
-            const l: i32 = @intCast((i >> @intCast(2 * k)) & 0x3);
-            pos[k] = 2 * l + 1;
-        }
-        for (0..grid_size) |j| {
-            var d2: i32 = 0;
-            for (0..8) |k| {
-                const diff = self.grid[j][k] - pos[k];
-                d2 += diff * diff;
-            }
-            dist2[2 * j] = d2;
-            dist2[2 * j + 1] = @intCast(j);
-        }
-        std.mem.sort([2]i32, @as([][2]i32, @ptrCast(@alignCast(dist2[0 .. 2 * grid_size]))), {}, struct {
-            fn lt(_: void, a: [2]i32, b: [2]i32) bool {
-                if (a[0] != b[0]) return a[0] < b[0];
-                return a[1] < b[1];
-            }
-        }.lt);
-
         const local_counter: usize = @intCast(offsets[i]);
         self.kmap[i] = -@as(i32, @intCast(local_counter + 1));
         var lc = local_counter;
-        self.kneighbors[lc] = 0; // placeholder count — filled below
+        self.kneighbors[lc] = @intCast(n_per_i[i]); // count
         lc += 1;
-        var d2 = dist2[0];
-        var n: u16 = 0;
-        var nhave: usize = 1;
-        for (0..grid_size) |j| {
-            if (dist2[2 * j] > d2) {
-                if (nhave == nwant) break;
-                d2 = dist2[2 * j];
-                nhave += 1;
-            }
-            self.kneighbors[lc] = @intCast(dist2[2 * j + 1]);
+        for (0..n_per_i[i]) |j| {
+            self.kneighbors[lc] = @intCast(neighbors_store[i][j][1]);
             lc += 1;
-            n += 1;
         }
-        self.kneighbors[local_counter] = n;
     }
     return self;
 }
@@ -239,7 +271,16 @@ pub fn freeIq2XsData(allocator: std.mem.Allocator, data: *Iq2GridData) void {
 }
 
 /// IQ2_XXS init: grid_size=256 (the original 2.0625-bpw format).
+/// Process-cached: the first call builds, later calls return the same
+/// table (thread-safe). freeIq2XsData on a cached table is a no-op-safe
+/// double free hazard — use the *_Owned variants if you need ownership.
 pub fn initIq2XsData(allocator: std.mem.Allocator) *Iq2GridData {
+    _ = allocator;
+    return cachedInit(&g_cache_iq2xxs, &KGRID_2BIT_256, 256, 2);
+}
+
+/// Caller-owned variant (the old semantics: fresh build, you free it).
+pub fn initIq2XsDataOwned(allocator: std.mem.Allocator) *Iq2GridData {
     return initIq2GridData(allocator, &KGRID_2BIT_256, 256, 2);
 }
 
@@ -295,6 +336,11 @@ pub const KGRID_2BIT_512 = [512]u16{
 /// grid (2.3125 bpw format). nwant=2 (ggml-quants.c:3110: only IQ2_S
 /// uses nwant=1; XXS/XS both use 2).
 pub fn initIq2XsData512(allocator: std.mem.Allocator) *Iq2GridData {
+    _ = allocator;
+    return cachedInit(&g_cache_iq2xs, &KGRID_2BIT_512, 512, 2);
+}
+
+pub fn initIq2XsData512Owned(allocator: std.mem.Allocator) *Iq2GridData {
     return initIq2GridData(allocator, &KGRID_2BIT_512, 512, 2);
 }
 
@@ -393,6 +439,11 @@ pub const KGRID_2BIT_1024 = [1024]u16{
 /// that refines off-grid points to their single nearest neighbor
 /// (ggml-quants.c:3110).
 pub fn initIq2SData(allocator: std.mem.Allocator) *Iq2GridData {
+    _ = allocator;
+    return cachedInit(&g_cache_iq2s, &KGRID_2BIT_1024, 1024, 1);
+}
+
+pub fn initIq2SDataOwned(allocator: std.mem.Allocator) *Iq2GridData {
     return initIq2GridData(allocator, &KGRID_2BIT_1024, 1024, 1);
 }
 
@@ -578,5 +629,10 @@ pub const KGRID_1BIT_2048 = [2048]u16{
 /// IQ1_S / IQ1_M init: the 2048-entry 1-bit grid. nwant=3
 /// (ggml-quants.c:3110: IQ1_S and IQ1_M both use 3 neighbors).
 pub fn initIq1SData(allocator: std.mem.Allocator) *Iq2GridData {
+    _ = allocator;
+    return cachedInit(&g_cache_iq1s, &KGRID_1BIT_2048, 2048, 3);
+}
+
+pub fn initIq1SDataOwned(allocator: std.mem.Allocator) *Iq2GridData {
     return initIq2GridData(allocator, &KGRID_1BIT_2048, 2048, 3);
 }

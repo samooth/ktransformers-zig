@@ -60,6 +60,23 @@ pub const Iq3GridData = struct {
     kneighbors: []u16,
 };
 
+/// Process-wide cache (see iq2xs_init.zig for the rationale — the kmap
+/// builds are expensive and shared across call sites/tests).
+var g_cache_mutex3: std.atomic.Mutex = .unlocked;
+var g_cache_iq3xxs: ?*Iq3GridData = null;
+var g_cache_iq3s: ?*Iq3GridData = null;
+
+fn cachedInit3(slot: *?*Iq3GridData, comptime table: []const u16, grid_size: usize, nwant: usize) *Iq3GridData {
+    while (!g_cache_mutex3.tryLock()) {
+        std.Thread.yield() catch {};
+    }
+    defer g_cache_mutex3.unlock();
+    if (slot.*) |existing| return existing;
+    const built = initIq3GridData(std.heap.page_allocator, table, grid_size, nwant);
+    slot.* = built;
+    return built;
+}
+
 /// Build the grid from the packed u16 fingerprints. pos[k] = 2*nibble+1.
 fn buildGrid(allocator: std.mem.Allocator, table: []const u16, grid_size: usize) [][4]i32 {
     var grid = allocator.alloc([4]i32, grid_size) catch @panic("OOM");
@@ -222,6 +239,12 @@ fn initIq3GridData(allocator: std.mem.Allocator, table: []const u16, grid_size: 
 
 /// IQ3_XXS init: grid_size=256, nwant=2.
 pub fn initIq3XsData(allocator: std.mem.Allocator) *Iq3GridData {
+    _ = allocator;
+    return cachedInit3(&g_cache_iq3xxs, &KGRID_Q3XS_256, 256, 2);
+}
+
+/// Caller-owned variant (fresh build, caller frees).
+pub fn initIq3XsDataOwned(allocator: std.mem.Allocator) *Iq3GridData {
     return initIq3GridData(allocator, &KGRID_Q3XS_256, 256, 2);
 }
 
@@ -284,5 +307,10 @@ pub const KGRID_Q3XS_512 = [512]u16{
 /// 256 grid but denser). nwant=3 for grid_size=512 (ggml-quants.c:3762:
 /// `grid_size == 256 ? 2 : 3`).
 pub fn initIq3SData(allocator: std.mem.Allocator) *Iq3GridData {
+    _ = allocator;
+    return cachedInit3(&g_cache_iq3s, &KGRID_Q3XS_512, 512, 3);
+}
+
+pub fn initIq3SDataOwned(allocator: std.mem.Allocator) *Iq3GridData {
     return initIq3GridData(allocator, &KGRID_Q3XS_512, 512, 3);
 }
