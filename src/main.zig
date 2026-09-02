@@ -516,6 +516,20 @@ export fn kt_abi_size_mlp_config() usize {
     return @sizeOf(kt_mlp_config_t);
 }
 
+// Model-orchestration layer configs (config BY POINTER; layout is
+// the C ABI contract between Zig and the pybind11 shim).
+export fn kt_abi_size_dsv3_layer_config() usize {
+    return @sizeOf(kt_dsv3_layer_config_t);
+}
+
+export fn kt_abi_size_qwen3moe_layer_config() usize {
+    return @sizeOf(kt_qwen3moe_layer_config_t);
+}
+
+export fn kt_abi_size_qwen3moe_model_config() usize {
+    return @sizeOf(kt_qwen3moe_model_config_t);
+}
+
 /// Field-offset probe: returns the byte offset of field `field_index` within
 /// the struct identified by `struct_id` (0 = kt_moe_config_t, 1 = kt_mla_config_t).
 /// Returns SIZE_MAX for an unknown id/index. Lets the C++ shim (and the
