@@ -1,18 +1,19 @@
 # ktransformers-zig TODO
 
-## Status: Beta (All workstreams closed; 10/10 GGML formats + 133+ tests)
+## Status: Beta (All workstreams closed; 10/10 GGML formats + 156 tests)
 
-Last updated: 2026-09-01
+Last updated: 2026-09-02
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
-**Tests: WORKING** - `zig build test` runs all suites: 103 kernels + 11 MLA + 2 FP8 + 1 MLA C API + 9 GGML C API + 7 aarch64 + 1 neon + 2 allocator C API = **135 total pass, 0 leaks, exit 0** (137 with the recent IQ4_NL additions; 133+ was the count at the GGML 10/10 milestone, all green).
-**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon, each exporting **96 C API symbols** (double-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`).
+**Tests: WORKING** - `zig build test` runs all suites: 73 kernels + 11 MLA + 9 MLA C-API + 9 Qwen3 MoE + 2 FP8 + 9 GGML C API + 7 aarch64 + 4 NEON kernel + 2 allocator C API = **156 total pass, 0 leaks, exit 0**.
+**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon, each exporting **105 C API symbols** (double-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). The 9 kt_qwen3moe_* symbols are exported from all 8 variants.
 **Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
 **Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
 **SFT/LoRA: FORWARD+BACKWARD COMPLETE** - training path done; C API exports (forward_sft/backward/update_lora_weights); smoke test passes.
 **Allocator: INJECTABLE (B1)** - `kt_set_default_allocator` C-ABI vtable; all 9 context types capture-and-free symmetrically.
-**Model Orchestration: COMPLETE** - DeepseekV3DecoderLayer + DeepseekV3Model + DeepseekV3ForCausalLM, C-API exposed (`kt_dsv3_*`), pybind11 shim.
+**Model Orchestration: COMPLETE** - DeepseekV3DecoderLayer + DeepseekV3Model + DeepseekV3ForCausalLM (C-API `kt_dsv3_*`) AND Qwen3MoeDecoderLayer + Qwen3MoeModel + Qwen3MoeForCausalLM (C-API `kt_qwen3moe_*`).
 **GGML: 10/10 STANDARD FORMATS COMPLETE** - Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ4_XS, IQ2_XXS (full quantize with kmap init), IQ3_XXS, IQ4_NL — all with quantize + dequantize + GEMM + tests.
+**MHA engine + GGUF parser (Qwen3 dev)**: vanilla MHA `MhaEngine` + GGUF v3 parser in `src/io/gguf.zig` — committed in `a61271e`.
 
 ---
 

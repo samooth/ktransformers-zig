@@ -522,12 +522,52 @@ en la referencia). Esa pieza ahora vive en `src/numa/iq2xs_init.zig`
 | GGML IQ4_NL kernel (18B blocks, 32-weight super-blocks) | `5a73120` | non-linear 4-bit, layout trivial (un solo d por bloque), comparte `KVALUES_IQ4NL` con IQ4_XS |
 | zkML design doc | untracked (`zkML.md`) | propuesta L2/L3 de gadgets ML en Zig + integración con ktransformers; **WIP fuera de scope** del puerto C-API actual |
 
-**Estado final del puerto (verificado):**
+**Estado final del puerto (verificado al cierre de Qwen3):**
 - 10 formatos GGML completos: Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ4_XS, IQ2_XXS, IQ3_XXS, IQ4_NL
-  (la lista es 11 — IQ4_NL cierra el slot, dejando "todos los formatos
-  estándar" como cierra la nota del commit 5fd239b)
-- 133+ tests / 0 leaks / `verify_abi.py` 96/96 × 8 .so doble gate PASS
-- Todas las workstreams del TODO original cerradas (C-API, MoE+work-stealing+SFT, MLA+model-orchestration, FP8, GGML, MTP out-of-scope)
+- 156 tests / 0 leaks / `verify_abi.py` 105/105 × 8 .so doble gate PASS
+  (los 9 símbolos qwen3 añadidos al header tienen matching export
+  en las 8 variantes)
+- Todas las workstreams cerradas (C-API, MoE+work-stealing+SFT, MLA
+  +model-orchestration DeepseekV3, Qwen3 orchestration, MHA engine,
+  GGUF parser, FP8, GGML, MTP out-of-scope)
+
+---
+
+## Hitos Qwen3 + MHA + GGUF (post-deps merge)
+
+El workstream Qwen3 (tercer dev) cerró la tercera arquitectura de
+modelo del puerto, paralela a DeepseekV3. Mismas primitivas de
+atención (RMSNorm + MHA + MoE residual) pero arquitectura distinta
+(standard MHA en lugar de MLA, gate-only en lugar de grouped-top2).
+
+| Item | Commit | Notas |
+|------|--------|-------|
+| GGUF v3 parser | `a61271e` | Header + tensor table; usado por la test suite para fabricar GGUF blobs en memoria. Reusable para carga de pesos desde .gguf reales (futuro). |
+| MHA engine (vanilla attention) | `a61271e` | `MhaEngine.init/deinit/forward/decode` + `matmulF32` / `rmsNormInline` / `softmaxInPlace` standalone. Complementa MLA (mismo patrón de API: `*Engine` + `*Engine.forward/decode`). |
+| Qwen3MoeDecoderLayer | `a61271e` | RMSNorm → MHA → residual, RMSNorm → gate+MoE → residual. Reusa `moe_mod.routeExpertsDeepSeek` con la nueva firma allocator-first (commit `58b0cb1` cerró ese ítem). |
+| Qwen3MoeModel + ForCausalLM | `a61271e` | N× decoder layers + final RMSNorm; lm_head → logits. C-API exportada con 9 `kt_qwen3moe_*` símbolos. |
+| Qwen3 test suite | `a61271e` | 9 tests: GGUF parse (×4, incluyendo bad-magic y truncated-header), MHA correctness (×3), layer lifecycle, CausalLM end-to-end. |
+
+**Estado de los TODOs runtime (todos cerrados):**
+
+| Item | Commit | Estado |
+|------|--------|--------|
+| Ctypes binding de `kt_set_default_allocator` | `45e1a40` (otro dev) | ✅ |
+| ABI gates en `wheels.yml` (verify_abi + audit_layout + test) | `1da4470` (mío) | ✅ |
+| `selectTileParams` wiring (A4 → BufferA sizing) | `ce849ec` (otro dev) | ✅ |
+| MoE routing scratch allocator (routeExperts*) | `58b0cb1` (otro dev) | ✅ |
+| NumaTopology helpers Zig 0.16 rot | `bd7e712` (mío) | ✅ |
+| NumaTopology.detect → kt_worker_pool_new_config | WIP revertido (otro dev) | ⏳ |
+| `kt_mla_forward` qlen>1 paged | `139bf63` + `4e2be9b` | ✅ |
+| IQ2/3/4_NL family (full quantize) | `37f08cd` + `b003990` + `5fd239b` + `5a73120` | ✅ |
+| MTP head | out-of-scope (spec ausente) | ✅ closed |
+
+**Pendiente único real (futuro):**
+- MTP head — spec no existe en el checkout, mismo problema que el kml/ original
+- vLLM block-level granularity (los IQ grid usan per-token-page) — solo si un modelo real lo pide
+- Continuous-batching scheduling / eviction
+- Cross-instance page migration (sharding)
+- Qwen3 GGUF loading E2E (el parser existe pero no hay test E2E con archivo .gguf real todavía)
 
 ---
 

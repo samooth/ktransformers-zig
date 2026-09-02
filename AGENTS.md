@@ -83,12 +83,13 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
 ## Status (see TODO.md for details)
 
 - Build: working; 6 x86 variants + aarch64 neon cross-build.
-- C API: **96 symbols** gated by `verify_abi.py` triple gate (exports +
+ - C API: **105 symbols** gated by `verify_abi.py` triple gate (exports +
   arity + layout via audit_layout.py). All operator families implemented:
   MoE (incl. SFT/LoRA forward+backward), MLA, Gate (DeepSeek-V3
   group-top2 routing), Linear, MLP, FP8 transport, math helpers,
-  `kt_set_default_allocator` (injectable allocator, B1), and the
-  `kt_dsv3_*` model-orchestration C-API.
+  `kt_set_default_allocator` (injectable allocator, B1),
+  `kt_dsv3_*` (DeepseekV3 model-orchestration), and
+  `kt_qwen3moe_*` (Qwen3 model-orchestration).
 - GGML: **10/10 standard formats complete** — Q8_0, Q4_K, Q5_K, Q6_K,
   Q8_K (linear/4-8 bit), Q2_K, Q3_K (linear/2-3 bit), IQ4_XS, IQ2_XXS
   (grid-based with full kmap/kneighbors init for quantize), IQ3_XXS
@@ -99,14 +100,30 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
 - MoE: `loadWeights` packs all 3 projections; `forwardGateUp`/
   `forwardDown` are real; `gemmExpert` is vectorized (`@Vector(8,f32)`
   K-loop, A1, ~5.2x on decode shapes); D1/D2/D3 buffer-overflow/index
-  bugs fixed with regression tests (qlen>1, tp>1).
+  bugs fixed with regression tests (qlen>1, tp>1). Routing
+  (routeExperts / routeExpertsDeepSeek) threads a captured
+  `std.mem.Allocator` for its scratch buffers (B1 closure).
 - MLA: complete in `src/mla/`; `kt_mla_*` C API fully implemented
   (new/load_weights/forward/prefill/decode/update_kv_cache/free).
-  `kt_mla_forward` supports qlen_count==1; qlen_count>1 (paged
-  attention indirection) panics with a clear message.
-- Model Orchestration: `DeepseekV3DecoderLayer` + `DeepseekV3Model`
-  + `DeepseekV3ForCausalLM` (Zig-native, in `src/kernels/moe/`) with
-  C-API (`kt_dsv3_*`) and pybind11 shim.
+  `kt_mla_forward` supports qlen_count==1 (legacy sequential) AND
+  qlen_count>1 (paged/batched via per-sequence page_tables; matches
+  the C++ mla-tp.hpp:84 forward(qlens, page_tables, kv_lens,
+  input, output) contract exactly). MlaKvCache has save/load
+  (binary file) for context resume (kvcache_load_dump.cpp mirror).
+- DeepseekV3 Orchestration: `DeepseekV3DecoderLayer` +
+  `DeepseekV3Model` + `DeepseekV3ForCausalLM` (Zig-native, in
+  `src/kernels/moe/`) with C-API (`kt_dsv3_*`) and pybind11 shim.
+- Qwen3 Orchestration: `Qwen3MoeDecoderLayer` + `Qwen3MoeModel` +
+  `Qwen3MoeForCausalLM` (Zig-native, in `src/kernels/qwen3/`) with
+  C-API (`kt_qwen3moe_*`, 9 symbols). RMSNorm → MHA → residual,
+  RMSNorm → gate+MoE → residual (standard MHA, no MLA).
+- Vanilla MHA: `MhaEngine` in `src/kernels/attn/mha.zig` (matmulQKV,
+  softmax, matmulO). Companion to MLA; same `*Engine.init/deinit/
+  forward/decode` API shape. Standalone `matmulF32` / `rmsNormInline` /
+  `softmaxInPlace` for callers that don't need a full engine.
+- GGUF parser: `src/io/gguf.zig` — GGUF v3 header + tensor table. Used
+  by the Qwen3 test suite to fabricate minimal GGUF blobs in memory;
+  reusable for real `.gguf` file loading (future work).
 - AMX: `detectAmxSupport()` runtime CPUID + arch_prctl guard (A2 fix —
   the old `@hasField` comptime check was ALWAYS false, silently
   no-op'ing every AMX intrinsic even on AMX hardware).
@@ -115,10 +132,13 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
   fully revived (NumaTopology.detect + allocNuma + getThreadAffinity
   work byte-exact; getThreadAffinity bug fixed in route — kernel
   returns bytes-copied, not errno).
-- Tests: 103 kernels + 11 MLA + 2 FP8 + 1 MLA C API + 9 GGML C API +
-  7 aarch64 + 1 neon + 2 allocator C API = **135 tests, all passing,
-  0 leaks**. Bench: `zig build bench` (2.8-5.3x measured speedup A1) +
-  `moe_bench.zig` (end-to-end MoE forward with tile-param tuning).
+- Tests: 73 kernels + 11 MLA + 9 MLA C-API + 2 FP8 + 9 GGML C API +
+  7 aarch64 + 4 NEON kernel + 2 allocator C API + 9 Qwen3 MoE =
+  **156 tests, all passing, 0 leaks**. Bench: `zig build bench`
+  (2.8-9.3x measured speedup A1) + `moe_bench.zig` (end-to-end MoE
+  forward with tile-param tuning: -20.3% on prefill 8×4 at K=448
+  vs the 1792 default on this Ryzen 512K-L2 — validates the A4
+  wiring empirically).
 - IMPROVE.md documents a verified external-dev-feedback audit: all
   P0-P3 items resolved (see its Parte E table for the commit map).
 
