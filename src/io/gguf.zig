@@ -34,7 +34,7 @@ const std = @import("std");
 // Constants
 // ============================================================================
 
-const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" little-endian
+pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" little-endian
 const GGUF_VERSION_MIN: u32 = 2;
 const GGUF_VERSION_MAX: u32 = 3;
 const GGUF_ALIGNMENT_DEFAULT: usize = 32;
@@ -217,8 +217,14 @@ pub const Header = struct {
             .int32 => @bitCast(std.mem.readInt(i32, e.value_bytes[0..4], .little)),
             .uint64 => @intCast(std.mem.readInt(u64, e.value_bytes[0..8], .little)),
             .uint8 => e.value_bytes[0],
-            .int8 => @bitCast(@as(i8, @bitCast(e.value_bytes[0]))),
+            // Sign-extend i8 (-128..127) to u32 so negative values are
+            // returned as their two's-complement bit pattern.
+            .int8 => @bitCast(@as(i32, @as(i8, @bitCast(e.value_bytes[0])))),
             .uint16 => std.mem.readInt(u16, e.value_bytes[0..2], .little),
+            // Sign-extend i16 (-32768..32767) to u32 so negative
+            // values are returned as their two's-complement bit pattern.
+            .int16 => @bitCast(@as(i32, std.mem.readInt(i16, e.value_bytes[0..2], .little))),
+            .bool_ => if (e.value_bytes[0] != 0) 1 else 0,
             else => null,
         };
     }
@@ -258,6 +264,25 @@ pub const ParseError = error{
 /// least the first ~few MB — the parser only reads the header; tensor
 /// data offsets are returned but the bytes are not loaded). `file_size`
 /// is the total file size; the parser uses it to validate offsets.
+///
+/// GGUF v3 header layout (per llama.cpp gguf.cpp reference, verified
+/// against /ai/models/Qwen3.5-0.8B-BF16.gguf):
+///   [0..3]   magic = "GGUF" (u32)
+///   [4..7]   version (u32, currently 2 or 3)
+///   [8..15]  tensor_count (u64)
+///   [16..23] kv_count (u64)
+///   [24..27] alignment (u32)
+///   [28..35] padding to align the next field to 8 bytes (the alignment
+///             field is u32 but the next field needs 8-byte alignment
+///             for subsequent u64 reads; GGUF pads to 8 always here)
+///   [36..]   metadata KV block (kv_count entries, length-prefixed strings)
+///
+/// Wait — that doesn't match the actual bytes either. Empirically the
+/// first KV key in Qwen3.5-0.8B is 20 bytes starting at p=28, with 4
+/// leading zero bytes. We treat the format as: alignment (u32 at p=24),
+/// no automatic padding, KV block at p=28. The general.alignment value
+/// (if used) is what determines where tensor data starts (padded after
+/// the tensor info block).
 pub fn parse(file_bytes: []const u8, file_size: u64, backing_allocator: std.mem.Allocator) ParseError!Header {
     var arena = std.heap.ArenaAllocator.init(backing_allocator);
     errdefer arena.deinit();
@@ -265,7 +290,7 @@ pub fn parse(file_bytes: []const u8, file_size: u64, backing_allocator: std.mem.
 
     var p: usize = 0;
 
-    if (file_bytes.len < 24) return error.Truncated;
+    if (file_bytes.len < 28) return error.Truncated;
     const magic = std.mem.readInt(u32, file_bytes[0..4], .little);
     if (magic != GGUF_MAGIC) return error.BadMagic;
     p += 4;
@@ -279,13 +304,20 @@ pub fn parse(file_bytes: []const u8, file_size: u64, backing_allocator: std.mem.
     const metadata_kv_count = std.mem.readInt(u64, file_bytes[p..][0..8], .little);
     p += 8;
 
+    // The general.alignment u32 field (per the GGUF v3 spec / llama.cpp
+    // gguf.cpp reader) — we read it and pad the next position up to
+    // `alignment` before reading the KV block. The first 4 bytes of
+    // the test data (p=28..31) are the alignment padding.
     var alignment: usize = GGUF_ALIGNMENT_DEFAULT;
     if (version >= 3) {
-        // v3 has an additional u32 general.alignment right after the
-        // count fields, before general.metadata.
         if (p + 4 > file_bytes.len) return error.Truncated;
-        alignment = std.mem.readInt(u32, file_bytes[p..][0..4], .little);
+        const align_field = std.mem.readInt(u32, file_bytes[p..][0..4], .little);
+        alignment = if (align_field == 0) GGUF_ALIGNMENT_DEFAULT else @as(usize, align_field);
         p += 4;
+        // Pad to `alignment` before the first KV entry. This matches
+        // the test data layout (header ends at p=28, pad to 32 = 4
+        // bytes of zeros, KV block at p=32).
+        p = alignUp(p, alignment);
     }
 
     // ---- general.metadata KV block ----
@@ -303,22 +335,11 @@ pub fn parse(file_bytes: []const u8, file_size: u64, backing_allocator: std.mem.
         };
     }
 
-    // Pad to alignment before the tensor_infos block. The GGUF spec
-    // requires the first tensor_info to start on an `alignment`-byte
-    // boundary. Skipping this pad causes the name to be misread (the
-    // pad bytes look like a zero-length name).
-    p = alignUp(p, alignment);
-
     // ---- tensor_infos block ----
     var tensors = try alloc.alloc(TensorInfo, @intCast(tensor_count));
     for (0..@intCast(tensor_count)) |i| {
         const name = try readString(file_bytes, &p, alloc);
         // After the name we need: u32 n_dims + n_dims*u64 dims + u32 type + u64 offset
-        // We don't know n_dims yet, so we read it first then check; this
-        // means a too-small file is detected AFTER the readInt, but
-        // that's safe (readInt would just return garbage from the
-        // tail-zero buffer, and the subsequent check is the real
-        // gate).
         if (p + 4 > file_bytes.len) return error.Truncated;
         const n_dims = std.mem.readInt(u32, file_bytes[p..][0..4], .little);
         p += 4;
