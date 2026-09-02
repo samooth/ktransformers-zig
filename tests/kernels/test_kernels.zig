@@ -4163,3 +4163,168 @@ test "iq3xs kmap512(3bit) init: exact grid entries map correctly (nwant=3)" {
         try testing.expect(data.kmap[index] == @as(i32, @intCast(i)));
     }
 }
+
+// ============================================================================
+// IQ1_S (1.5625 bpw, 2048-entry 1-bit grid + delta) — layout/dequant/quantize
+// ============================================================================
+
+test "IQ1_S block layout is byte-exact (50 bytes)" {
+    const iq1s = root.gemm_iq1_s;
+    try testing.expectEqual(@as(usize, 50), @sizeOf(iq1s.BlockIQ1_S));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(iq1s.BlockIQ1_S, "d"));
+    try testing.expectEqual(@as(usize, 2), @offsetOf(iq1s.BlockIQ1_S, "qs"));
+    try testing.expectEqual(@as(usize, 34), @offsetOf(iq1s.BlockIQ1_S, "qh"));
+    // 2 + 32 + 16 = 50
+}
+
+test "IQ1_S dequant: hand-traced block matches C reference math" {
+    const iq1s = root.gemm_iq1_s;
+    const QK_K = iq1s.QK_K;
+    var blk: [1]iq1s.BlockIQ1_S = .{std.mem.zeroes(iq1s.BlockIQ1_S)};
+
+    // d = 1.0; group 0: scale nibble 2 (dl = 1*(2*2+1) = 5), delta bit
+    // CLEAR -> delta = +0.125.
+    blk[0].d = iq1s.f32_to_f16(1.0);
+    blk[0].qh[0] = (2 << 12); // scale=2, delta bit clear
+
+    // Sub-block 0: index 1 (lo=1, hi bits 0). grid[1] = 0xffffffffffffff01
+    // LE bytes: {-1,-1,-1,-1,-1,-1,-1,+1}. y[j] = 5 * (g[j] + 0.125).
+    blk[0].qs[0] = 1;
+
+    var y: [QK_K]f32 = undefined;
+    iq1s.dequantizeRowIQ1_S(&blk, &y, QK_K);
+
+    const dl: f32 = 5.0;
+    const d_plus: f32 = 0.125;
+    // grid[1] LE: byte0 = 0x01 = +1
+    try testing.expectApproxEqAbs(dl * (1 + d_plus), y[0], 1e-6);
+    // byte1 = 0xff = -1
+    try testing.expectApproxEqAbs(dl * (-1 + d_plus), y[1], 1e-6);
+    // bytes 2..7 also -1
+    for (2..8) |j| try testing.expectApproxEqAbs(dl * (-1 + d_plus), y[j], 1e-6);
+    // Sub-blocks 1..3 of group 0: index 0 = all-(-1): y = 5*(-1+0.125)
+    for (8..32) |j| try testing.expectApproxEqAbs(dl * (-1 + d_plus), y[j], 1e-6);
+    // Groups 1..7: scale nibble 0 -> dl = 1, all-index-0 grids:
+    // y = 1*(-1+0.125) = -0.875
+    for (32..QK_K) |j| try testing.expectApproxEqAbs(@as(f32, -0.875), y[j], 1e-6);
+}
+
+test "IQ1_S dequant: delta-sign bit negates the code shift" {
+    const iq1s = root.gemm_iq1_s;
+    const QK_K = iq1s.QK_K;
+    var blk: [1]iq1s.BlockIQ1_S = .{std.mem.zeroes(iq1s.BlockIQ1_S)};
+    blk[0].d = iq1s.f32_to_f16(1.0);
+    // scale 0 -> dl = 1; delta bit SET -> delta = -0.125
+    blk[0].qh[0] = 0x8000;
+    blk[0].qs[0] = 0; // grid[0]: all -1
+
+    var y: [QK_K]f32 = undefined;
+    iq1s.dequantizeRowIQ1_S(&blk, &y, QK_K);
+    // y = 1 * (-1 - 0.125) = -1.125
+    for (0..8) |j| try testing.expectApproxEqAbs(@as(f32, -1.125), y[j], 1e-6);
+}
+
+test "IQ1_S quantize with kmap2048(1bit): init -> quantize -> dequant round trip" {
+    const init_mod = root.iq2xs_init;
+    const iq1s = root.gemm_iq1_s;
+    const allocator = testing.allocator;
+
+    const k = iq1s.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+
+    const data = init_mod.initIq1SData(allocator);
+    defer init_mod.freeIq2XsData(allocator, data);
+
+    var blk: [1]iq1s.BlockIQ1_S = undefined;
+    iq1s.quantizeRowIQ1_S_WithInit(data, &src, &blk, k, null);
+
+    var dst: [k]f32 = undefined;
+    iq1s.dequantizeRowIQ1_S(&blk, &dst, k);
+
+    // 1.5625 bpw is EXTREMELY lossy — the honest round-trip floor on
+    // smooth data is rel ~1.7 (verified against a Python port of the
+    // ggml reference for IQ2_K at 2.625 bpw; IQ1_S at 1.5625 bpw is
+    // coarser). Use the RMS metric as the primary gate (max-rel is
+    // outlier-dominated at 3 effective levels), with probes.
+    var sum_sq: f64 = 0;
+    var sum_abs: f64 = 0;
+    var max_abs_err: f32 = 0;
+    for (0..k) |i| {
+        const e = @as(f64, @floatCast(src[i] - dst[i]));
+        sum_sq += e * e;
+        sum_abs += @abs(@as(f64, @floatCast(src[i])));
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+    }
+    const rms_rel = @sqrt(sum_sq / k) / (sum_abs / k);
+    try testing.expect(rms_rel < 0.85); // 3-level code + delta
+    try testing.expect(max_abs_err / @as(f32, @floatCast(sum_abs / k)) < 2.2);
+}
+
+test "IQ1_S scalar GEMM with constant inputs is consistent" {
+    const iq1s = root.gemm_iq1_s;
+    const QK_K = iq1s.QK_K;
+    const M: usize = 2;
+    const N: usize = 2;
+
+    var a: [M * QK_K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var b: [N]iq1s.BlockIQ1_S = undefined;
+    for (&b) |*blk| {
+        blk.* = std.mem.zeroes(iq1s.BlockIQ1_S);
+        blk.d = iq1s.f32_to_f16(1.0);
+        // zeroed qs/qh -> grid[0] (all -1), scale 0 (dl=1), delta +0.125
+        // y = -0.875 everywhere
+    }
+
+    var c: [M * N]f32 = undefined;
+    iq1s.gemmIQ1_SScalar(&a, &b, &c, M, N, QK_K, QK_K, 1, N);
+
+    var ref_col: [QK_K]f32 = undefined;
+    iq1s.dequantizeRowIQ1_S(&b, &ref_col, QK_K);
+    var ref_sum: f32 = 0;
+    for (ref_col) |v| ref_sum += v;
+
+    for (c) |v| try testing.expectApproxEqAbs(ref_sum, v, 1e-3);
+}
+
+test "iq1s kmap2048 init: exact entries + nibble->byte bijection" {
+    const init_mod = root.iq2xs_init;
+    const iq1s = root.gemm_iq1_s;
+    const allocator = testing.allocator;
+
+    const data = init_mod.initIq1SData(allocator);
+    defer init_mod.freeIq2XsData(allocator, data);
+
+    // All 2048 entries map to themselves.
+    for (0..2048) |i| {
+        var index: u16 = 0;
+        for (0..8) |kk| {
+            const q: u16 = @intCast(@divTrunc(data.grid[i][kk] - 1, 2));
+            index |= q << @intCast(2 * kk);
+        }
+        try testing.expect(data.kmap[index] == @as(i32, @intCast(i)));
+    }
+    // Bijection: nibble {0,1,2} -> int8 byte {0xff(-1), 0x00(0), 0x01(+1)}.
+    var n_ok: usize = 0;
+    for (0..2048) |gi| {
+        const entry: u64 = iq1s.IQ1S_GRID[gi];
+        var ok = true;
+        for (0..8) |kk| {
+            const l: u8 = @intCast(@divTrunc(data.grid[gi][kk] - 1, 2));
+            const byte: u8 = @truncate(entry >> @intCast(8 * kk));
+            const expected: u8 = switch (l) {
+                0 => 0xff,
+                1 => 0x00,
+                2 => 0x01,
+                else => unreachable,
+            };
+            if (byte != expected) ok = false;
+        }
+        if (ok) n_ok += 1;
+    }
+    try testing.expectEqual(@as(usize, 2048), n_ok);
+}
