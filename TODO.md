@@ -128,8 +128,16 @@ true vs false, with file:line evidence). All real items fixed:
   does not run `tools/verify_abi.py` (export+arity) or
   `tools/audit_layout.py` (pybind11 layout). A symbol regression ships
   silently otherwise.
-- [ ] **Python binding for `kt_set_default_allocator`** — symbol 87 has no
-  ctypes wrapper yet (vtable struct + install/reset).
+- [x] **Python binding for `kt_set_default_allocator`** — symbol 87 has
+  ctypes wrapper (lines 542-566 of `python/kt_kernel/__init__.py`):
+  `kt_allocator_vtable` Structure (userdata + alloc/free/resize
+  CFUNCTYPEs) + `kt_set_default_allocator(POINTER(vtable))` call
+  (None restores default). End-to-end test at
+  `tests/test_allocator.py`: installs a tracker allocator, runs
+  kt_worker_pool_new(0) + kt_worker_pool_free() round-trip, asserts
+  5 allocs/5 frees/408 bytes (matching the WorkerPool's internal
+  buffer setup), then asserts kt_set_default_allocator(None) actually
+  stops the tracker (counts stay frozen across a second round-trip).
 
 ---
 
