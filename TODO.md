@@ -112,11 +112,7 @@ true vs false, with file:line evidence). All real items fixed:
 
 ### Runtime (follow-ups from the audit)
 
-- [ ] **Wire `selectTileParams` into the kernels** — kernels still use the
-  fixed `K_BLOCK=1792`/`N_BLOCK=256` constants; on hosts with 512K L2 that
-  exceeds the cache. The helper exists (A4) and the benchmark exists (B2)
-  to validate the change. Approach: pass TileParams into the GemmKernel
-  BufferA/B sizing at MoE init.
+- [x] **Wire `selectTileParams` into the kernels — CLOSED (ce849ec, validated by 196a6c4)** — the tune hook (`tuneTileParamsForHost` in main.zig) installs measured cache-derived K_BLOCK/N_BLOCK into the BF16 kernel. Two fixes landed in ce849ec: (1) **idempotent guard** — detectCpu allocates, so a process-wide static makes the first call win (was re-running the sysfs probe on every kt_cpuinfer_new); (2) **defensive wiring at every operator _new** — kt_moe_new/kt_moe_new_sft/kt_dsv3_{layer,model,causallm}_new all construct TpMoe (whose init reads GemmKernel224BF.K_BLOCK for BufferA/B/C sizing) and now call the tune first, so callers that build their own pool still get host-sized expert buffers. **Measured validation** (moe_bench, 196a6c4): host-derived K_BLOCK=448 on a 512K-L2 Ryzen gives **-13.2% / -20.3%** on 16-tok / 8-tok prefill shapes vs the 1792 default (working set per block-step drops 9MB -> 2.3MB), noise-level on decode shapes — the A4 design intent, delivered. Note: INT8/MXFP kernels still use fixed K_BLOCK=3584 comptime consts (only the BF16 kernel has the runtime override) — extending the `pub var` pattern to them is optional follow-up if a host ever shows pressure on their shapes.
 - [ ] **Fix Zig 0.16 rot in the unused src/numa/ helpers** —
   `NumaTopology.detect`, `allocNuma`, `migratePagesToNode`,
   `getPageNodes` use dead APIs (std.fs.cwd, std.mem.page_size,
