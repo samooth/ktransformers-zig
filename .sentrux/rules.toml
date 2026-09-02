@@ -1,0 +1,106 @@
+# sentrux rules for ktransformers-zig — encodes the layering the port
+# actually follows (verified against the import graph):
+#
+#   include/kt_kernel.h  the C ABI contract (no code)
+#   bindings/            pybind11 shim — links AGAINST the .so, never compiles Zig
+#   python/              ctypes — dlopens the .so
+#   src/main.zig         C exports; imports ONLY std + root.zig
+#   src/root.zig         module hub + comptime fn-refs (48 imports)
+#   src/kernels/**       kernels; may import ../arch; NOT main/runtime
+#   src/runtime/**        pool/detect/memory; NOT kernels
+#   src/numa/**          NUMA syscalls; std-only leaf
+#   src/mla/**           MLA engine; leaf w.r.t. kernels
+#   src/io/**            GGUF parser; std-only leaf
+#   tests/ + bench/      import src via the "kt" module alias only
+#
+# Intentional same-layer data sharing (do NOT "fix"): the iq*_grid/
+# KSIGNS/KMASK lookup tables have a single owner file that siblings
+# import (iq1_s owns IQ1S_GRID; iq2_xxs owns KSIGNS/KMASK).
+
+[constraints]
+# KNOWN, INTENTIONAL Zig structural trade-offs (do NOT "fix" these):
+#   1. root.zig <-> main.zig cycle: root.zig:241 forces main.zig analysis
+#      so the export fn kt_* are EMITTED into the .so (Zig lazy analysis:
+#      exports not referenced from the root of the graph are dropped).
+#      main.zig imports root.zig for module re-exports. This cycle is the
+#      documented emission mechanism (AGENTS.md "Library wiring").
+#      => max_cycles = 1, not 0.
+#   2. root.zig fan-out 47: it is the DESIGNATED module hub + comptime
+#      fn-ref block (48 imports is the whole point of the file).
+#      => no_god_files = false. The "god file" IS the wiring layer.
+# What we DO lock in: no OTHER cycles (any new cycle beyond the
+# documented root<->main pair fails), and the layer directions below.
+max_cycles = 1
+no_god_files = false
+
+# Layer order: lower number may be imported BY higher, never the reverse.
+[[layers]]
+name = "leaves"
+paths = ["src/numa/**", "src/io/**"]
+order = 0
+
+[[layers]]
+name = "shared-intrinsics"
+paths = ["src/kernels/arch/**"]
+order = 1
+
+[[layers]]
+name = "mla-engine"
+paths = ["src/mla/**"]
+order = 2
+
+[[layers]]
+name = "kernels"
+paths = ["src/kernels/amx/**", "src/kernels/moe/**", "src/kernels/qwen3/**", "src/kernels/attn/**"]
+order = 3
+
+[[layers]]
+name = "runtime"
+paths = ["src/runtime/**"]
+order = 2
+
+[[layers]]
+name = "root-hub"
+paths = ["src/root.zig"]
+order = 3
+
+[[layers]]
+name = "c-exports"
+paths = ["src/main.zig"]
+order = 4
+
+[[layers]]
+name = "tests-bench"
+paths = ["tests/**", "bench/**"]
+order = 5
+
+[[layers]]
+name = "bindings-python"
+paths = ["bindings/**", "python/**"]
+order = 6
+
+# Hard boundaries (violation = real architecture break, not style).
+[[boundaries]]
+from = "src/**"
+to = "tests/**"
+reason = "Product code must never import test or bench files"
+
+[[boundaries]]
+from = "src/main.zig"
+to = "src/kernels/**"
+reason = "main.zig goes through root.zig re-exports only — a direct kernel import bypasses the comptime fn-ref wiring"
+
+[[boundaries]]
+from = "src/kernels/**"
+to = "src/main.zig"
+reason = "Kernels are imported BY main, never the reverse"
+
+[[boundaries]]
+from = "src/numa/**"
+to = "src/kernels/**"
+reason = "numa is a std-only leaf consumed via root.zig"
+
+[[boundaries]]
+from = "src/kernels/arch/**"
+to = "src/kernels/amx/**"
+reason = "arch (amx.zig/neon.zig) is shared by ALL kernels — it must not depend on any specific kernel"

@@ -233,24 +233,11 @@ pub fn gemmIQ3_XXSScalar(
 }
 
 // ============================================================================
-// Quantize — thin wrapper over the real quantizer (iq3_quantize.zig).
-// ============================================================================
-
-/// Lazily-initialized shared kmap data for the convenience wrapper below.
-var g_iq3_data: ?*@import("iq3xs_init.zig").Iq3GridData = null;
-var g_iq3_init_mutex: std.Thread.Mutex = .{};
-
-/// Quantize a row of f32 into IQ3_XXS blocks. On first call (per process)
-/// this builds the 4096-entry kmap + kneighbors tables (expensive, ~4M
-/// distance evals); pass the data explicitly via
-/// iq3_quantize.quantizeRowIQ3_XXS_WithInit to control the lifetime.
-pub fn quantizeRowIQ3_XXS(src: [*]const f32, dst: [*]BlockIQ3_XXS, k: usize) void {
-    const init = @import("iq3xs_init.zig");
-    const quant = @import("iq3_quantize.zig");
-    g_iq3_init_mutex.lock();
-    defer g_iq3_init_mutex.unlock();
-    if (g_iq3_data == null) {
-        g_iq3_data = init.initIq3XsData(std.heap.page_allocator);
-    }
-    quant.quantizeRowIQ3_XXS_WithInit(g_iq3_data.?, src[0..k], dst, k, null);
-}
+// Quantize — lives in iq3_quantize.zig (quantizeRowIQ3_XXS_WithInit),
+// which owns the kmap plumbing (iq3xs_init) and this file's block type.
+// The former convenience wrapper here was REMOVED: it created a
+// gemm_224_iq3_xxs <-> iq3_quantize import cycle (sentrux rule
+// max_cycles=0 caught it), declared a std.Thread.Mutex that does not
+// exist in this std (std.atomic.Mutex — latent, hidden by lazy
+// analysis), and had zero callers. Callers use the WithInit form with
+// initIq3XsData (process-cached since d0b0211).
