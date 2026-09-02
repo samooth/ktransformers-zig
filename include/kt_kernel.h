@@ -692,7 +692,7 @@ typedef struct KT_DSV3CausalLM KT_DSV3CausalLM;
 
 KT_DSV3Model* kt_dsv3_model_new(const kt_dsv3_model_config_t* config);
 void kt_dsv3_model_forward(KT_DSV3Model* model, size_t qlen, size_t kv_start_pos,
-                           const void* input, void* output);
+                            const void* input, void* output);
 void kt_dsv3_model_free(KT_DSV3Model* model);
 
 KT_DSV3CausalLM* kt_dsv3_causallm_new(const kt_dsv3_model_config_t* config);
@@ -700,5 +700,65 @@ KT_DSV3CausalLM* kt_dsv3_causallm_new(const kt_dsv3_model_config_t* config);
 void kt_dsv3_causallm_forward(KT_DSV3CausalLM* clm, size_t qlen, size_t kv_start_pos,
                               const void* input, float* logits);
 void kt_dsv3_causallm_free(KT_DSV3CausalLM* clm);
+
+// ============================================================================
+// Qwen3 MoE (model orchestration — Zig extension)
+// ============================================================================
+// Ports the Qwen3 MoE forward pass: standard MHA + GQA + RoPE + pre-norm
+// + vanilla softmax top-k gate (no group routing, no e_score_correction_bias)
+// + MoE FFN. Weight pointers are caller-owned (borrowed).
+
+typedef struct kt_qwen3moe_layer_config_t {
+    /* dims */
+    size_t hidden_size;
+    size_t num_heads;
+    size_t num_kv_heads;
+    size_t head_dim;
+    size_t max_qlen;
+    size_t max_kvlen;
+    double rope_theta;
+    size_t expert_num;
+    size_t num_experts_per_tok;
+    size_t intermediate_size;
+    void* pool;                       /* KT_WorkerPool* or NULL */
+    /* weights (BF16) */
+    const void* q_proj;               /* [num_heads*head_dim, hidden_size] */
+    const void* k_proj;               /* [num_kv_heads*head_dim, hidden_size] */
+    const void* v_proj;               /* [num_kv_heads*head_dim, hidden_size] */
+    const void* o_proj;               /* [hidden_size, num_heads*head_dim] */
+    const void* attn_norm_weight;     /* BF16 [hidden_size] */
+    const void* ffn_norm_weight;      /* BF16 [hidden_size] */
+    const void* gate_weight;          /* BF16 [expert_num, hidden_size] */
+    const void* gate_proj;            /* BF16 [expert_num, inter, hidden] */
+    const void* up_proj;
+    const void* down_proj;
+} kt_qwen3moe_layer_config_t;
+
+typedef struct KT_Qwen3MoeLayer KT_Qwen3MoeLayer;
+typedef struct KT_Qwen3MoeModel KT_Qwen3MoeModel;
+typedef struct KT_Qwen3MoeCausalLM KT_Qwen3MoeCausalLM;
+
+KT_Qwen3MoeLayer* kt_qwen3moe_layer_new(const kt_qwen3moe_layer_config_t* config);
+void kt_qwen3moe_layer_forward(KT_Qwen3MoeLayer* layer, size_t qlen, size_t kv_start_pos,
+                                const void* input, void* output);
+void kt_qwen3moe_layer_free(KT_Qwen3MoeLayer* layer);
+
+typedef struct kt_qwen3moe_model_config_t {
+    size_t num_layers;
+    kt_qwen3moe_layer_config_t layer;     /* per-layer template */
+    const void* final_norm_weight;        /* BF16 [hidden_size] */
+    const void* lm_head;                  /* BF16 [vocab_size, hidden_size]; CausalLM only */
+    size_t vocab_size;                    /* 0 = model-only */
+} kt_qwen3moe_model_config_t;
+
+KT_Qwen3MoeModel* kt_qwen3moe_model_new(const kt_qwen3moe_model_config_t* config);
+void kt_qwen3moe_model_forward(KT_Qwen3MoeModel* model, size_t qlen, size_t kv_start_pos,
+                                const void* input, void* output);
+void kt_qwen3moe_model_free(KT_Qwen3MoeModel* model);
+
+KT_Qwen3MoeCausalLM* kt_qwen3moe_causallm_new(const kt_qwen3moe_model_config_t* config);
+void kt_qwen3moe_causallm_forward(KT_Qwen3MoeCausalLM* clm, size_t qlen, size_t kv_start_pos,
+                                  const void* input, float* logits);
+void kt_qwen3moe_causallm_free(KT_Qwen3MoeCausalLM* clm);
 
 #endif // KTRANSFORMERS_C_API_H

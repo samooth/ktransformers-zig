@@ -34,6 +34,8 @@ const mla_core = root.mla_core;
 // root re-exports it from kernels/moe/deepseekv3_layer.zig).
 const deepseekv3_layer = root.deepseekv3_layer;
 const deepseekv3_model = root.deepseekv3_model;
+const qwen3_layer = root.qwen3_layer;
+const qwen3_model = root.qwen3_model;
 
 // ============================================================================
 // C API Types
@@ -1383,6 +1385,155 @@ pub export fn kt_dsv3_causallm_forward(
 
 pub export fn kt_dsv3_causallm_free(clm: *KT_DSV3CausalLM) void {
     const c: *deepseekv3_model.DeepseekV3ForCausalLM = @ptrCast(@alignCast(clm));
+    c.deinit();
+}
+
+// ============================================================================
+// Qwen3 MoE Decoder Layer + Model + CausalLM (model orchestration —
+// Zig extension). Ports the Qwen3-style MoE forward pass: standard
+// MHA + GQA + RoPE + pre-norm + vanilla softmax top-k gate (no group
+// routing, no e_score_correction_bias) + MoE FFN.
+//
+// Reference: ktransformers/kt-kernel/python/sft/layer.py:461-560
+// (Qwen3 MoE forward) and ktransformers/kt-kernel/doc/en/Qwen3.5.md.
+// ============================================================================
+// Mirrors kt_qwen3moe_layer_config_t in include/kt_kernel.h exactly
+// (the C ABI contract; verify with tools/audit_layout.py if extended).
+
+pub const kt_qwen3moe_layer_config_t = extern struct {
+    hidden_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    max_qlen: usize,
+    max_kvlen: usize,
+    rope_theta: f64,
+    expert_num: usize,
+    num_experts_per_tok: usize,
+    intermediate_size: usize,
+    pool: ?*anyopaque,
+    q_proj: *const anyopaque,
+    k_proj: *const anyopaque,
+    v_proj: *const anyopaque,
+    o_proj: *const anyopaque,
+    attn_norm_weight: *const anyopaque,
+    ffn_norm_weight: *const anyopaque,
+    gate_weight: *const anyopaque,
+    gate_proj: *const anyopaque,
+    up_proj: *const anyopaque,
+    down_proj: *const anyopaque,
+};
+
+fn toQwen3LayerConfig(c: kt_qwen3moe_layer_config_t) qwen3_layer.LayerConfig {
+    return .{
+        .hidden_size = c.hidden_size,
+        .num_heads = c.num_heads,
+        .num_kv_heads = c.num_kv_heads,
+        .head_dim = c.head_dim,
+        .max_qlen = c.max_qlen,
+        .max_kvlen = c.max_kvlen,
+        .rope_theta = c.rope_theta,
+        .expert_num = c.expert_num,
+        .num_experts_per_tok = c.num_experts_per_tok,
+        .intermediate_size = c.intermediate_size,
+        .pool = @ptrCast(@alignCast(c.pool)),
+        .q_proj = @ptrCast(@alignCast(c.q_proj)),
+        .k_proj = @ptrCast(@alignCast(c.k_proj)),
+        .v_proj = @ptrCast(@alignCast(c.v_proj)),
+        .o_proj = @ptrCast(@alignCast(c.o_proj)),
+        .attn_norm_weight = @ptrCast(@alignCast(c.attn_norm_weight)),
+        .ffn_norm_weight = @ptrCast(@alignCast(c.ffn_norm_weight)),
+        .gate_weight = @ptrCast(@alignCast(c.gate_weight)),
+        .gate_proj = @ptrCast(@alignCast(c.gate_proj)),
+        .up_proj = @ptrCast(@alignCast(c.up_proj)),
+        .down_proj = @ptrCast(@alignCast(c.down_proj)),
+    };
+}
+
+const KT_Qwen3MoeLayer = opaque {};
+const KT_Qwen3MoeModel = opaque {};
+const KT_Qwen3MoeCausalLM = opaque {};
+
+pub export fn kt_qwen3moe_layer_new(config: *const kt_qwen3moe_layer_config_t) *KT_Qwen3MoeLayer {
+    const layer = qwen3_layer.Qwen3MoeDecoderLayer.init(defaultAllocator(), toQwen3LayerConfig(config.*)) catch @panic("Failed to init Qwen3 layer");
+    return @ptrCast(layer);
+}
+
+pub export fn kt_qwen3moe_layer_forward(
+    layer: *KT_Qwen3MoeLayer,
+    qlen: usize,
+    kv_start_pos: usize,
+    input: [*]const amx.bf16,
+    output: [*]amx.bf16,
+) void {
+    const l: *qwen3_layer.Qwen3MoeDecoderLayer = @ptrCast(@alignCast(layer));
+    l.forward(qlen, kv_start_pos, input, output);
+}
+
+pub export fn kt_qwen3moe_layer_free(layer: *KT_Qwen3MoeLayer) void {
+    const l: *qwen3_layer.Qwen3MoeDecoderLayer = @ptrCast(@alignCast(layer));
+    l.deinit();
+}
+
+pub const kt_qwen3moe_model_config_t = extern struct {
+    num_layers: usize,
+    layer: kt_qwen3moe_layer_config_t,
+    final_norm_weight: *const anyopaque,
+    lm_head: *const anyopaque,
+    vocab_size: usize,
+};
+
+fn toQwen3ModelConfig(c: kt_qwen3moe_model_config_t) qwen3_model.ModelConfig {
+    return .{
+        .num_layers = c.num_layers,
+        .layer = toQwen3LayerConfig(c.layer),
+        .final_norm_weight = @ptrCast(@alignCast(c.final_norm_weight)),
+    };
+}
+
+pub export fn kt_qwen3moe_model_new(config: *const kt_qwen3moe_model_config_t) *KT_Qwen3MoeModel {
+    const model = qwen3_model.Qwen3MoeModel.init(defaultAllocator(), toQwen3ModelConfig(config.*)) catch @panic("Failed to init Qwen3 model");
+    return @ptrCast(model);
+}
+
+pub export fn kt_qwen3moe_model_forward(
+    model: *KT_Qwen3MoeModel,
+    qlen: usize,
+    kv_start_pos: usize,
+    input: [*]const amx.bf16,
+    output: [*]amx.bf16,
+) void {
+    const m: *qwen3_model.Qwen3MoeModel = @ptrCast(@alignCast(model));
+    m.forward(qlen, kv_start_pos, input, output);
+}
+
+pub export fn kt_qwen3moe_model_free(model: *KT_Qwen3MoeModel) void {
+    const m: *qwen3_model.Qwen3MoeModel = @ptrCast(@alignCast(model));
+    m.deinit();
+}
+
+pub export fn kt_qwen3moe_causallm_new(config: *const kt_qwen3moe_model_config_t) *KT_Qwen3MoeCausalLM {
+    const clm = qwen3_model.Qwen3MoeForCausalLM.init(defaultAllocator(), .{
+        .model = toQwen3ModelConfig(config.*),
+        .lm_head = @ptrCast(@alignCast(config.lm_head)),
+        .vocab_size = config.vocab_size,
+    }) catch @panic("Failed to init Qwen3 CausalLM");
+    return @ptrCast(clm);
+}
+
+pub export fn kt_qwen3moe_causallm_forward(
+    clm: *KT_Qwen3MoeCausalLM,
+    qlen: usize,
+    kv_start_pos: usize,
+    input: [*]const amx.bf16,
+    logits: [*]f32,
+) void {
+    const c: *qwen3_model.Qwen3MoeForCausalLM = @ptrCast(@alignCast(clm));
+    c.forward(qlen, kv_start_pos, input, logits);
+}
+
+pub export fn kt_qwen3moe_causallm_free(clm: *KT_Qwen3MoeCausalLM) void {
+    const c: *qwen3_model.Qwen3MoeForCausalLM = @ptrCast(@alignCast(clm));
     c.deinit();
 }
 

@@ -211,6 +211,35 @@ comptime {
     _ = &deepseekv3_model.DeepseekV3ForCausalLM.deinit;
 }
 
+// Force analysis of the Qwen3 MoE orchestration (MHA engine + decoder
+// layer + model + CausalLM). Same lazy-analysis rule as MLA / DSV3.
+pub const mha = @import("kernels/attn/mha.zig");
+pub const gguf = @import("io/gguf.zig");
+pub const qwen3_layer = @import("kernels/qwen3/qwen3_layer.zig");
+pub const qwen3_model = @import("kernels/qwen3/qwen3_model.zig");
+comptime {
+    _ = &mha.MhaEngine.init;
+    _ = &mha.MhaEngine.deinit;
+    _ = &mha.MhaEngine.forward;
+    _ = &mha.MhaEngine.decode;
+    _ = &mha.MhaKvCache.init;
+    _ = &mha.MhaKvCache.deinit;
+    _ = &mha.matmulF32;
+    _ = &mha.rmsNormInline;
+    _ = &mha.softmaxInPlace;
+    _ = &gguf.parse;
+    _ = &gguf.Header.findTensor;
+    _ = &qwen3_layer.Qwen3MoeDecoderLayer.init;
+    _ = &qwen3_layer.Qwen3MoeDecoderLayer.forward;
+    _ = &qwen3_layer.Qwen3MoeDecoderLayer.deinit;
+    _ = &qwen3_model.Qwen3MoeModel.init;
+    _ = &qwen3_model.Qwen3MoeModel.forward;
+    _ = &qwen3_model.Qwen3MoeModel.deinit;
+    _ = &qwen3_model.Qwen3MoeForCausalLM.init;
+    _ = &qwen3_model.Qwen3MoeForCausalLM.forward;
+    _ = &qwen3_model.Qwen3MoeForCausalLM.deinit;
+}
+
 // NEON Phase-2: force analysis of the NEON-vectorized BF16 GEMM. The
 // cross-build (`zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu`)
 // lowers the comptime @Vector(4,f32) to native NEON fmul/fmla. On
