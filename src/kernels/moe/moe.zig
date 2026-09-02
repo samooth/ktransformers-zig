@@ -190,6 +190,7 @@ pub const RouteOpts = struct {
 /// - `opts.topk_group <= opts.n_group`
 /// - `k == num_experts_per_tok`
 fn routeExpertsWithOpts(
+    allocator: std.mem.Allocator,
     logits: []f32,
     qlen: usize,
     expert_num: usize,
@@ -202,14 +203,18 @@ fn routeExpertsWithOpts(
     // Per-token scratch: sigmoid/softmax score, bias-corrected score,
     // and the group-mask. Allocated once per call to avoid re-allocation
     // per token in the inner loop.
-    var scores = std.heap.page_allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
-    defer std.heap.page_allocator.free(scores);
-    var scores_for_choice = std.heap.page_allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
-    defer std.heap.page_allocator.free(scores_for_choice);
-    var group_scores = std.heap.page_allocator.alloc(f32, qlen * opts.n_group) catch @panic("OOM");
-    defer std.heap.page_allocator.free(group_scores);
-    var group_mask = std.heap.page_allocator.alloc(f32, qlen * opts.n_group) catch @panic("OOM");
-    defer std.heap.page_allocator.free(group_mask);
+    // B1 closure: through the caller-provided allocator (the captured
+    // TpMoe/Gate/layer allocator), NOT page_allocator — same contract as
+    // every other operator scratch (allocator test documents this).
+    const alloc = allocator;
+    var scores = alloc.alloc(f32, qlen * expert_num) catch @panic("OOM");
+    defer alloc.free(scores);
+    var scores_for_choice = alloc.alloc(f32, qlen * expert_num) catch @panic("OOM");
+    defer alloc.free(scores_for_choice);
+    var group_scores = alloc.alloc(f32, qlen * opts.n_group) catch @panic("OOM");
+    defer alloc.free(group_scores);
+    var group_mask = alloc.alloc(f32, qlen * opts.n_group) catch @panic("OOM");
+    defer alloc.free(group_mask);
 
     for (0..qlen) |i| {
         const logit_row = logits[i * expert_num ..][0..expert_num];
@@ -369,6 +374,7 @@ fn routeExpertsWithOpts(
 }
 
 pub fn routeExperts(
+    allocator: std.mem.Allocator,
     input: [*]const amx.bf16, // [qlen, hidden_size]
     gate_proj: [*]const amx.bf16, // [expert_num, hidden_size]
     qlen: usize,
@@ -389,8 +395,8 @@ pub fn routeExperts(
     // callers; future work: parallelize the matmul + topk across the
     // pool's threads.
     if (pool) |_| {}
-    var logits = std.heap.page_allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
-    defer std.heap.page_allocator.free(logits);
+    var logits = allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
+    defer allocator.free(logits);
 
     gemm_bf16.gemmExpert(
         input, gate_proj, logits.ptr,
@@ -422,6 +428,7 @@ pub fn routeExperts(
 /// case). Callers that want the legacy naive top-k should use
 /// `routeExperts` directly.
 pub fn routeExpertsDeepSeek(
+    allocator: std.mem.Allocator,
     input: [*]const amx.bf16, // [qlen, hidden_size]
     gate_proj: [*]const amx.bf16, // [expert_num, hidden_size]
     qlen: usize,
@@ -437,12 +444,12 @@ pub fn routeExpertsDeepSeek(
     // n_group >= 1. If a malformed config slips through, fall back
     // to the simple softmax path so we never panic on a model load.
     if (opts.n_group < 1 or expert_num % opts.n_group != 0 or opts.topk_group > opts.n_group) {
-        routeExperts(input, gate_proj, qlen, hidden_size, expert_num, num_experts_per_tok, topk_ids, topk_weights, pool);
+        routeExperts(allocator, input, gate_proj, qlen, hidden_size, expert_num, num_experts_per_tok, topk_ids, topk_weights, pool);
         return;
     }
 
-    var logits = std.heap.page_allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
-    defer std.heap.page_allocator.free(logits);
+    var logits = allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
+    defer allocator.free(logits);
 
     gemm_bf16.gemmExpert(
         input, gate_proj, logits.ptr,
@@ -451,6 +458,7 @@ pub fn routeExpertsDeepSeek(
     );
 
     routeExpertsWithOpts(
+        allocator,
         logits,
         qlen,
         expert_num,

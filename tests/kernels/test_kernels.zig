@@ -975,6 +975,7 @@ test "Gate + MoE end-to-end (routeExperts -> forward)" {
     // Sequential routing (no pool). All scores equal hidden_size, so top-1
     // tie-breaks to the first expert (idx 0); we just check validity.
     moe.routeExperts(
+        std.heap.page_allocator,
         @ptrCast(input.ptr), @ptrCast(gate_weight.ptr),
         qlen, hidden_size, expert_num, num_experts_per_tok,
         topk_ids.ptr, topk_weights.ptr,
@@ -2475,6 +2476,7 @@ test "routeExpertsDeepSeek: group-top2 matches Python reference algorithm" {
     defer allocator.free(topk_weights);
 
     moe.routeExpertsDeepSeek(
+        allocator,
         input.ptr, gate_w.ptr, qlen, hidden, expert_num, k,
         .{
             .scoring = .sigmoid,
@@ -2547,6 +2549,7 @@ test "routeExpertsDeepSeek: no-group config falls back to legacy behavior" {
 
     // n_group=0: invalid, must fall back (not panic).
     moe.routeExpertsDeepSeek(
+        allocator,
         input.ptr, gate_w.ptr, qlen, hidden, expert_num, k,
         .{ .n_group = 0 },
         topk_ids.ptr, topk_weights.ptr,
@@ -2556,6 +2559,7 @@ test "routeExpertsDeepSeek: no-group config falls back to legacy behavior" {
 
     // n_group=3 with 8 experts: non-divisible, must fall back.
     moe.routeExpertsDeepSeek(
+        allocator,
         input.ptr, gate_w.ptr, qlen, hidden, expert_num, k,
         .{ .n_group = 3 },
         topk_ids.ptr, topk_weights.ptr,

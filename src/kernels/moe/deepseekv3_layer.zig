@@ -216,6 +216,7 @@ pub const DeepseekV3DecoderLayer = struct {
 
         // Router: DeepSeek-V3 noaux_tc group-top2 (:394-461)
         moe_mod.routeExpertsDeepSeek(
+            self.allocator,
             bridge_bf16.ptr,
             cfg.gate_weight,
             qlen,

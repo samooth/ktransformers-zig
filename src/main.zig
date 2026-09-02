@@ -1470,6 +1470,7 @@ pub export fn kt_gate_forward(
         // normalization + scaling. Matches the Python reference at
         // ktransformers/kt-kernel/python/sft/layer.py:696-728.
         moe.routeExpertsDeepSeek(
+            ctx.allocator,
             input, ctx.weight, qlen, ctx.hidden_size, ctx.num_experts, k,
             .{
                 .scoring = .sigmoid,
@@ -1486,6 +1487,7 @@ pub export fn kt_gate_forward(
         // Legacy path (pre-D4): flat top-k of raw logits. Preserved for
         // configs that don't set group routing (n_group <= 1).
         moe.routeExperts(
+            ctx.allocator,
             input, ctx.weight, qlen, ctx.hidden_size, ctx.num_experts, k,
             topk_ids, topk_weights,
             null,
