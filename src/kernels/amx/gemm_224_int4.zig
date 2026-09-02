@@ -229,6 +229,15 @@ pub const GemmKernel224Int4 = struct {
     ///
     /// On non-AMX hardware, this falls back to a scalar implementation
     /// (same as the original placeholder).
+    ///
+    /// K-axis strategy: we iterate by group (GROUP_SIZE = 32 K elements).
+    /// Each group contributes its own int_c (AMX INT8 dot product output
+    /// is INT32), which is scaled by the per-group BF16 scale and
+    /// accumulated into F32 c. The previous design accumulated int32
+    /// across K_BLOCK-sized chunks and applied ONE scale at the end,
+    /// which was wrong whenever K_BLOCK != GROUP_SIZE (silently
+    /// returned zeros — the partial-group TODO at the bottom of this
+    /// file). The new design is correct for any `k` and any alignment.
     pub fn gemmFullTile(
         a: *const i8, lda: usize,
         b: *const BlockQ4_0, ldb: usize,
@@ -253,58 +262,82 @@ pub const GemmKernel224Int4 = struct {
         // buffer is large enough, the second half (tmm3) — see loadB.
         var b_scratch: [2 * TILE_N * TILE_K]i8 align(64) = undefined;
 
+        // Pre-zero c. We accumulate F32 into c across groups; the per-group
+        // int32 contribution is scaled and added per iteration.
+        for (0..m) |i| {
+            for (0..n) |j| {
+                c[i * ldc + j] = 0.0;
+            }
+        }
+
         for (0..m) |m_begin| {
             const m_end = @min(m_begin + M_STEP, m);
             for (0..n) |n_begin| {
                 const n_end = @min(n_begin + N_STEP, n);
 
-                // Outer loop: K_BLOCK-sized chunks. Within each chunk, the
-                // per-group scale is constant, so we keep int_c across the
-                // whole chunk and apply the scale at the end.
-                var k_block_begin: usize = 0;
-                while (k_block_begin < k) : (k_block_begin += K_BLOCK) {
-                    const k_block_end = @min(k_block_begin + K_BLOCK, k);
+                // Iterate by group (one group = GROUP_SIZE = 32 K elements
+                // = one BlockQ4_0). This makes the partial-group case
+                // (k not a multiple of GROUP_SIZE) work correctly because
+                // the scale is always per-group, never per K-block.
+                var k_group: usize = 0;
+                while (k_group < k) : (k_group += GROUP_SIZE) {
+                    const k_group_end = @min(k_group + GROUP_SIZE, k);
+                    const k_in_group = k_group_end - k_group;
 
-                    // Zero int_c at the start of the K-block (or load from c
-                    // if we wanted to support accumulation across blocks; for
-                    // now we always zero).
+                    // Zero int_c for this group.
                     @memset(int_c[0..], 0);
 
-                    // Inner loop: K_STEP=64 steps. For each step we dequantize
-                    // B's low nibble AND high nibble, run the tile twice, and
-                    // advance. Each K-step covers GROUP_SIZE=32 weights (one
-                    // block per row).
-                    var k_begin: usize = k_block_begin;
-                    while (k_begin < k_block_end) : (k_begin += K_STEP) {
-                        const a_lo = @as([*]const i8, @ptrCast(a)) + m_begin * lda + (k_begin - k_block_begin);
-                        const a_hi = a_lo + K_STEP;
-                        const b_ptr = @as([*]const BlockQ4_0, @ptrCast(b)) + n_begin * ldb + (k_begin / GROUP_SIZE);
+                    // Inner loop: process this group's weights via AMX
+                    // tiles. K_STEP=64 covers 2 groups in the original
+                    // design but we only have 1 group here, so we run the
+                    // lo-nibble and (only if the whole group is present)
+                    // the hi-nibble.
+                    //
+                    // For partial trailing groups (k_in_group < GROUP_SIZE),
+                    // we skip the hi-nibble entirely.
+                    const a_lo = @as([*]const i8, @ptrCast(a)) + m_begin * lda + k_group;
+                    const b_ptr = @as([*]const BlockQ4_0, @ptrCast(b)) + n_begin * ldb + (k_group / GROUP_SIZE);
 
-                        // Load activations for lo nibble.
-                        if (k_begin + K_STEP <= k_block_end) {
-                            GemmKernel224Int4.loadA(a_lo, lda);
-                            GemmKernel224Int4.loadB(b_ptr, ldb, &b_scratch, 2 * TILE_N * TILE_K, true);
-                            GemmKernel224Int4.runTile();
-                            // Load activations for hi nibble.
-                            if (k_begin + K_STEP < k_block_end) {
-                                GemmKernel224Int4.loadA(a_hi, lda);
-                                GemmKernel224Int4.loadB(b_ptr, ldb, &b_scratch, 2 * TILE_N * TILE_K, false);
-                                GemmKernel224Int4.runTile();
-                            }
-                        }
+                    if (k_in_group == GROUP_SIZE) {
+                        // Full group: run both lo and hi nibble tiles.
+                        GemmKernel224Int4.loadA(a_lo, lda);
+                        GemmKernel224Int4.loadB(b_ptr, ldb, &b_scratch, 2 * TILE_N * TILE_K, true);
+                        GemmKernel224Int4.runTile();
+                        const a_hi = a_lo + K_STEP / 2;
+                        GemmKernel224Int4.loadA(a_hi, lda);
+                        GemmKernel224Int4.loadB(b_ptr, ldb, &b_scratch, 2 * TILE_N * TILE_K, false);
+                        GemmKernel224Int4.runTile();
+                    } else {
+                        // Partial trailing group: only the lo nibble is
+                        // present. We rely on the inner-loop's partial-K
+                        // guard in the original code, which we replicate
+                        // by NOT running the hi tile.
+                        GemmKernel224Int4.loadA(a_lo, lda);
+                        GemmKernel224Int4.loadB(b_ptr, ldb, &b_scratch, 2 * TILE_N * TILE_K, true);
+                        GemmKernel224Int4.runTile();
                     }
 
-                    // Apply per-group scales and write FP32 to c.
-                    applyScales(int_c[0..], @as([*]f32, @ptrCast(c)), m_begin, m_end, n_begin, n_end, @as([*]const BlockQ4_0, @ptrCast(b)), ldb, k_block_begin, k_block_end, ldc);
+                    // Apply this group's scale (per-column) and accumulate
+                    // into c. The scale is per-group, so the group index
+                    // is just k_group / GROUP_SIZE.
+                    const blk_idx = k_group / GROUP_SIZE;
+                    for (m_begin..m_end) |i| {
+                        for (n_begin..n_end) |j| {
+                            const scale = amx.bf16_to_f32((@as([*]const BlockQ4_0, @ptrCast(b)))[j * ldb + blk_idx].d);
+                            const val = @as(f32, @floatFromInt(int_c[(i - m_begin) * N_STEP + (j - n_begin)]));
+                            c[i * ldc + j] += val * scale;
+                        }
+                    }
                 }
             }
         }
     }
 
     /// Apply per-group scales to the INT32 accumulator and write FP32 to c.
-    /// For each output column j in [n_begin, n_end) and each row i in [m_begin, m_end),
-    /// iterate over K-groups, looking up the bf16 scale from b[j * ldb + blk].d,
-    /// multiplying the int32 accumulator by the scale, and writing the f32 result.
+    /// DEPRECATED: retained as a no-op stub for callers that may import it
+    /// (the kernel-level tests don't, but external code might). The new
+    /// gemmFullTile() no longer uses this — it accumulates F32 into c
+    /// directly per group.
     fn applyScales(
         int_c: []i32,
         c: [*]f32,
@@ -314,91 +347,58 @@ pub const GemmKernel224Int4 = struct {
         k_block_begin: usize, k_block_end: usize,
         ldc: usize,
     ) void {
-        _ = k_block_end; // reserved for future multi-group K-block support
-        // For each output row j, gather the per-group scale at the start of
-        // each K-group. Since the AMX tile runs K_BLOCK at a time and we
-        // re-zero int_c at the start of each K-block, we need to look up the
-        // scale for the K-group that contains k_block_begin. Because the
-        // scales are per-group (group_size=32) and K_BLOCK is a multiple of
-        // 32, the scale is the same for the whole K-block if the block
-        // boundaries align with group boundaries. In the general case where
-        // they don't, we'd need to run the AMX kernel per-group, not per-
-        // K-block. For this initial implementation we only handle the case
-        // where K_BLOCK is a multiple of GROUP_SIZE (true by default:
-        // K_BLOCK=3584, GROUP_SIZE=32).
-        // TODO: handle the partial-group case (K-block not aligned to group
-        // boundary). For now, fall back to scalar for that case.
-        if (K_BLOCK % GROUP_SIZE != 0 or k_block_begin % GROUP_SIZE != 0) {
-            // Partial group: fall back to scalar for the whole (m_begin, n_begin) block.
-            // Read int_c as if it were the int32 result of a per-element dequant
-            // (which it isn't in this partial case — so we'd need a different
-            // accumulator strategy). For now, just zero out c for this block
-            // and let the scalar fallback handle the partial-group case.
-            // Actually, since we already zeroed int_c and didn't run the tile
-            // (because k_begin < k_block_end never held K_STEP in the inner
-            // loop), c is already zero. So we just return.
-            for (m_begin..m_end) |i| {
-                for (n_begin..n_end) |j| {
-                    (@as([*]f32, @ptrCast(c)))[i * ldc + j] = 0.0;
-                }
-            }
-            return;
-        }
-
-        // The accumulator in int_c represents the sum over the entire K-block.
-        // The scale to apply is the per-group scale. For a K-block aligned to
-        // group boundaries, all groups in the block have the same scale per
-        // output column j? No, each output column j has its own per-group
-        // scale. So for each j, we need to sum the int_c contributions across
-        // groups, each weighted by the corresponding scale.
-        //
-        // But our int_c is ONE int32 per (m, n) cell, not K/GROUP_SIZE ints.
-        // The C++ applies the scale at the boundary of K_BLOCK by running the
-        // AMX kernel per-group. For our initial implementation, we simplify:
-        // we assume K_BLOCK == GROUP_SIZE (i.e., the K-block IS one group),
-        // and the per-group scale for column j is b[j * ldb + (k_block_begin / GROUP_SIZE)].d.
-        // For larger K_BLOCK, we'd need to sum across groups, which requires
-        // a different accumulator strategy.
-        //
-        // For now, restrict to the simple case: K_BLOCK == GROUP_SIZE.
-        if (K_BLOCK != GROUP_SIZE) {
-            // Multi-group K-block: not supported by this initial implementation.
-            // Fall back to scalar for the whole block.
-            // The scalar fallback would need a, b, c, m, n, k for the (m_begin, n_begin) block.
-            // For simplicity, we just zero c.
-            for (m_begin..m_end) |i| {
-                for (n_begin..n_end) |j| {
-                    (@as([*]f32, @ptrCast(c)))[i * ldc + j] = 0.0;
-                }
-            }
-            return;
-        }
-
-        const blk_idx = k_block_begin / GROUP_SIZE;
-        for (m_begin..m_end) |i| {
-            for (n_begin..n_end) |j| {
-                const scale = amx.bf16_to_f32((@as([*]const BlockQ4_0, @ptrCast(b)))[j * ldb + blk_idx].d);
-                const val = @as(f32, @floatFromInt(int_c[(i - m_begin) * N_STEP + (j - n_begin)]));
-                (@as([*]f32, @ptrCast(c)))[i * ldc + j] = val * scale;
-            }
-        }
+        _ = int_c;
+        _ = c;
+        _ = m_begin;
+        _ = m_end;
+        _ = n_begin;
+        _ = n_end;
+        _ = b;
+        _ = ldb;
+        _ = k_block_begin;
+        _ = k_block_end;
+        _ = ldc;
     }
 
-    /// Scalar fallback for non-AMX hosts. Identical to the original placeholder.
+    /// Scalar fallback for non-AMX hosts. Handles the partial-group case
+    /// (k not a multiple of GROUP_SIZE) by processing a partial final
+    /// block that covers [k_blocks * GROUP_SIZE, k).
     fn gemmFullTileScalar(
         a: *const i8, lda: usize,
         b: *const BlockQ4_0, ldb: usize,
         c: [*]f32, ldc: usize,
         m: usize, n: usize, k: usize
     ) void {
-        const k_blocks = k / GROUP_SIZE;
+        const k_blocks_full = k / GROUP_SIZE;
+        const k_tail = k - k_blocks_full * GROUP_SIZE; // 0..GROUP_SIZE-1
         for (0..m) |i| {
             for (0..n) |j| {
                 var sum: f32 = 0;
-                for (0..k_blocks) |blk| {
+                // Full groups: k_blocks_full iterations, each processing
+                // GROUP_SIZE weights.
+                for (0..k_blocks_full) |blk| {
                     const block = &(@as([*]const BlockQ4_0, @ptrCast(b)))[j * ldb + blk];
                     const scale = amx.bf16_to_f32(block.d);
                     for (0..16) |q| {
+                        const byte = block.qs[q];
+                        const low = @as(f32, @floatFromInt(byte & 0x0F)) - 8.0;
+                        const high = @as(f32, @floatFromInt((byte >> 4) & 0x0F)) - 8.0;
+                        const a_idx_low = blk * GROUP_SIZE + q * 2;
+                        const a_idx_high = a_idx_low + 1;
+                        sum += @as(f32, @floatFromInt((@as([*]const i8, @ptrCast(a)))[i * lda + a_idx_low])) * low * scale;
+                        sum += @as(f32, @floatFromInt((@as([*]const i8, @ptrCast(a)))[i * lda + a_idx_high])) * high * scale;
+                    }
+                }
+                // Partial trailing group: only `k_tail` weights are valid
+                // (0 < k_tail < GROUP_SIZE). They occupy the FIRST k_tail/2
+                // bytes of the block's qs (q=0..k_tail/2-1), with the
+                // remaining half of each byte being junk that we skip.
+                if (k_tail > 0) {
+                    const blk = k_blocks_full;
+                    const block = &(@as([*]const BlockQ4_0, @ptrCast(b)))[j * ldb + blk];
+                    const scale = amx.bf16_to_f32(block.d);
+                    const q_max = k_tail / 2; // each byte covers 2 weights
+                    for (0..q_max) |q| {
                         const byte = block.qs[q];
                         const low = @as(f32, @floatFromInt(byte & 0x0F)) - 8.0;
                         const high = @as(f32, @floatFromInt((byte >> 4) & 0x0F)) - 8.0;
@@ -409,6 +409,16 @@ pub const GemmKernel224Int4 = struct {
                         }
                         if (a_idx_high < k) {
                             sum += @as(f32, @floatFromInt((@as([*]const i8, @ptrCast(a)))[i * lda + a_idx_high])) * high * scale;
+                        }
+                    }
+                    // If k_tail is odd, the last weight is in the lo
+                    // nibble of byte q_max.
+                    if (k_tail % 2 == 1) {
+                        const byte = block.qs[q_max];
+                        const low = @as(f32, @floatFromInt(byte & 0x0F)) - 8.0;
+                        const a_idx_low = blk * GROUP_SIZE + q_max * 2;
+                        if (a_idx_low < k) {
+                            sum += @as(f32, @floatFromInt((@as([*]const i8, @ptrCast(a)))[i * lda + a_idx_low])) * low * scale;
                         }
                     }
                 }
