@@ -274,8 +274,22 @@ extern "C" {
     // DeepseekV3 layer (model orchestration — config BY POINTER, matches Zig)
     void* kt_dsv3_layer_new(const void* config);
     void  kt_dsv3_layer_forward(void* layer, size_t qlen, size_t kv_start_pos,
-                                 const void* input, void* output);
+                                const void* input, void* output);
     void  kt_dsv3_layer_free(void* layer);
+
+    // Qwen3 MoE layer (model orchestration — Zig extension, config BY POINTER)
+    void* kt_qwen3moe_layer_new(const void* config);
+    void  kt_qwen3moe_layer_forward(void* layer, size_t qlen, size_t kv_start_pos,
+                                    const void* input, void* output);
+    void  kt_qwen3moe_layer_free(void* layer);
+    void* kt_qwen3moe_model_new(const void* config);
+    void  kt_qwen3moe_model_forward(void* model, size_t qlen, size_t kv_start_pos,
+                                    const void* input, void* output);
+    void  kt_qwen3moe_model_free(void* model);
+    void* kt_qwen3moe_causallm_new(const void* config);
+    void  kt_qwen3moe_causallm_forward(void* clm, size_t qlen, size_t kv_start_pos,
+                                      const void* input, float* logits);
+    void  kt_qwen3moe_causallm_free(void* clm);
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +403,97 @@ public:
         kt_dsv3_layer_forward(h_, qlen, kv_start_pos,
                               reinterpret_cast<const void*>(input),
                               reinterpret_cast<void*>(output));
+    }
+private:
+    void* h_;
+};
+
+// ---- Qwen3 MoE (model orchestration — Zig extension) ----
+// ABI struct mirror of kt_qwen3moe_layer_config_t (src/main.zig). Pointer
+// fields as const void* (8 bytes each on Itanium x86-64). The pybind-side
+// config below stores them as size_t (Python int addresses) and converts in
+// the constructor — same layout, no UB.
+struct kt_qwen3moe_layer_config_t {
+    size_t hidden_size, num_heads, num_kv_heads, head_dim, max_qlen, max_kvlen;
+    double rope_theta;
+    size_t expert_num, num_experts_per_tok, intermediate_size;
+    void* pool;
+    const void* q_proj, *k_proj, *v_proj, *o_proj,
+              *attn_norm_weight, *ffn_norm_weight, *gate_weight,
+              *gate_proj, *up_proj, *down_proj;
+};
+
+struct Qwen3MoeLayerCfg {
+    size_t hidden_size = 0, num_heads = 0, num_kv_heads = 0, head_dim = 0,
+           max_qlen = 0, max_kvlen = 0;
+    double rope_theta = 1000000.0;   // Qwen3 default; 0.0 makes RoPE NaN
+    size_t expert_num = 0, num_experts_per_tok = 0, intermediate_size = 0;
+    size_t pool = 0;
+    size_t q_proj = 0, k_proj = 0, v_proj = 0, o_proj = 0,
+           attn_norm_weight = 0, ffn_norm_weight = 0, gate_weight = 0,
+           gate_proj = 0, up_proj = 0, down_proj = 0;
+};
+
+// kt_qwen3moe_model_config_t — has a kt_qwen3moe_layer_config_t embedded
+// (NOT a pointer like the pybind Dsv3LayerCfg pattern). Layout must match
+// the Zig extern struct: num_layers size_t + layer (the embedded struct)
+// + final_norm_weight + lm_head + vocab_size.
+struct kt_qwen3moe_model_config_t {
+    size_t num_layers;
+    kt_qwen3moe_layer_config_t layer;
+    const void* final_norm_weight;
+    const void* lm_head;
+    size_t vocab_size;
+};
+
+struct Qwen3MoeModelCfg {
+    size_t num_layers = 0;
+    Qwen3MoeLayerCfg layer;
+    size_t final_norm_weight = 0;
+    size_t lm_head = 0;
+    size_t vocab_size = 0;
+};
+
+class PyQwen3MoeLayer {
+public:
+    explicit PyQwen3MoeLayer(void* h) : h_(h) {}
+    ~PyQwen3MoeLayer() { if (h_) kt_qwen3moe_layer_free(h_); }
+    PyQwen3MoeLayer(const PyQwen3MoeLayer&) = delete;
+    PyQwen3MoeLayer& operator=(const PyQwen3MoeLayer&) = delete;
+    void forward(size_t qlen, size_t kv_start_pos, size_t input, size_t output) {
+        kt_qwen3moe_layer_forward(h_, qlen, kv_start_pos,
+                                  reinterpret_cast<const void*>(input),
+                                  reinterpret_cast<void*>(output));
+    }
+private:
+    void* h_;
+};
+
+class PyQwen3MoeModel {
+public:
+    explicit PyQwen3MoeModel(void* h) : h_(h) {}
+    ~PyQwen3MoeModel() { if (h_) kt_qwen3moe_model_free(h_); }
+    PyQwen3MoeModel(const PyQwen3MoeModel&) = delete;
+    PyQwen3MoeModel& operator=(const PyQwen3MoeModel&) = delete;
+    void forward(size_t qlen, size_t kv_start_pos, size_t input, size_t output) {
+        kt_qwen3moe_model_forward(h_, qlen, kv_start_pos,
+                                  reinterpret_cast<const void*>(input),
+                                  reinterpret_cast<void*>(output));
+    }
+private:
+    void* h_;
+};
+
+class PyQwen3MoeCausalLM {
+public:
+    explicit PyQwen3MoeCausalLM(void* h) : h_(h) {}
+    ~PyQwen3MoeCausalLM() { if (h_) kt_qwen3moe_causallm_free(h_); }
+    PyQwen3MoeCausalLM(const PyQwen3MoeCausalLM&) = delete;
+    PyQwen3MoeCausalLM& operator=(const PyQwen3MoeCausalLM&) = delete;
+    void forward(size_t qlen, size_t kv_start_pos, size_t input, size_t logits) {
+        kt_qwen3moe_causallm_forward(h_, qlen, kv_start_pos,
+                                    reinterpret_cast<const void*>(input),
+                                    reinterpret_cast<float*>(logits));
     }
 private:
     void* h_;
@@ -619,6 +724,148 @@ PYBIND11_MODULE(kt_kernel_ext, m) {
         .def_readwrite("gate_proj", &Dsv3LayerCfg::gate_proj)
         .def_readwrite("up_proj", &Dsv3LayerCfg::up_proj)
         .def_readwrite("down_proj", &Dsv3LayerCfg::down_proj);
+
+    // ---- Qwen3 MoE (model orchestration — Zig extension) ----
+    auto qwen3 = m.def_submodule("qwen3moe", "Qwen3 MoE model orchestration");
+
+    py::class_<PyQwen3MoeLayer>(qwen3, "Qwen3MoeDecoderLayer")
+        .def(py::init([](const Qwen3MoeLayerCfg& cfg) {
+            kt_qwen3moe_layer_config_t abi{};
+            abi.hidden_size = cfg.hidden_size;
+            abi.num_heads = cfg.num_heads;
+            abi.num_kv_heads = cfg.num_kv_heads;
+            abi.head_dim = cfg.head_dim;
+            abi.max_qlen = cfg.max_qlen;
+            abi.max_kvlen = cfg.max_kvlen;
+            abi.rope_theta = cfg.rope_theta;
+            abi.expert_num = cfg.expert_num;
+            abi.num_experts_per_tok = cfg.num_experts_per_tok;
+            abi.intermediate_size = cfg.intermediate_size;
+            abi.pool = reinterpret_cast<void*>(cfg.pool);
+            abi.q_proj = reinterpret_cast<const void*>(cfg.q_proj);
+            abi.k_proj = reinterpret_cast<const void*>(cfg.k_proj);
+            abi.v_proj = reinterpret_cast<const void*>(cfg.v_proj);
+            abi.o_proj = reinterpret_cast<const void*>(cfg.o_proj);
+            abi.attn_norm_weight = reinterpret_cast<const void*>(cfg.attn_norm_weight);
+            abi.ffn_norm_weight = reinterpret_cast<const void*>(cfg.ffn_norm_weight);
+            abi.gate_weight = reinterpret_cast<const void*>(cfg.gate_weight);
+            abi.gate_proj = reinterpret_cast<const void*>(cfg.gate_proj);
+            abi.up_proj = reinterpret_cast<const void*>(cfg.up_proj);
+            abi.down_proj = reinterpret_cast<const void*>(cfg.down_proj);
+            return std::unique_ptr<PyQwen3MoeLayer>(new PyQwen3MoeLayer(
+                kt_qwen3moe_layer_new(&abi)));
+        }), py::arg("config"))
+        .def("forward", &PyQwen3MoeLayer::forward,
+             py::arg("qlen"), py::arg("kv_start_pos"),
+             py::arg("input"), py::arg("output"));
+
+    py::class_<PyQwen3MoeModel>(qwen3, "Qwen3MoeModel")
+        .def(py::init([](const Qwen3MoeModelCfg& cfg) {
+            // Qwen3MoeModelCfg has the same layout as the Zig extern struct
+            // (num_layers, layer, final_norm_weight, lm_head, vocab_size) so
+            // a memcpy-cast is safe. We re-build the struct to be defensive
+            // about field order if either side adds padding.
+            kt_qwen3moe_model_config_t abi{};
+            abi.num_layers = cfg.num_layers;
+            // Layer — same as the layer constructor
+            abi.layer.hidden_size = cfg.layer.hidden_size;
+            abi.layer.num_heads = cfg.layer.num_heads;
+            abi.layer.num_kv_heads = cfg.layer.num_kv_heads;
+            abi.layer.head_dim = cfg.layer.head_dim;
+            abi.layer.max_qlen = cfg.layer.max_qlen;
+            abi.layer.max_kvlen = cfg.layer.max_kvlen;
+            abi.layer.rope_theta = cfg.layer.rope_theta;
+            abi.layer.expert_num = cfg.layer.expert_num;
+            abi.layer.num_experts_per_tok = cfg.layer.num_experts_per_tok;
+            abi.layer.intermediate_size = cfg.layer.intermediate_size;
+            abi.layer.pool = reinterpret_cast<void*>(cfg.layer.pool);
+            abi.layer.q_proj = reinterpret_cast<const void*>(cfg.layer.q_proj);
+            abi.layer.k_proj = reinterpret_cast<const void*>(cfg.layer.k_proj);
+            abi.layer.v_proj = reinterpret_cast<const void*>(cfg.layer.v_proj);
+            abi.layer.o_proj = reinterpret_cast<const void*>(cfg.layer.o_proj);
+            abi.layer.attn_norm_weight = reinterpret_cast<const void*>(cfg.layer.attn_norm_weight);
+            abi.layer.ffn_norm_weight = reinterpret_cast<const void*>(cfg.layer.ffn_norm_weight);
+            abi.layer.gate_weight = reinterpret_cast<const void*>(cfg.layer.gate_weight);
+            abi.layer.gate_proj = reinterpret_cast<const void*>(cfg.layer.gate_proj);
+            abi.layer.up_proj = reinterpret_cast<const void*>(cfg.layer.up_proj);
+            abi.layer.down_proj = reinterpret_cast<const void*>(cfg.layer.down_proj);
+            abi.final_norm_weight = reinterpret_cast<const void*>(cfg.final_norm_weight);
+            abi.lm_head = reinterpret_cast<const void*>(cfg.lm_head);
+            abi.vocab_size = cfg.vocab_size;
+            return std::unique_ptr<PyQwen3MoeModel>(new PyQwen3MoeModel(
+                kt_qwen3moe_model_new(&abi)));
+        }), py::arg("config"))
+        .def("forward", &PyQwen3MoeModel::forward,
+             py::arg("qlen"), py::arg("kv_start_pos"),
+             py::arg("input"), py::arg("output"));
+
+    py::class_<PyQwen3MoeCausalLM>(qwen3, "Qwen3MoeForCausalLM")
+        .def(py::init([](const Qwen3MoeModelCfg& cfg) {
+            // Same conversion as Qwen3MoeModel — CausalLM is just Model + lm_head.
+            kt_qwen3moe_model_config_t abi{};
+            abi.num_layers = cfg.num_layers;
+            abi.layer.hidden_size = cfg.layer.hidden_size;
+            abi.layer.num_heads = cfg.layer.num_heads;
+            abi.layer.num_kv_heads = cfg.layer.num_kv_heads;
+            abi.layer.head_dim = cfg.layer.head_dim;
+            abi.layer.max_qlen = cfg.layer.max_qlen;
+            abi.layer.max_kvlen = cfg.layer.max_kvlen;
+            abi.layer.rope_theta = cfg.layer.rope_theta;
+            abi.layer.expert_num = cfg.layer.expert_num;
+            abi.layer.num_experts_per_tok = cfg.layer.num_experts_per_tok;
+            abi.layer.intermediate_size = cfg.layer.intermediate_size;
+            abi.layer.pool = reinterpret_cast<void*>(cfg.layer.pool);
+            abi.layer.q_proj = reinterpret_cast<const void*>(cfg.layer.q_proj);
+            abi.layer.k_proj = reinterpret_cast<const void*>(cfg.layer.k_proj);
+            abi.layer.v_proj = reinterpret_cast<const void*>(cfg.layer.v_proj);
+            abi.layer.o_proj = reinterpret_cast<const void*>(cfg.layer.o_proj);
+            abi.layer.attn_norm_weight = reinterpret_cast<const void*>(cfg.layer.attn_norm_weight);
+            abi.layer.ffn_norm_weight = reinterpret_cast<const void*>(cfg.layer.ffn_norm_weight);
+            abi.layer.gate_weight = reinterpret_cast<const void*>(cfg.layer.gate_weight);
+            abi.layer.gate_proj = reinterpret_cast<const void*>(cfg.layer.gate_proj);
+            abi.layer.up_proj = reinterpret_cast<const void*>(cfg.layer.up_proj);
+            abi.layer.down_proj = reinterpret_cast<const void*>(cfg.layer.down_proj);
+            abi.final_norm_weight = reinterpret_cast<const void*>(cfg.final_norm_weight);
+            abi.lm_head = reinterpret_cast<const void*>(cfg.lm_head);
+            abi.vocab_size = cfg.vocab_size;
+            return std::unique_ptr<PyQwen3MoeCausalLM>(new PyQwen3MoeCausalLM(
+                kt_qwen3moe_causallm_new(&abi)));
+        }), py::arg("config"))
+        .def("forward", &PyQwen3MoeCausalLM::forward,
+             py::arg("qlen"), py::arg("kv_start_pos"),
+             py::arg("input"), py::arg("logits"));
+
+    py::class_<Qwen3MoeLayerCfg>(qwen3, "LayerConfig")
+        .def(py::init<>())
+        .def_readwrite("hidden_size", &Qwen3MoeLayerCfg::hidden_size)
+        .def_readwrite("num_heads", &Qwen3MoeLayerCfg::num_heads)
+        .def_readwrite("num_kv_heads", &Qwen3MoeLayerCfg::num_kv_heads)
+        .def_readwrite("head_dim", &Qwen3MoeLayerCfg::head_dim)
+        .def_readwrite("max_qlen", &Qwen3MoeLayerCfg::max_qlen)
+        .def_readwrite("max_kvlen", &Qwen3MoeLayerCfg::max_kvlen)
+        .def_readwrite("rope_theta", &Qwen3MoeLayerCfg::rope_theta)
+        .def_readwrite("expert_num", &Qwen3MoeLayerCfg::expert_num)
+        .def_readwrite("num_experts_per_tok", &Qwen3MoeLayerCfg::num_experts_per_tok)
+        .def_readwrite("intermediate_size", &Qwen3MoeLayerCfg::intermediate_size)
+        .def_readwrite("pool", &Qwen3MoeLayerCfg::pool)
+        .def_readwrite("q_proj", &Qwen3MoeLayerCfg::q_proj)
+        .def_readwrite("k_proj", &Qwen3MoeLayerCfg::k_proj)
+        .def_readwrite("v_proj", &Qwen3MoeLayerCfg::v_proj)
+        .def_readwrite("o_proj", &Qwen3MoeLayerCfg::o_proj)
+        .def_readwrite("attn_norm_weight", &Qwen3MoeLayerCfg::attn_norm_weight)
+        .def_readwrite("ffn_norm_weight", &Qwen3MoeLayerCfg::ffn_norm_weight)
+        .def_readwrite("gate_weight", &Qwen3MoeLayerCfg::gate_weight)
+        .def_readwrite("gate_proj", &Qwen3MoeLayerCfg::gate_proj)
+        .def_readwrite("up_proj", &Qwen3MoeLayerCfg::up_proj)
+        .def_readwrite("down_proj", &Qwen3MoeLayerCfg::down_proj);
+
+    py::class_<Qwen3MoeModelCfg>(qwen3, "ModelConfig")
+        .def(py::init<>())
+        .def_readwrite("num_layers", &Qwen3MoeModelCfg::num_layers)
+        .def_readwrite("layer", &Qwen3MoeModelCfg::layer)
+        .def_readwrite("final_norm_weight", &Qwen3MoeModelCfg::final_norm_weight)
+        .def_readwrite("lm_head", &Qwen3MoeModelCfg::lm_head)
+        .def_readwrite("vocab_size", &Qwen3MoeModelCfg::vocab_size);
 
     // ---- kvcache submodule (minimal: expose ggml_type enum) ----
     auto kvcache = m.def_submodule("kvcache", "KV cache utilities");
