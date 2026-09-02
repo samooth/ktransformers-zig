@@ -3865,3 +3865,169 @@ test "iq2xs kmap512 init: exact grid entries map correctly" {
     // Every grid entry's magnitude bytes must come from the {8,25,43} alphabet.
     try testing.expectEqual(@as(usize, 512), n_mapped);
 }
+
+// ============================================================================
+// IQ2_S (2.5625 bpw, 1024-entry grid, raw signs) — layout/dequant/quantize
+// ============================================================================
+
+test "IQ2_S block layout is byte-exact (82 bytes)" {
+    const iq2s = root.gemm_iq2_s;
+    try testing.expectEqual(@as(usize, 82), @sizeOf(iq2s.BlockIQ2_S));
+    try testing.expectEqual(@as(usize, 0), @offsetOf(iq2s.BlockIQ2_S, "d"));
+    try testing.expectEqual(@as(usize, 2), @offsetOf(iq2s.BlockIQ2_S, "qs"));
+    try testing.expectEqual(@as(usize, 66), @offsetOf(iq2s.BlockIQ2_S, "qh"));
+    try testing.expectEqual(@as(usize, 74), @offsetOf(iq2s.BlockIQ2_S, "scales"));
+    // 2 + 64 + 8 + 8 = 82
+}
+
+test "IQ2_S dequant: hand-traced block matches C reference math" {
+    const iq2s = root.gemm_iq2_s;
+    const QK_K = iq2s.QK_K;
+    var blk: [1]iq2s.BlockIQ2_S = .{std.mem.zeroes(iq2s.BlockIQ2_S)};
+
+    // d = 1.0; scales[0] nibbles: lo=3, hi=5
+    blk[0].d = iq2s.f32_to_f16(1.0);
+    blk[0].scales[0] = 3 | (5 << 4);
+
+    // Sub-block 0: grid index 1 (lo byte in qs[0], hi bits 0 -> qh=0),
+    // RAW signs byte at qs[32] = 0b0000_0001 -> y[0] negative.
+    // grid[1] = 0x080808080808082b — LE: byte0 = 43, bytes1-7 = 8.
+    // db_lo = (0.5+3)*0.25 = 0.875
+    blk[0].qs[0] = 1;
+    blk[0].qs[32] = 1;
+
+    var y: [QK_K]f32 = undefined;
+    iq2s.dequantizeRowIQ2_S(&blk, &y, QK_K);
+
+    const db_lo: f32 = 0.875;
+    // grid byte 0 = LSB = 43 (the LE gotcha, documented twice already)
+    try testing.expectApproxEqAbs(-db_lo * 43, y[0], 1e-6); // sign bit 0 set
+    try testing.expectApproxEqAbs(db_lo * 8, y[1], 1e-6);
+
+    // Sub-blocks l=2,3 (weights 16..31) use db_hi with grid[0] (all-8s):
+    // y = (0.5+5)*0.25*8 = 11
+    for (16..32) |j| {
+        try testing.expectApproxEqAbs(@as(f32, 11.0), y[j], 1e-6);
+    }
+    // Rest: zero nibbles -> db = 0.125, grid[0] -> 1.0
+    for (32..QK_K) |j| {
+        try testing.expectApproxEqAbs(@as(f32, 1.0), y[j], 1e-6);
+    }
+}
+
+test "IQ2_S dequant: qh high-bits select the upper grid half" {
+    const iq2s = root.gemm_iq2_s;
+    const QK_K = iq2s.QK_K;
+    var blk: [1]iq2s.BlockIQ2_S = .{std.mem.zeroes(iq2s.BlockIQ2_S)};
+    blk[0].d = iq2s.f32_to_f16(1.0);
+    blk[0].scales[0] = 0; // db = 0.5*0.25 = 0.125
+
+    // qs[0] = 0 with qh bit 8 set: index = 0 | (qh << 8 & 0x300) = 256.
+    // grid[256] is a DIFFERENT entry than grid[0] — verify the hi-bits
+    // plumbing actually indexes the upper half.
+    blk[0].qs[0] = 0;
+    blk[0].qh[0] = 1; // l=0: shift 8 -> 0x100 = 256
+
+    var y: [QK_K]f32 = undefined;
+    iq2s.dequantizeRowIQ2_S(&blk, &y, QK_K);
+
+    const grid_hi: u64 = iq2s.IQ2S_GRID[256];
+    const gb: [*]const u8 = @ptrCast(&grid_hi);
+    for (0..8) |j| {
+        try testing.expectApproxEqAbs(0.125 * @as(f32, @floatFromInt(gb[j])), y[j], 1e-6);
+    }
+}
+
+test "IQ2_S quantize with kmap1024: init -> quantize -> dequant round trip" {
+    const init_mod = root.iq2xs_init;
+    const iq2s = root.gemm_iq2_s;
+    const allocator = testing.allocator;
+
+    const k = iq2s.QK_K;
+    var src: [k]f32 = undefined;
+    for (0..k) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05) * 0.5 + 0.1 * @as(f32, @floatFromInt(i % 7));
+    }
+
+    const data = init_mod.initIq2SData(allocator);
+    defer init_mod.freeIq2XsData(allocator, data);
+
+    var blk: [1]iq2s.BlockIQ2_S = undefined;
+    iq2s.quantizeRowIQ2_S_WithInit(data, &src, &blk, k, null);
+
+    var dst: [k]f32 = undefined;
+    iq2s.dequantizeRowIQ2_S(&blk, &dst, k);
+
+    var max_abs_err: f32 = 0;
+    var sum_abs_x: f32 = 0;
+    for (0..k) |i| {
+        max_abs_err = @max(max_abs_err, @abs(src[i] - dst[i]));
+        sum_abs_x += @abs(src[i]);
+    }
+    const rel = max_abs_err / (sum_abs_x / k);
+    // 150% bound, same rationale/evidence family as XXS/XS (null
+    // importance weights). S's null-weight fallback (0.25*sigma2 + x^2)
+    // primes small values, but the max-rel metric stays outlier-bound.
+    try testing.expect(rel < 1.5);
+}
+
+test "IQ2_S scalar GEMM with constant inputs is consistent" {
+    const iq2s = root.gemm_iq2_s;
+    const QK_K = iq2s.QK_K;
+    const M: usize = 2;
+    const N: usize = 2;
+
+    var a: [M * QK_K]amx.bf16 = undefined;
+    for (&a) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    var b: [N]iq2s.BlockIQ2_S = undefined;
+    for (&b) |*blk| {
+        blk.* = std.mem.zeroes(iq2s.BlockIQ2_S);
+        blk.d = iq2s.f32_to_f16(1.0);
+        // all zero qs/qh -> grid[0] (all-8s) everywhere, zero scale nibbles
+    }
+
+    var c: [M * N]f32 = undefined;
+    iq2s.gemmIQ2_SScalar(&a, &b, &c, M, N, QK_K, QK_K, 1, N);
+
+    var ref_col: [QK_K]f32 = undefined;
+    iq2s.dequantizeRowIQ2_S(&b, &ref_col, QK_K);
+    var ref_sum: f32 = 0;
+    for (ref_col) |v| ref_sum += v;
+
+    for (c) |v| try testing.expectApproxEqAbs(ref_sum, v, 1e-3);
+}
+
+test "iq2xs kmap1024 init: exact grid entries map correctly (nwant=1)" {
+    const init_mod = root.iq2xs_init;
+    const iq2s = root.gemm_iq2_s;
+    const allocator = testing.allocator;
+
+    const data = init_mod.initIq2SData(allocator);
+    defer init_mod.freeIq2XsData(allocator, data);
+
+    // All 1024 entries map to themselves.
+    for (0..1024) |i| {
+        var index: u16 = 0;
+        for (0..8) |kk| {
+            const q: u16 = @intCast(@divTrunc(data.grid[i][kk] - 1, 2));
+            index |= q << @intCast(2 * kk);
+        }
+        try testing.expect(data.kmap[index] == @as(i32, @intCast(i)));
+    }
+    // Alphabet bijection {0..3} -> {8,25,43} + 0 (2-bit nibbles: only
+    // 0..3 appear; nibble 3 is unused in the grid fingerprints).
+    const alphabet = [4]u8{ 8, 25, 43, 0 };
+    var n_ok: usize = 0;
+    for (0..1024) |gi| {
+        const packed_grid: u64 = iq2s.IQ2S_GRID[gi];
+        const gb: [*]const u8 = @ptrCast(&packed_grid);
+        var ok = true;
+        for (0..8) |kk| {
+            const l: u8 = @intCast(@divTrunc(data.grid[gi][kk] - 1, 2));
+            if (alphabet[l] != gb[kk]) ok = false;
+        }
+        if (ok) n_ok += 1;
+    }
+    try testing.expectEqual(@as(usize, 1024), n_ok);
+}
