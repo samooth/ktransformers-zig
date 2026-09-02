@@ -656,11 +656,14 @@ export fn kt_worker_pool_get_thread_num(pool: *KT_WorkerPool) c_int {
 /// A4 wiring: derive GEMM tile block sizes from the host's measured cache
 /// hierarchy and install them into the BF16 kernel before any operator
 /// construction. Best-effort — on detection failure the compiled-in
-/// defaults (K_BLOCK=1792/N_BLOCK=256) hold. Idempotent and cheap after
-/// the first call (CPU detect is cached by cpu_detect itself? No — detect
-/// allocates; we run it once per kt_cpuinfer_new call, which matches the
-/// reference lifecycle: one CPUInfer per process).
+/// defaults (K_BLOCK=1792/N_BLOCK=256) hold. Runs once per process (the
+/// static guard caches the result: detectCpu allocates, and every
+/// operator *_new calls this defensively in case the caller built its
+/// worker pool directly instead of via kt_cpuinfer_new).
+var g_tile_params_tuned: bool = false;
 fn tuneTileParamsForHost() void {
+    if (g_tile_params_tuned) return;
+    g_tile_params_tuned = true;
     const allocator = defaultAllocator();
     var cpu = cpu_detect.detectCpu(allocator) catch {
         gemm_bf16.GemmKernel224BF.resetTileParams();
@@ -744,6 +747,7 @@ fn toMoeConfig(config: kt_moe_config_t) moe.MoeConfig {
 }
 
 export fn kt_moe_new(cpuinfer: *KT_CPUInfer, config: kt_moe_config_t) *KT_MOE {
+    tuneTileParamsForHost();
     const pool: *worker_pool.WorkerPool = @ptrCast(@alignCast(cpuinfer));
     var cfg = toMoeConfig(config);
     cfg.pool = pool;
@@ -754,6 +758,7 @@ export fn kt_moe_new(cpuinfer: *KT_CPUInfer, config: kt_moe_config_t) *KT_MOE {
 }
 
 export fn kt_moe_new_sft(cpuinfer: *KT_CPUInfer, config: kt_moe_sft_config_t) *KT_MOE {
+    tuneTileParamsForHost();
     const pool: *worker_pool.WorkerPool = @ptrCast(@alignCast(cpuinfer));
     var base_cfg = toMoeConfig(config.base);
     base_cfg.pool = pool;
@@ -1285,6 +1290,7 @@ fn toLayerConfig(c: kt_dsv3_layer_config_t) deepseekv3_layer.LayerConfig {
 }
 
 pub export fn kt_dsv3_layer_new(config: *const kt_dsv3_layer_config_t) *KT_DSV3Layer {
+    tuneTileParamsForHost();
     const layer = deepseekv3_layer.DeepseekV3DecoderLayer.init(defaultAllocator(), toLayerConfig(config.*)) catch @panic("Failed to init DSV3 layer");
     return @ptrCast(layer);
 }
@@ -1333,6 +1339,7 @@ fn toModelConfig(c: kt_dsv3_model_config_t) deepseekv3_model.ModelConfig {
 }
 
 pub export fn kt_dsv3_model_new(config: *const kt_dsv3_model_config_t) *KT_DSV3Model {
+    tuneTileParamsForHost();
     const model = deepseekv3_model.DeepseekV3Model.init(defaultAllocator(), toModelConfig(config.*)) catch @panic("Failed to init DSV3 model");
     return @ptrCast(model);
 }
@@ -1354,6 +1361,7 @@ pub export fn kt_dsv3_model_free(model: *KT_DSV3Model) void {
 }
 
 pub export fn kt_dsv3_causallm_new(config: *const kt_dsv3_model_config_t) *KT_DSV3CausalLM {
+    tuneTileParamsForHost();
     const clm = deepseekv3_model.DeepseekV3ForCausalLM.init(defaultAllocator(), .{
         .model = toModelConfig(config.*),
         .lm_head = @ptrCast(@alignCast(config.lm_head)),
