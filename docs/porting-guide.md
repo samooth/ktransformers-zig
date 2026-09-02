@@ -170,6 +170,124 @@ forward equivalence, SFT forward+backward, work-stealing pool, NUMA topology.
 4. Force comptime analysis: `_ = &gemm_<new>.GemmKernel224<New>.gemmFullTile;`
 5. Add test in `tests/kernels/test_kernels.zig` (append-only)
 
+## Adding a New Model Orchestration Layer
+
+The Qwen3 MoE port (2026-09) is the canonical example. Procedure:
+
+1. **Pick an attention engine** — MLA (`src/mla/mla_core.zig`) for
+   DeepSeek-style, or MHA (`src/kernels/attn/mha.zig`) for standard
+   attention. MHA is reusable across any non-MLA transformer; MLA is
+   DSV3-specific.
+2. **Pick or implement a router** — DeepSeek uses sigmoid+group-top2
+   (`moe.routeExpertsDeepSeek` with `scoring=.sigmoid, n_group>1`),
+   Qwen3 uses vanilla softmax top-k (`scoring=.softmax, n_group=1,
+   bias=null`). The D4 path already supports both — no new gate code
+   needed.
+3. **Create the layer module** (`src/kernels/<arch>/<arch>_layer.zig`):
+   - Define a `LayerConfig` struct mirroring the C ABI struct (all
+     weight pointers borrowed from caller; BF16 for everything).
+   - Create a `*DecoderLayer` struct holding the engine + cache + MoE
+     + scratch buffers. `init` allocates, `deinit` frees symmetrically.
+   - Implement `forward(qlen, kv_start_pos, input, output)` doing
+     residual + RMSNorm + attention + residual + RMSNorm + gate + MoE +
+     residual, with BF16↔F32 conversion at the C ABI boundary.
+4. **Create the model + CausalLM** (`src/kernels/<arch>/<arch>_model.zig`):
+   - Model: N × layer + final RMSNorm (ping-pong buffers).
+   - CausalLM: Model + lm_head GEMM.
+5. **Add C API exports** (`src/main.zig`):
+   - `pub const kt_<arch>_layer_config_t = extern struct { ... };` matching
+     the header field-for-field.
+   - `fn toXxxConfig(c) ...` converter; `*_new` / `*_forward` / `*_free`
+     with the `*opaque` casts.
+6. **Add header declarations** (`include/kt_kernel.h`):
+   - `typedef struct kt_<arch>_layer_config_t { ... };`
+   - Function prototypes in the "Zig extensions" section.
+7. **Wire into root.zig**: `pub const <arch>_layer = @import(...);` +
+   `comptime { _ = &<arch>_layer.<Type>.init; _ = &<arch>_layer.<Type>.forward; ... }`
+   (lazy-analysis trap — without the comptime block, the .so has zero
+   code for the module).
+8. **Add size probes** (`src/main.zig`):
+   - `export fn kt_abi_size_<arch>_layer_config() usize { return @sizeOf(...); }`
+9. **Update `tools/audit_layout.py`** with the new struct's field list.
+10. **Add pybind11 shim** (`bindings/kt_kernel_pybind.cpp`):
+    - ABI struct mirror with identical field order/types.
+    - pybind-side config struct (pointer fields as `size_t` ints).
+    - `Py<Name>Layer`/`Model`/`CausalLM` wrapper classes.
+    - `m.<arch>` submodule with the classes and `LayerConfig`/`ModelConfig`.
+11. **Tests** in `tests/kernels/<arch>_tests.zig`:
+    - Unit tests for the engine (MHA softmax, RoPE, etc.)
+    - Layer init + 2-step decode (zero weights → exact residual semantics).
+    - Model + CausalLM forward (zero weights → zero logits).
+    - Register the test file in `build.zig` (Suite N: ...).
+12. **Verify all gates**:
+    - `zig build all-variants` — all 6+1 variants build clean
+    - `python3 tools/verify_abi.py` — all symbols exported
+    - `python3 tools/audit_layout.py` — struct layouts match
+    - `zig build test` — all tests pass, 0 leaks
+    - `bash bindings/build.sh` — pybind11 module builds, smoke test OK
+
+**Lazy-analysis trap**: a `pub const` re-export in root.zig does NOT
+analyze the module's declarations — the .so contains zero code for it
+unless you also add a `comptime { _ = &... }` block. Same pattern
+applies to `main.zig` exports: a `pub export fn` in a module that's not
+imported anywhere is silently stripped. See `LESSONS_ZIG.md` for the
+detailed analysis.
+
+## When NOT to Add a New Model Layer
+
+ktransformers is an **MoE-offload engine** — its value is CPU offload
+of expert FFN layers for trillion-param MoE models (DeepSeek-V3 671B,
+Qwen3-30B-A3B, Qwen3.5-35B-A3B, etc.). The C++ upstream chose not to
+port dense transformer families (Gemma, dense Qwen) because there's
+nothing to offload: a dense 12B/26B model fits entirely in GPU VRAM
+on a single consumer card, so the offload architecture provides no
+benefit.
+
+The same logic applies here. **Gemma (and dense Qwen) are out of
+scope** unless the goal is to build a *general* CPU inference engine
+(rather than an MoE-offload engine). If that goal changes, the
+shared MHA + GGUF-parser + RMSNorm + RoPE base from the Qwen3 port
+(`src/kernels/attn/mha.zig`, `src/io/gguf.zig`, the C-extension
+`mha.rmsNormInline`) covers ~80% of the work — only the GeLU FFN,
+post-norm placement, and (Gemma 2+) soft-capping need to be added
+on top.
+
+Dense Qwen and Gemma would also need an embedding/lm-head layer that
+the MoE engine currently doesn't have (the Qwen3 port still
+assumes embedded inputs from the caller; a true standalone engine
+needs a token-id → hidden-state row in `token_embd.weight`).
+
+## AMX GEMM kernel pattern: per-group scale, accumulate F32
+
+The `src/kernels/amx/gemm_224_int4.zig` kernel implements the canonical
+pattern for AMX GEMMs with on-the-fly dequant + per-group scales:
+
+1. **K-axis tiling by group, not by K_BLOCK.** Iterate by `GROUP_SIZE`
+   (one K-block = one group of 32 elements for Q4_0), not by the larger
+   `K_BLOCK` (3584 for the AMX tile pipeline). Each group gets its own
+   AMX tile run; the per-group scale is applied immediately and the
+   result is accumulated into F32 `c`. **Don't** try to accumulate
+   across multiple groups in INT32 then apply a single scale at the
+   end — when K_BLOCK > GROUP_SIZE, multiple groups contribute to the
+   same INT32 with different scales, and the trailing partial group
+   silently gets dropped (returns 0) for any K not a multiple of
+   GROUP_SIZE.
+
+2. **Scalar fallback must handle partial trailing groups.** Don't
+   compute `k_blocks = k / GROUP_SIZE` (integer divide). Use
+   `k_blocks_full = k / GROUP_SIZE` for the full groups and
+   `k_tail = k - k_blocks_full * GROUP_SIZE` for the partial last
+   block, processing only `k_tail` weights (and handling the
+   even/odd `k_tail` separately for the lo/hi nibble layout).
+
+3. **AMX partial-group test gating.** The AMX path is gated by
+   `amx.detectAmxSupport()`; the test must work in BOTH paths. For
+   the partial-group regression test, gate the AMX-specific expected
+   value behind `if (!amx.AmxFeatures.available)` and use a tolerance
+   check (e.g. "non-zero, finite") for the AMX case, since the
+   lo+hi-tiles-both-contribute math on real AMX hardware produces
+   a different exact value than the scalar (1x scale vs 2x).
+
 ## Lessons Learned
 
 See `LESSONS_ZIG.md` for verified Zig 0.16 gotchas:

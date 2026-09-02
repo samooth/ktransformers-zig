@@ -7,10 +7,10 @@ definitions (`kt_moe_config_t`, `kt_fp8_stats_t`, etc.) live in the header; the
 function signatures here are signatures-of-record, not a replacement for the
 header.
 
-As of `tools/verify_abi.py` last PASS, the API is **68 symbols × 7 built .so
-files** (6 x86 variants + 1 aarch64 `neon` cross-build). Any change to a symbol's
-name, signature, or call convention is an ABI break and must be gated behind
-the verifier.
+As of `tools/verify_abi.py` last PASS, the API is **105 symbols × 7 built
+.so files** (6 x86 variants + 1 aarch64 `neon` cross-build). Any change to
+a symbol's name, signature, or call convention is an ABI break and must
+be gated behind the verifier.
 
 ## Family map
 
@@ -25,13 +25,15 @@ the verifier.
 | [MLP](#mlp) | 3 | `kt_mlp_new`, `kt_mlp_free`, `kt_mlp_forward` |
 | [MoE (inference + SFT)](#moe) | 10 | `kt_moe_new(_sft)`, `_free`, `_warm_up`, `_load_weights(_with_map)`, `_forward`, `_forward_sft`, `_backward`, `_update_lora_weights` |
 | [MLA (attention)](#mla) | 4 | `kt_mla_new`, `_load_weights`, `_free`, `_forward` |
+| [Qwen3 MoE (model orchestration)](#qwen3-moe-model-orchestration) | 9 | `kt_qwen3moe_{layer,model,causallm}_{new,forward,free}` |
+| [DeepseekV3 (model orchestration)](#deepseekv3-model-orchestration) | 9 | `kt_dsv3_{layer,model,causallm}_{new,forward,free}` |
 | [Quantize / dequantize (per-row)](#quantize--dequantize) | 6 | `kt_quantize/dequantize_{int8, int4_gptq, fp8_e4m3}` |
 | [GGML block formats (Q8_0 / Q4_K / Q5_K / Q6_K / Q8_K)](#ggml-block-formats) | 10 | `kt_quantize/dequantize_q{8_0,4_k,5_k,6_k,8_k}` |
 | [GGML block matmul](#ggml-block-matmul) | 5 | `kt_matmul_q{8_0,4_k,5_k,6_k,8_k}` |
 | [FP8 layerwise transport](#fp8-layerwise-transport) | 10 | `kt_fp8_layerwise_init`, `kt_fp8_transport_{new,free,close,closed,rank,tp_size,num_experts,run_producer,wait}` |
 | [GGML init (no-op stub)](#ggml-init) | 1 | `kt_ggml_init` |
 
-**68 symbols total** in the C ABI (header is the contract, verified by
+**105 symbols total** in the C ABI (header is the contract, verified by
 `tools/verify_abi.py`). The math primitives
 (`kt_apply_swiglu` / `kt_apply_rms_norm` / `kt_apply_rope` / `kt_softmax`)
 exist as `export fn` in `src/main.zig` and are emitted into the .so, but are
@@ -205,6 +207,174 @@ rebuilding the MoE.
 
 ---
 
+## Qwen3 MoE (model orchestration)
+
+Layer / model / CausalLM orchestration for Qwen3-style MoE
+(Qwen3-30B-A3B, Qwen3.5-35B-A3B, Qwen3-Coder-Next). Standard MHA + GQA
++ RoPE + pre-norm + **vanilla softmax top-k gate** (no group-top2, no
+e_score_correction_bias — those are DeepSeek-V3-specific). Targets
+the same MoE-FFN as DeepSeek-V3 (gate/up/down, SwiGLU, BF16 weights).
+
+```c
+KT_Qwen3MoeLayer* kt_qwen3moe_layer_new(const kt_qwen3moe_layer_config_t* config);
+void  kt_qwen3moe_layer_forward(KT_Qwen3MoeLayer* layer, size_t qlen, size_t kv_start_pos,
+                                 const void* input, void* output);
+void  kt_qwen3moe_layer_free(KT_Qwen3MoeLayer* layer);
+
+KT_Qwen3MoeModel* kt_qwen3moe_model_new(const kt_qwen3moe_model_config_t* config);
+void  kt_qwen3moe_model_forward(KT_Qwen3MoeModel* model, size_t qlen, size_t kv_start_pos,
+                                 const void* input, void* output);
+void  kt_qwen3moe_model_free(KT_Qwen3MoeModel* model);
+
+KT_Qwen3MoeCausalLM* kt_qwen3moe_causallm_new(const kt_qwen3moe_model_config_t* config);
+/* logits: f32 [qlen, vocab_size] */
+void  kt_qwen3moe_causallm_forward(KT_Qwen3MoeCausalLM* clm, size_t qlen, size_t kv_start_pos,
+                                    const void* input, float* logits);
+void  kt_qwen3moe_causallm_free(KT_Qwen3MoeCausalLM* clm);
+```
+
+**Config (pointer-passed, not by-value)**: every weight pointer is
+caller-owned (borrowed). The model and CausalLM share the layer config
+struct — the CausalLM is just `Model + lm_head` (the layer config is
+embedded by value in `kt_qwen3moe_model_config_t.layer`; `final_norm_weight`
+and `lm_head` are the model-level additions).
+
+**RoPE default**: Qwen3 uses `rope_theta = 1,000,000.0` (vs DeepSeek-V3's
+10,000). The default in the C-API struct is 1,000,000.0; you only need to
+override it if you're running a Qwen3 checkpoint that was trained with a
+different value.
+
+**GQA**: `num_kv_heads` may be less than `num_heads` (GQA). The KV cache is
+sized for `num_kv_heads`; K and V tensors are shared across query-head
+groups in the attention layer (every `num_heads/num_kv_heads`-th query
+head reads the same K/V).
+
+**Forward**: input/output are BF16 `[qlen, hidden]`. `kv_start_pos` is
+the starting position in the (continuous) KV cache for the new query
+tokens — pass 0 for the first decode step, then 1, 2, 3, ... for
+subsequent decode steps; pass `(N, qlen=N)` for prefill in one shot. The
+layer handles both single-token decode (`qlen=1`) and multi-token prefill
+(`qlen>1`).
+
+**Lifecycle** (same pattern for all three):
+
+```c
+kt_qwen3moe_layer_config_t cfg = {
+    .hidden_size = 4096, .num_heads = 32, .num_kv_heads = 4,
+    .head_dim = 128, .max_qlen = 1, .max_kvlen = 32768,
+    .rope_theta = 1000000.0,
+    .expert_num = 128, .num_experts_per_tok = 8,
+    .intermediate_size = 12288, .pool = NULL,
+    .q_proj = q_weight_ptr, .k_proj = ..., /* etc. */
+};
+KT_Qwen3MoeLayer* layer = kt_qwen3moe_layer_new(&cfg);
+uint16_t input[4096] = {...};  // BF16 hidden state (1 token)
+uint16_t output[4096];
+kt_qwen3moe_layer_forward(layer, 1, /*kv_start_pos=*/0, input, output);
+kt_qwen3moe_layer_free(layer);
+```
+
+**Differences vs DeepSeek-V3** (`kt_dsv3_*`):
+
+| Feature | Qwen3 MoE | DeepSeek-V3 |
+|---|---|---|
+| Attention | Standard MHA + GQA + RoPE | MLA (latent compression) |
+| Routing | softmax over experts, top-k, no bias, no grouping | sigmoid + e_score_correction_bias + group-top2 + scale |
+| Normalization | pre-norm (RMSNorm → MHA → residual → RMSNorm → MoE → residual) | pre-norm (same pattern) |
+| FFN | SwiGLU (gate × up, clamped) | SwiGLU (same) |
+| RoPE θ | 1,000,000 | 10,000 |
+| Layer config | by-pointer (single `kt_qwen3moe_layer_config_t*`) | by-pointer (same) |
+
+**pybind11 surface** (Tier 1): `from kt_kernel_ext.qwen3moe import
+Qwen3MoeDecoderLayer, Qwen3MoeModel, Qwen3MoeForCausalLM, LayerConfig,
+ModelConfig`. The shim's mirror structs are validated against the Zig
+extern structs by `tools/audit_layout.py` (5/5 model-orchestration
+configs, 0 divergences).
+
+**Why not Qwen3-Next hybrid attention (DCA/DeltaNet)?** That's a
+separate workstream — see `TODO_QWEN.md` for the open questions. The
+Qwen3 standard-MHA path covers Qwen3-30B-A3B, Qwen3.5-35B-A3B, and
+Qwen3-Coder-Next (which uses the same vanilla attention).
+
+---
+
+## MHA (reusable for any non-MLA model)
+
+The `MhaEngine` in `src/kernels/attn/mha.zig` is the standard multi-head
+attention with GQA + RoPE + continuous KV cache. It's wired into the
+`Qwen3MoeDecoderLayer` (`kt_qwen3moe_layer_*`) but is not exposed as a
+top-level C API surface — the model-orchestration layer is the entry
+point. The lower-level math helpers (rmsNormInline, matmulF32,
+softmaxInPlace) ARE exported in the .so (see
+[Math helpers](#math-helpers)); call them directly if you need to
+assemble a custom layer outside the Qwen3 surface.
+
+**MHA engine contract** (for callers that bypass the model orchestration):
+
+```zig
+const cfg = mha.MhaConfig{
+    .hidden_size = 4096, .num_heads = 32, .num_kv_heads = 8, // GQA: 4 query heads per KV
+    .head_dim = 128, .max_qlen = 1, .max_kvlen = 32768,
+    .rope_theta = 1000000.0,                              // Qwen3 default
+    .q_proj = @ptrCast(q_weight), .k_proj = @ptrCast(k_weight),
+    .v_proj = @ptrCast(v_weight), .o_proj = @ptrCast(o_weight),
+};
+var cache = try mha.MhaKvCache.init(allocator, cfg.num_kv_heads, cfg.head_dim, cfg.max_kvlen);
+defer cache.deinit();
+var engine = try mha.MhaEngine.init(allocator, cfg, &cache);
+defer engine.deinit();
+
+var input: [cfg.hidden_size]f32 = ...;
+var output: [cfg.hidden_size]f32 = ...;
+engine.decode(&input, &output, /*position=*/0);  // single-token decode
+// For multi-token prefill:
+engine.forward(&input, &output, /*qlen=*/N, /*kv_start_pos=*/0);
+```
+
+**Helpers** (in `src/kernels/attn/mha.zig`, exposed via the C extension
+section in `src/main.zig`):
+
+| Function | Signature | Purpose |
+|---|---|---|
+| `mha.matmulF32` | `(input, lda, weight, ldb, output, ldc, m, n, k)` | BF16 weight matmul → F32 output |
+| `mha.rmsNormInline` | `(x, weight, out, eps)` | In-place RMSNorm with BF16 weight |
+| `mha.softmaxInPlace` | `(buf, size)` | Numerically stable in-place softmax |
+
+These are also useful for assembling a Gemma or non-Qwen3 dense layer
+on top of the same primitives (see the "When NOT to Add a New Model
+Layer" section in `docs/porting-guide.md`).
+
+---
+
+## DeepseekV3 (model orchestration)
+
+Layer / model / CausalLM orchestration for DeepSeek-V3 (and V2 — same
+schema). MLA attention + sigmoid+group-top2 routing + standard MoE FFN.
+
+```c
+KT_DSV3Layer* kt_dsv3_layer_new(const kt_dsv3_layer_config_t* config);
+void kt_dsv3_layer_forward(KT_DSV3Layer* layer, size_t qlen, size_t kv_start_pos,
+                           const void* input, void* output);
+void kt_dsv3_layer_free(KT_DSV3Layer* layer);
+
+KT_DSV3Model* kt_dsv3_model_new(const kt_dsv3_model_config_t* config);
+void kt_dsv3_model_forward(KT_DSV3Model* model, size_t qlen, size_t kv_start_pos,
+                           const void* input, void* output);
+void kt_dsv3_model_free(KT_DSV3Model* model);
+
+KT_DSV3CausalLM* kt_dsv3_causallm_new(const kt_dsv3_model_config_t* config);
+void kt_dsv3_causallm_forward(KT_DSV3CausalLM* clm, size_t qlen, size_t kv_start_pos,
+                             const void* input, float* logits);
+void kt_dsv3_causallm_free(KT_DSV3CausalLM* clm);
+```
+
+Same pointer-passed config pattern as Qwen3 (see above). The
+Differences-vs-Qwen3 table in the Qwen3 section summarizes the
+architectural deltas (MLA vs MHA, sigmoid+group-top2 vs softmax
+top-k, RoPE θ=10000 vs 1000000).
+
+---
+
 ## MLA
 
 ```c
@@ -302,6 +472,29 @@ On-the-fly dequantization happens inside the matmul (scalar kernels today;
 AMX-vectorized on Sapphire Rapids+ on the `amx` variant). `k` must be a
 multiple of the format's super-block width.
 
+**AMX INT4 partial-group support**: `gemm_224_int4.zig::gemmFullTile`
+iterates by `GROUP_SIZE` (32 K elements) and applies the per-group
+scale immediately, so any K value is supported (not just multiples of
+32). Before this fix, K values that didn't divide evenly by 32
+silently returned 0 because the trailing partial group was dropped.
+The scalar fallback (`gemmFullTileScalar`) handles the partial
+trailing group explicitly (both even and odd `k_tail`).
+
+### I-quants (grid-based, sub-3-bit)
+
+The non-linear I-quants (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL,
+IQ4_XS) are also byte-exact vs llama.cpp and live in
+`src/kernels/amx/gemm_224_iq*.zig`. They use grid-based magnitude
+lookups (256–512 entry precomputed tables, fingerprint-matched via the
+2-bit kmap from `src/kernels/amx/iq2xs_init.zig`) plus per-block
+scales and per-weight sign bytes. Quantize is real for the 2-bit
+formats (IQ2_XXS, IQ2_XS); the rest have quantize stubbed in
+llama.cpp too and only dequant + GEMM are ported here. The byte
+layouts match `ggml-common.h` so a `.gguf` with I-quant weights
+drops in without preprocessing. Useful when you need to load a
+sub-3-bpw GGUFs (e.g. the IQ2_XXS GGUFs in `/ai/models/`) and want
+to do the dequant inside the matmul.
+
 ---
 
 ## FP8 layerwise transport
@@ -371,7 +564,60 @@ epoch). See `tests/kernels/fp8_transport_tests.zig` for a worked example.
 
 ---
 
-## GGML init
+## GGUF parser
+
+`src/io/gguf.zig` — read-only GGUF v3 header parser. Byte-exact vs the
+llama.cpp `ggml.h` format. Not exposed through the C API (callers use
+the C bindings below to consume the tensors). Useful for loading
+weights from a `.gguf` file and passing them to the matmul functions.
+
+**Zig usage** (the Python ctypes wrapper in `python/kt_kernel/__init__.py`
+exposes the higher-level `matmul_quantized` API; for raw file loading
+use the Zig module directly):
+
+```zig
+const gguf = @import("io/gguf.zig");
+
+// Read the file (mmap recommended for large files; the parser
+// only walks 0..data_offset).
+const file_bytes = try allocator.alignedAlloc(u8, .@"64", file_size);
+const fd = try std.posix.openat(AT.FDCWD, path, .{.RDONLY}, 0);
+defer std.posix.close(fd);
+_ = std.posix.read(fd, file_bytes);
+
+var h = try gguf.parse(file_bytes, file_size, allocator);
+defer h.deinit();
+
+// Find a tensor by name (linear search; GGUF doesn't require
+// sorted tensors).
+const idx = h.findTensor("blk.0.attn_q.weight") orelse return;
+// Tensors carry: name, n_dims, dims[0..n_dims], tensor_type, offset.
+// `offset` is the byte offset into the file; the bytes at
+// [offset, offset+block_bytes) are the packed tensor data
+// (block_bytes depends on tensor_type + dims).
+```
+
+**KV metadata**: `h.getKv("general.architecture")` returns the metadata
+string (or `null` if missing). Supports `string`, `u32`/`i32`/`u8`/`i16`,
+and `f32`/`f64` types.
+
+**Tensor types** (`gguf.TensorType`): byte-exact vs llama.cpp —
+F32=0, F16=1, Q4_0=2, Q4_1=3, Q5_0=6, Q5_1=7, Q8_0=8, Q8_1=9, Q2_K=10,
+Q3_K=11, Q4_K=12, Q5_K=13, Q6_K=14, Q8_K=15, IQ2_XXS=16, IQ2_XS=17,
+IQ3_XXS=18, IQ1_S=19, IQ4_NL=20, IQ3_S=21, IQ2_S=22, IQ4_XS=23, IQ1_M=24,
+BF16=25, MXFP4=28, MXFP8=29. Values match the `kt_type_t` enum in
+`include/kt_kernel.h` for direct comparison.
+
+**Real-model E2E test**: `tests/kernels/qwen3_gguf_e2e_tests.zig`
+opens `/ai/models/Qwen3.5-0.8B-BF16.gguf` via `mmap(2)` and verifies
+the parser produces a sensible `Header` (version=3, ≥150 tensors,
+`token_embd.weight` present, per-block `attn_*`/`ffn_*` names decoded
+correctly). This is the only test in the suite that exercises a real
+on-disk file.
+
+---
+
+## GGUF init
 
 ```c
 void kt_ggml_init();  // no-op stub
