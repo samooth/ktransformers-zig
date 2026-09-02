@@ -163,6 +163,8 @@ pub fn build(b: *std.Build) void {
     RunTest.run(b, test_step, "tests/kernels/dsv3_layer_capi_tests.zig", "src/main.zig", target, optimize);
     // Suite 7: Qwen3 MoE + MHA + GGUF (model orchestration + parser)
     RunTest.run(b, test_step, "tests/kernels/qwen3_moe_tests.zig", "src/root.zig", target, optimize);
+    // Suite 8: NUMA auto-population in kt_worker_pool_new_config (A3 closure)
+    RunTest.run(b, test_step, "tests/kernels/numa_pool_tests.zig", "src/main.zig", target, optimize);
     // Suite 5b: custom allocator injection C API (B1)
     RunTest.run(b, test_step, "tests/kernels/allocator_capi_tests.zig", "src/main.zig", target, optimize);
     // Suite 5: aarch64 CPU detection in selectBestVariant

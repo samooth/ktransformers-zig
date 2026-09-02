@@ -8,6 +8,7 @@ const memory = root.memory;
 const worker_pool = root.worker_pool;
 const task_queue = root.task_queue;
 const cpu_detect = root.cpu_detect;
+const numa = root.numa;
 pub const amx = root.amx;
 const buffers = root.buffers;
 const gemm_bf16 = root.gemm_bf16;
@@ -610,34 +611,87 @@ export fn kt_f32_to_bf16(src: [*]const f32, dst: [*]amx.bf16, count: usize) void
 // Worker Pool
 // ============================================================================
 
-export fn kt_worker_pool_new(thread_count: c_int) *KT_WorkerPool {
+pub export fn kt_worker_pool_new(thread_count: c_int) *KT_WorkerPool {
     const allocator = defaultAllocator();
     const pool = allocator.create(worker_pool.WorkerPool) catch @panic("OOM");
     pool.* = worker_pool.WorkerPool.initSimple(allocator, @intCast(thread_count)) catch @panic("pool init");
     return @ptrCast(pool);
 }
 
-export fn kt_worker_pool_new_config(config: kt_worker_pool_config_t) *KT_WorkerPool {
+pub export fn kt_worker_pool_new_config(config: kt_worker_pool_config_t) *KT_WorkerPool {
     const allocator = defaultAllocator();
 
-    const numa_map = allocator.alloc(usize, @intCast(config.subpool_count)) catch @panic("OOM");
-    const thread_counts = allocator.alloc(usize, @intCast(config.subpool_count)) catch @panic("OOM");
+    const subpool_count: usize = @intCast(config.subpool_count);
+    const numa_map = allocator.alloc(usize, subpool_count) catch @panic("OOM");
+    const thread_counts = allocator.alloc(usize, subpool_count) catch @panic("OOM");
 
-    for (0..@as(usize, @intCast(config.subpool_count))) |i| {
+    for (0..subpool_count) |i| {
         numa_map[i] = @intCast(config.subpool_numa_map[i]);
         thread_counts[i] = @intCast(config.subpool_thread_count[i]);
     }
 
+    // A3 auto-population: when the caller declares a multi-node topology
+    // (subpool_numa_map non-zero across subpools) but the C config struct
+    // carries no CPU list (it has no field for one — the list is a
+    // Zig-side WorkerPoolConfig extension), derive the per-subpool CPU
+    // lists from the host's real topology (NumaTopology.detect -> sysfs)
+    // so each subpool's workers pin to its node's CPUs. Ownership of the
+    // built lists transfers to the pool config (owns_cpu_lists = true):
+    // the pool frees them at deinit — no stack-lifetime use-after-free,
+    // no leak. On a single-node host, non-Linux, or detect failure we
+    // pass no lists (workers run unpinned, pre-A3 behavior).
+    var cpu_lists: ?[]const ?[]const usize = null;
+    var owns_cpu_lists = false;
+    blk: {
+        var has_numa_topology = false;
+        for (0..subpool_count) |i| {
+            if (numa_map[i] != 0) {
+                has_numa_topology = true;
+                break;
+            }
+        }
+        if (!has_numa_topology) break :blk; // single-node: nothing to pin
+
+        var topo = numa.topology.NumaTopology.detect(allocator) catch break :blk;
+        defer topo.deinit();
+
+        // Build the per-subpool list storage (outer + inner slices all
+        // owned by this config once handed to the pool below).
+        const backed = allocator.alloc(?[]const usize, subpool_count) catch @panic("OOM");
+        for (0..subpool_count) |i| {
+            const cpus = topo.cpusForNode(numa_map[i]);
+            if (cpus.len == 0) {
+                // Node has no CPUs (or doesn't exist) — leave this
+                // subpool unpinned rather than failing the whole pool.
+                backed[i] = null;
+                continue;
+            }
+            const copy = allocator.alloc(usize, cpus.len) catch @panic("OOM");
+            @memcpy(copy, cpus);
+            backed[i] = copy;
+        }
+        cpu_lists = backed;
+        owns_cpu_lists = true;
+    }
+
     const pool = allocator.create(worker_pool.WorkerPool) catch @panic("OOM");
-    pool.* = worker_pool.WorkerPool.init(allocator, .{
-        .subpool_count = @intCast(config.subpool_count),
+    var pool_val = worker_pool.WorkerPool.init(allocator, .{
+        .subpool_count = subpool_count,
         .subpool_numa_map = numa_map,
         .subpool_thread_count = thread_counts,
+        .subpool_thread_cpus = cpu_lists,
+        .owns_cpu_lists = owns_cpu_lists,
     }) catch @panic("pool init");
+    // The C path builds the config inline — nothing outside the pool
+    // references those slices, so the pool owns them. This mirrors
+    // initSimple's owns_config=true: kt_worker_pool_free -> deinit frees
+    // numa_map/thread_counts (+ the cpu lists when owns_cpu_lists).
+    pool_val.owns_config = true;
+    pool.* = pool_val;
     return @ptrCast(pool);
 }
 
-export fn kt_worker_pool_free(pool: *KT_WorkerPool) void {
+pub export fn kt_worker_pool_free(pool: *KT_WorkerPool) void {
     const wp: *worker_pool.WorkerPool = @ptrCast(@alignCast(pool));
     wp.deinit();
     // B1: free through the allocator the pool was constructed with
@@ -646,7 +700,7 @@ export fn kt_worker_pool_free(pool: *KT_WorkerPool) void {
     wp.allocator.destroy(wp);
 }
 
-export fn kt_worker_pool_get_thread_num(pool: *KT_WorkerPool) c_int {
+pub export fn kt_worker_pool_get_thread_num(pool: *KT_WorkerPool) c_int {
     const wp: *worker_pool.WorkerPool = @ptrCast(@alignCast(pool));
     return @intCast(wp.getTotalThreads());
 }

@@ -35,10 +35,16 @@ pub const WorkerPoolConfig = struct {
     /// element is a slice of physical CPU indices the subpool's worker
     /// threads should pin to via sched_setaffinity. Pass `null` for a
     /// subpool to skip pinning (e.g. on a single-socket host where
-    /// pinning is a no-op). The slices themselves must outlive the
-    /// WorkerPool (they are NOT owned by WorkerPoolConfig — typically
-    /// allocated by the caller and freed in its own deinit).
+    /// pinning is a no-op). By default the slices are NOT owned by
+    /// WorkerPoolConfig (borrowed, must outlive the pool); set
+    /// `owns_cpu_lists = true` to transfer ownership so `deinit` frees
+    /// them (the C-API auto-population path uses this — it builds the
+    /// lists from NumaTopology.detect with nowhere else to live).
     subpool_thread_cpus: ?[]const ?[]const usize = null,
+    /// When true, deinit frees `subpool_thread_cpus`' backing storage:
+    /// the outer slice AND each inner non-null slice (all allocated
+    /// through `allocator`).
+    owns_cpu_lists: bool = false,
     enable_work_stealing: bool = true,
     allocator: Allocator = std.heap.page_allocator,
 
@@ -61,6 +67,19 @@ pub const WorkerPoolConfig = struct {
         }
         if (self.subpool_thread_count.len > 0) {
             self.allocator.free(self.subpool_thread_count);
+        }
+        if (self.owns_cpu_lists) {
+            if (self.subpool_thread_cpus) |lists| {
+                for (lists) |maybe_list| {
+                    if (maybe_list) |list| {
+                        // The config type is const-slice; the backing
+                        // store was allocated as []usize — free via
+                        // constCast to satisfy the allocator contract.
+                        self.allocator.free(@constCast(list));
+                    }
+                }
+                self.allocator.free(@constCast(lists));
+            }
         }
         self.* = undefined;
     }
