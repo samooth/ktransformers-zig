@@ -48,7 +48,8 @@ const MoEConfig = struct {
 
 /// Build a TpMoe with deterministic ones-weights. The forward output is
 /// non-zero for any input (no need to match a reference value; the bench
-/// only measures time).
+/// only measures time). Heap-allocates so the lifetime spans the bench
+/// iterations (the deinit pattern in the engine expects a pointer).
 fn buildMoE(allocator: std.mem.Allocator, cfg: MoEConfig) !*moe.TpMoe {
     const s = cfg.shape;
     // Each expert weight tensor: [intermediate, hidden] (gate/up) or
@@ -70,7 +71,8 @@ fn buildMoE(allocator: std.mem.Allocator, cfg: MoEConfig) !*moe.TpMoe {
     const up = gate + n_gate_per * s.experts;
     const down = up + n_up_per * s.experts;
 
-    var moe_inst = try moe.TpMoe.init(.{
+    var moe_inst_heap = try allocator.create(moe.TpMoe);
+    moe_inst_heap.* = moe.TpMoe.init(.{
         .expert_num = @intCast(s.experts),
         .num_experts_per_tok = @intCast(s.k),
         .hidden_size = @intCast(s.hidden),
@@ -78,12 +80,12 @@ fn buildMoE(allocator: std.mem.Allocator, cfg: MoEConfig) !*moe.TpMoe {
         .max_len = @intCast(s.qlen),
         .pool = null, // sequential dispatch — the bench measures the
         // compute path, not the work-stealing overhead.
-        .gate_proj = gate,
-        .up_proj = up,
-        .down_proj = down,
-    }, allocator);
-    moe_inst.loadWeights();
-    return moe_inst;
+        .gate_proj = @constCast(gate),
+        .up_proj = @constCast(up),
+        .down_proj = @constCast(down),
+    }, allocator) catch |err| return err;
+    moe_inst_heap.loadWeights();
+    return moe_inst_heap;
 }
 
 fn runCase(allocator: std.mem.Allocator, cfg: MoEConfig, iters: usize) !u64 {
@@ -132,8 +134,8 @@ pub fn main(init: std.process.Init) !void {
     _ = init.minimal;
 
     // Host info for context
-    const cpu = root.cpu_detect.detectCpu(allocator) catch null;
-    defer if (cpu) |*c| c.deinit(allocator);
+    var cpu = root.cpu_detect.detectCpu(allocator) catch null;
+    defer if (cpu != null) cpu.?.deinit(allocator);
     std.debug.print("ktransformers-zig MoE forward bench (B2 extension)\n", .{});
     if (cpu) |c| {
         std.debug.print("  host: {s}  L2={d}K\n", .{ c.model_name, c.l2_bytes / 1024 });
@@ -173,7 +175,7 @@ pub fn main(init: std.process.Init) !void {
         };
 
         const delta_pct = @as(f64, @floatFromInt(tuned_ns)) / @as(f64, @floatFromInt(default_ns)) * 100.0 - 100.0;
-        std.debug.print("{s:<36} {d:>10} {d:>10} {d:+5.1}%\n", .{
+        std.debug.print("{s:<36} {d:>10} {d:>10} {d:>6.1}%\n", .{
             shape.name,
             default_ns / 200,
             tuned_ns / 200,
