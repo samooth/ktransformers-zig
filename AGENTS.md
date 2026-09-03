@@ -66,9 +66,15 @@ src/
 │   ├── arch/amx.zig            # AMX inline asm + detectAmxSupport runtime guard (A2)
 │   │                           # + VecF32 helpers (swigluVec, reduceAddFp32)
 │   ├── arch/neon.zig           # ARM NEON comptime gate (aarch64 cross-build)
-│   ├── amx/{buffers,gemm_224_{bf16,int8,int4,fp8,q8_0,q4_k,q5_k,q6_k,q8_k,mxfp4,mxfp8}}.zig
-│   └── moe/moe.zig             # TpMoe: routing (legacy + DeepSeek-V3 group-top2, D4),
+│   ├── amx/{buffers,gemm_224_{bf16,int8,int4,fp8,q8_0,q4_k,q5_k,q6_k,q8_k,mxfp4,mxfp8,
+│          q2_k,q3_k,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_xs,iq4_nl,iq1_s,iq1_m}}.zig
+│   │                          # + iq2xs_init/iq3xs_init (kmap/kneighbors, histogram+cached)
+│   └── moe/{moe,llamafile_moe}.zig
+│                               # TpMoe: routing (legacy + DeepSeek-V3 group-top2, D4),
 │                               # loadWeights (all 3 projections), vectorized gemmExpert (A1)
+│                               # LlamaMoe: GGML-quantized MoE for GGUF checkpoints —
+│                               # gemmQuant 16-format dispatch (comptime @sizeOf-audited;
+│                               # KT_TYPE values ABI-test-pinned vs main.zig's enum)
 └── mla/                        # MLA attention (DeepSeek-V2/V3): config/cache/core
 
 bench/gemm_bench.zig            # B2: gemmExpert vs scalar ref at DeepSeek-V3 shapes
@@ -84,13 +90,17 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
 ## Status (see TODO.md for details)
 
 - Build: working; 6 x86 variants + aarch64 neon cross-build.
- - C API: **105 symbols** gated by `verify_abi.py` triple gate (exports +
+ - C API: **112 symbols** gated by `verify_abi.py` triple gate (exports +
   arity + layout via audit_layout.py). All operator families implemented:
   MoE (incl. SFT/LoRA forward+backward), MLA, Gate (DeepSeek-V3
   group-top2 routing), Linear, MLP, FP8 transport, math helpers,
   `kt_set_default_allocator` (injectable allocator, B1),
-  `kt_dsv3_*` (DeepseekV3 model-orchestration), and
-  `kt_qwen3moe_*` (Qwen3 model-orchestration).
+  `kt_dsv3_*` (DeepseekV3 model-orchestration),
+  `kt_qwen3moe_*` (Qwen3 model-orchestration), and
+  `kt_llama_moe_*` (LlamaMoe for GGUF checkpoints, all 16 GGML
+  weight formats per projection), `kt_to_float`/`kt_from_float`/
+  `kt_type_row_bytes` (generic block↔F32 dispatch). User docs:
+  `docs/api.md` covers every symbol (112/112, comm-audited).
 - GGML: **15/15 — every kt_type_t format complete** — Q8_0 + the 7
   K-quants (Q2_K..Q8_K), IQ4_XS + IQ4_NL (non-linear 4-bit),
   IQ2_XXS/IQ2_XS/IQ2_S (2-bit grid family, full kmap/kneighbors
@@ -118,6 +128,14 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
   `Qwen3MoeForCausalLM` (Zig-native, in `src/kernels/qwen3/`) with
   C-API (`kt_qwen3moe_*`, 9 symbols). RMSNorm → MHA → residual,
   RMSNorm → gate+MoE → residual (standard MHA, no MLA).
+- LlamaMoe (reconciled 2026-09-03): `LlamaMoe` in
+  `src/kernels/moe/llamafile_moe.zig` — GGML-quantized MoE for GGUF
+  checkpoints, ALL 16 weight formats per projection via `gemmQuant`
+  (three kernel signature conventions mapped per family), gpu_experts_mask,
+  C-API `kt_llama_moe_*`. LESSON: the 16-format extension once shipped
+  11 invented KT_TYPE values + 9 wrong block sizes (eec0c22) — now
+  guarded by comptime `@sizeOf` audit + KT_TYPE ABI test + 16-arm
+  dispatch test. Never hand-copy enum values; import or pin them.
 - Vanilla MHA: `MhaEngine` in `src/kernels/attn/mha.zig` (matmulQKV,
   softmax, matmulO). Companion to MLA; same `*Engine.init/deinit/
   forward/decode` API shape. Standalone `matmulF32` / `rmsNormInline` /
@@ -133,13 +151,15 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
   fully revived (NumaTopology.detect + allocNuma + getThreadAffinity
   work byte-exact; getThreadAffinity bug fixed in route — kernel
   returns bytes-copied, not errno).
-- Tests: **187+ across the suites, 0 leaks** (134 in the kernels suite
-  incl. all 15 GGML formats, 11 MLA + 4 MLA C-API + 2 FP8 + 9 GGML C
-  API + 7 aarch64 + NEON + allocator + Qwen3 + NUMA pool). Bench: `zig build bench`
-  (2.8-9.3x measured speedup A1) + `moe_bench.zig` (end-to-end MoE
-  forward with tile-param tuning: -20.3% on prefill 8×4 at K=448
-  vs the 1792 default on this Ryzen 512K-L2 — validates the A4
-  wiring empirically).
+- Tests: **219 across the suites, 0 leaks** (137 in the kernels suite
+  incl. all 15 GGML formats + the 16-arm gemmQuant dispatch sweep; 11
+  MLA + 4+3 MLA C-API + 2 FP8 + 9 GGML C API + 7 aarch64 + NEON +
+  allocator + Qwen3 + Qwen3 C-API + GGUF e2e + to/from_float + 3
+  LlamaMoe C-API incl. the KT_TYPE ABI audit + K_BLOCK runtime). Bench:
+  `zig build bench` (2.8-9.3x measured speedup A1) + `moe_bench.zig`
+  (end-to-end MoE forward with tile-param tuning: -20.3% on prefill
+  8×4 at K=448 vs the 1792 default on this Ryzen 512K-L2 — validates
+  the A4 wiring empirically).
 - IMPROVE.md documents a verified external-dev-feedback audit: all
   P0-P3 items resolved (see its Parte E table for the commit map).
 

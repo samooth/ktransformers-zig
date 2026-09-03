@@ -1,6 +1,6 @@
 # ktransformers-zig TODO
 
-## Status: Beta (All workstreams closed; 15/15 GGML formats + 200+ tests)
+## Status: Beta (All workstreams closed; 15/15 GGML formats + 219 tests)
 
 Last updated: 2026-09-03
 
@@ -12,14 +12,14 @@ independently ported the same LLAMA_MOE_TP to Zig in the same session).
 Claims are removed when the task is done; abandoned claims can be reclaimed.
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
-**Tests: WORKING** - `zig build test` runs all suites: 73 kernels + 11 MLA + 9 MLA C-API + 9 Qwen3 MoE + 2 FP8 + 9 GGML C API + 7 aarch64 + 4 NEON kernel + 2 allocator C API = **156 total pass, 0 leaks, exit 0**.
-**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon, each exporting **105 C API symbols** (double-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). The 9 kt_qwen3moe_* symbols are exported from all 8 variants.
+**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime) = **219 total pass, 0 leaks, exit 0**.
+**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon (8 installed names), each exporting **112 C API symbols** (triple-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). Runs in CI (`wheels.yml` `abi-gate` job).
 **Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
 **Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
 **SFT/LoRA: FORWARD+BACKWARD COMPLETE** - training path done; C API exports (forward_sft/backward/update_lora_weights); smoke test passes.
-**Allocator: INJECTABLE (B1)** - `kt_set_default_allocator` C-ABI vtable; all 9 context types capture-and-free symmetrically.
-**Model Orchestration: COMPLETE** - DeepseekV3DecoderLayer + DeepseekV3Model + DeepseekV3ForCausalLM (C-API `kt_dsv3_*`) AND Qwen3MoeDecoderLayer + Qwen3MoeModel + Qwen3MoeForCausalLM (C-API `kt_qwen3moe_*`).
-**GGML: 10/10 STANDARD FORMATS COMPLETE** - Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ4_XS, IQ2_XXS (full quantize with kmap init), IQ3_XXS, IQ4_NL — all with quantize + dequantize + GEMM + tests.
+**Allocator: INJECTABLE (B1)** - `kt_set_default_allocator` C-ABI vtable; all context types capture-and-free symmetrically.
+**Model Orchestration: COMPLETE** - DeepseekV3DecoderLayer + DeepseekV3Model + DeepseekV3ForCausalLM (C-API `kt_dsv3_*`), Qwen3MoeDecoderLayer + Qwen3MoeModel + Qwen3MoeForCausalLM (C-API `kt_qwen3moe_*`), AND LlamaMoe for GGUF checkpoints (C-API `kt_llama_moe_*`, all 16 GGML weight formats per projection via the comptime-audited `gemmQuant` dispatch).
+**GGML: 15/15 FORMATS COMPLETE** - Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ4_XS, IQ4_NL, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M — all with quantize + dequantize + GEMM + tests. Kmap init histogram-based (22x) + process-cached.
 **MHA engine + GGUF parser (Qwen3 dev)**: vanilla MHA `MhaEngine` + GGUF v3 parser in `src/io/gguf.zig` — committed in `a61271e`.
 
 ---
@@ -242,7 +242,7 @@ true vs false, with file:line evidence). All real items fixed:
   - [x] **aarch64 variant detection** — `selectBestVariant` picks `sve2` > `sve` > `neon` for `cpu.vendor == .arm` or `cpu.arch == "aarch64"`. 7 tests in `tests/kernels/aarch64_detect_test.zig`.
   - [x] **NEON Phase-2: BF16 GEMM kernel** — `src/kernels/arch/gemm_224_bf16_neon.zig` (205 lines) parallels the A1 work in `src/kernels/amx/gemm_224_bf16.zig` with `@Vector(4,f32)` (4 f32 lanes = 128-bit NEON register). Comptime-dispatched: x86_64 builds hit the SSE fallback; aarch64 cross-build emits NEON fmla/fmul. Dispatcher (`gemmExpert`) routes to scalar or vectorized based on the NEON comptime gate. 4 tests in `tests/kernels/neon_kernel_test.zig`: vecF32 layout, dispatcher routing, vectorized-vs-scalar reference, correctness on x86_64 fallback.
   - [x] **NEON feature detection** — `src/kernels/arch/neon.zig` exposes `NeonFeatures.available` (comptime flag), `selectBestVariant` honors it. 1 test in `tests/kernels/neon_arch_test.zig`.
-  - [x] **Cross-compiled aarch64 `.so`** — `zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu` produces `zig-out/lib/libkt_kernel_ext_neon.so` (5.4 MB ARM ELF, 112 symbols). `tools/verify_abi.py` gates it PASS: 105/105 header prototypes exported, arity audit clean. File header verified: ELF 64-bit LSB aarch64, dynamically linked, with debug_info. Build-time footgun guard: passing `-Dvariant=neon` without `-Dtarget=aarch64-linux-gnu` exits with a clear error (no silent x86 "neon" build).
+  - [x] **Cross-compiled aarch64 `.so`** — `zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu` produces `zig-out/lib/libkt_kernel_ext_neon.so` (5.4 MB ARM ELF, 112 symbols). `tools/verify_abi.py` gates it PASS: 112/112 header prototypes exported, arity audit clean. File header verified: ELF 64-bit LSB aarch64, dynamically linked, with debug_info. Build-time footgun guard: passing `-Dvariant=neon` without `-Dtarget=aarch64-linux-gnu` exits with a clear error (no silent x86 "neon" build).
   - **Remaining follow-ups (out of scope for this workstream)**: SVE/SVE2 GEMM kernels (the dispatcher already routes to `sve2 > sve > neon` but the actual vectorized kernels beyond the BF16 one are not yet ported; further work only justified when a real aarch64 host is in the dev rotation).
 - [x] **GGML Q8_0 kernel — Phase 1 DONE (2026-08-31)** — `src/kernels/amx/gemm_224_q8_0.zig`: byte-exact `BlockQ8_0` (34 bytes: f16 `d` + 32×i8 `qs`, `@sizeOf` compile-checked) vs ggml-common.h; quantize/dequantize matching ggml-quants.c:276/553 (`d = amax/127`, `qs = round(x·1/d)`, `y = qs·d`); f16↔f32 via Zig's **native f16** `@floatCast`/`@bitCast` (first attempt hand-rolled the bit math — buggy subnormal path, replaced by native casts, lesson for LESSONS); scalar GEMM (BF16 activations × Q8_0 weights → F32, on-the-fly dequant). 5 exact-value tests in test_kernels.zig (f16 round-trip, 34-byte layout, quantize/dequant tolerance, 2 GEMM constants). Wired into root.zig with comptime fn-refs (emission verified via nm). Remaining formats: Q4_K → Q6_K → Q5_K (defer Q8_K — super-block scale/min layout is the fiddliest and least used); C-API quantize/dequantize exports are Phase 2.
 - [x] **GGML Q4_K kernel — Phase 1 DONE (2026-08-31)** — `src/kernels/amx/gemm_224_q4_k.zig`: byte-exact `BlockQ4_K` (144 bytes: f16 `d`+`dmin`, 12-byte 6-bit packed `scales`, 128-byte 4-bit `qs`, `@sizeOf` compile-checked) vs ggml-common.h; `nearestInt` (magic-number trick, ggml-quants.c:621), `getScaleMinK4` (6-bit scale/min unpack, :880), full `makeQkx2Quants` error-minimizing search (:799, 20-step), `quantizeRowQ4_K` (:1457), `dequantizeRowQ4_K` (:1529); scalar GEMM (BF16 × Q4_K → F32). 5 tests in test_kernels.zig (nearest_int known values, 144-byte layout, scale/min unpack scheme, round-trip accuracy <15% rel on smooth data, GEMM constant 256.0). Wired into root.zig (emission verified via nm).
@@ -261,30 +261,39 @@ true vs false, with file:line evidence). All real items fixed:
 - [x] **ABI signature parity audit — Tier 0 DONE (2026-08-31)** — full 86-symbol sweep of header prototypes vs Zig export signatures. Found and fixed 3 real divergences (stack-corruption risk for header-following callers): `kt_mla_new` (dropped the extra cpuinfer param; header contract is 1 arg), `kt_mla_forward` (rewritten to the 8-arg paged/batched C contract: qlens/page_tables/kv_lens arrays; qlen_count==1 fully supported, >1 panics with a clear message — paged-attention indirection is future work; page_tables accepted-but-unused documented), `kt_gate_forward` (header updated to the 7-arg Zig form with topk_ids/topk_weights outputs — the ctypes wrapper + tests already used it; 4-arg C++ minimum noted as not exported). Also gated 18 previously-unheadered .so exports (4 math helpers kt_apply_swiglu/rms_norm/rope + kt_softmax, MLA prefill/decode/update_kv_cache conveniences, MoE forward_gate_up/down, FP8 quantize helpers, scalar matmuls bf16/int8/int4/fp8, worker_pool_get_thread_num) in a clearly-marked 'Zig extensions' header section — ABI: 68 → 86 symbols. **New gates**: `tools/audit_arity.py` (header/Zig arity parser with fn-ptr + multi-line + trailing-comma handling) + wired into `verify_abi.py` as a second gate (FAIL on any name or arity divergence). Side effect: the audit surfaced two latent compile errors in `kt_matmul_int4` (b_scratch pointer-type mismatch, applyScales b/c types) — fixed; INT4 AMX-path tests now actually run (previously silently un-analyzed under lazy compilation). Python wrapper: 18 new raw bindings + argtypes, 61 names in __all__.
 - [x] **pybind11 drop-in wrapper — Tier 1 DONE (2026-08-31)** — `bindings/kt_kernel_pybind.cpp` + `bindings/build.sh`: a pybind11 module named `kt_kernel_ext` (matching the C++ reference's PYBIND11_MODULE name, so `from kt_kernel_ext.moe import MOE, MOEConfig` works unchanged) that links against the Zig `.so` and routes every method through the C API. Surface: `moe.MOE` (construct-from-config, load_weights, warm_up, forward, forward_sft), `moe.MOEConfig` (full field set incl. embedded quant_config), `mla.MLA` + `mla.MLAConfig` (paged forward, qlen_count==1), `kvcache.ggml_type` enum, `WorkerPool`/`CPUInfer` (submit is synchronous; the Zig work-stealing pool is reached via the MoE pool config), `kt_version`/`kt_get_cpu_variant`. **The hard part was the ABI**: config structs are passed BY VALUE (~340/272 bytes) — a C++ mirror struct with wrong field order silently corrupts the callee (found live: the shim originally missed `num_gpu_experts`/`gpu_experts_mask`/`physical_to_logical_map` + embedded `quant_config`, and typed `kt_type_t` enums as u8 instead of c_int). Three-layer fix: (1) shim structs transcribed field-for-field from the Zig `extern struct`s; (2) new Zig ABI probes `kt_abi_size_*`/`kt_abi_field_offset` (via `@offsetOf`, test-only exports); (3) new gate `tools/audit_layout.py` — loads the probes from the .so, computes the C++ shim's Itanium-ABI offsets, FAILs on any sizeof/offset divergence. Layout gate caught the MLA u8-vs-int enum bug live. End-to-end verified: MOE construct→load_weights→forward (zero weights→zero output exact) and MLA construct→load_weights→forward through the real pybind11 path with numpy buffers. Third Python surface alongside the ctypes wrapper; build via bindings/build.sh (pybind11 from torch include).
 
-- [x] **LlamaMoe (Zig extension) — first cut DONE (2026-09-02)** — ports
+- [x] **LlamaMoe (Zig extension) — DONE + RECONCILED (2026-09-03)** — ports
   the C++ `LLAMA_MOE_TP` from `ktransformers/kt-kernel/operators/llamafile/moe.hpp`
   (the framework's default backend for GGUF-loaded checkpoints). The
-  Zig class (`src/kernels/moe/llamafile_moe.zig`, 622 lines) implements
-  the full per-expert algorithm: BF16 input → Q8_0 quant → SwiGLU
-  → Q4_K/Q5_K/Q6_K/Q8_0/Q8_K × Q8_0 dot products → F32 weighted sum.
-  Supported weight types: Q8_0, Q4_K, Q5_K, Q6_K, Q8_K. C ABI:
+  Zig class (`src/kernels/moe/llamafile_moe.zig`) implements the
+  full per-expert algorithm: BF16 input → Q8_0 quant → SwiGLU
+  → per-format GEMM × Q8_0 activations → F32 weighted sum.
+  **Reconciliation (5177bdf)**: two agents ported this in parallel
+  (llama_moe.zig vs llamafile_moe.zig); unified into llamafile_moe.zig
+  — the 16-format `gemmQuant` dispatch + gpu_experts_mask merged into
+  the C-API-first base, duplicate deleted. **Supported weight types:
+  ALL 16 GGML formats** (Q8_0, Q*_K, IQ2/IQ3/IQ4/IQ1 families) —
+  each projection may differ. C ABI:
   `kt_llama_moe_{new,free,load_weights,forward}` (4 symbols) +
-  `kt_llama_moe_config_t` extern struct. ABI: 105 → 109 symbols,
-  verify_abi.py PASS on all 8 variants. The first-cut matmul path
-  dequantizes Q8_0 → BF16 and uses the existing `kt_matmul_q*`
-  (byte-exact vs llama.cpp, but does an extra dequant/quant round
-  trip on the activation). Tests: `tests/kernels/llamafile_moe_capi_tests.zig`
-  (2 tests: new+load_weights+free lifecycle, pool-null rejection).
-  **Limitations (follow-ups)**: (1) add a true Q4_K × Q8_0 matmul
-  to skip the BF16 round-trip; (2) `forward_many` (batched per-m-block
-  work-stealing) is a follow-up — the C ABI calls per-token `forward_one`
-  for qlen > 1 (correct, not optimal); (3) TP path is `tp_part_idx=0`
-  only (the C++ exposes a subpool index; the Zig port uses the pool's
-  default subpool for now). **Closes the §1 gap** from the other dev's
-  "qué falta" analysis.
+  `kt_llama_moe_config_t` extern struct. ABI: 105 → 112 symbols,
+  verify_abi.py PASS on all 8 variants. The matmul path dequantizes
+  Q8_0 → BF16 and calls the per-format GEMM kernels (byte-exact vs
+  llama.cpp, but does an extra dequant/quant round trip on the
+  activation). Tests: `tests/kernels/llamafile_moe_capi_tests.zig`
+  (lifecycle, pool-null rejection, KT_TYPE ABI audit) +
+  `test_kernels.zig` (Q8_0/Q4_K constant-value dispatch, 16-format
+  zero-weight dispatch sweep). **P0 bug fixed (eec0c22)**: the
+  16-format extension originally shipped 11 invented KT_TYPE values
+  (e.g. IQ3_S=29 vs header 25 — collisions dispatched the WRONG
+  kernel silently) + 9 wrong block byte-sizes; guarded now by a
+  comptime `@sizeOf` audit, a KT_TYPE-vs-enum ABI test, and the
+  16-arm dispatch test. **Limitations (follow-ups)**: (1) true fused
+  q×q matmuls to skip the BF16 round-trip; (2) `forward_many`
+  (batched per-m-block work-stealing) — the C ABI calls per-token
+  `forward_one` for qlen > 1 (correct, not optimal); (3) TP path is
+  `tp_part_idx=0` only. **Closes the §1 gap** from the "qué falta" analysis.
 
 ### Documentation
-- [x] **API documentation** — `docs/api.md` (500 lines, hand-written; toolchain is Zig 0.16.0-dev.2535 which has **no `zig doc` subcommand** and no `-femit-docs` flag, so the doc is not auto-generated). Integrator's quick-reference: 68 kt_* symbols grouped by family (version/detection, BF16, workers, MoE/MLA/Gate/Linear/MLP, GGML block formats + matmuls, FP8 layerwise transport, math helpers), pointers + minimal Python ctypes example, ABI contract (header is the source of truth; `tools/verify_abi.py` is the gate; multi-variant layout), known gaps. Also flags the 4 math-helper exports (`kt_apply_swiglu` / `kt_apply_rms_norm` / `kt_apply_rope` / `kt_softmax`) that exist in the .so but are missing from `include/kt_kernel.h` and therefore not ABI-gated — follow-up to add them to the header. The "zig doc" wording in this TODO is misleading; the toolchain simply does not have it.
+- [x] **API documentation** — `docs/api.md` (hand-written; toolchain is Zig 0.16.0-dev.2535 which has **no `zig doc` subcommand** and no `-femit-docs` flag, so the doc is not auto-generated). Integrator's quick-reference: family map + per-family signature blocks covering **ALL 112 kt_* symbols** (verified: every header prototype is mentioned; `comm` audit 2026-09-03), pointers + minimal Python ctypes example, ABI contract (header is the source of truth; `tools/verify_abi.py` is the gate; multi-variant layout), known gaps (incl. the header-comment lie about nonexistent `kt_*_iq*` per-type exports — now fixed in the header). Also flags the 4 math-helper exports (`kt_apply_swiglu` / `kt_apply_rms_norm` / `kt_apply_rope` / `kt_softmax`) that exist in the .so but are missing from `include/kt_kernel.h` and therefore not ABI-gated — follow-up to add them to the header.
 - [x] **Porting guide from C++** — `docs/porting-guide.md` (181 lines, committed in `e2c900d`): C++ reference file map → Zig counterpart map, lazy-analysis wiring pattern, comptime fn-ref pattern for `.so` symbol emission, AMX arch-gate, the bf16 f16 cast (Zig 0.16 native f16 vs hand-rolled bit math), and the `@Vector` indexing gotchas. Linked from AGENTS.md.
 
 ---
