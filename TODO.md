@@ -131,10 +131,9 @@ true vs false, with file:line evidence). All real items fixed:
   remains the zero-dependency surface.)
 
 ### CI/CD
-- [ ] **Run the ABI gates in CI** — `wheels.yml` builds the variants but
-  does not run `tools/verify_abi.py` (export+arity) or
-  `tools/audit_layout.py` (pybind11 layout). A symbol regression ships
-  silently otherwise.
+- [x] **Run the ABI gates in CI** — `wheels.yml` has `abi-gate` job
+  (builds all variants, runs `verify_abi.py` + `audit_layout.py` +
+  `zig build test`; other dev added in `7db2936`).
 - [x] **Python binding for `kt_set_default_allocator`** — symbol 87 has
   ctypes wrapper (lines 542-566 of `python/kt_kernel/__init__.py`):
   `kt_allocator_vtable` Structure (userdata + alloc/free/resize
