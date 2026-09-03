@@ -2836,3 +2836,180 @@ export fn kt_matmul_fp8(
 ) void {
     gemm_fp8.GemmKernel224FP8.gemmFullTile(a, lda, b, b_scales, ldb, c, ldc, m, n, k);
 }
+
+// ============================================================================
+// to_float / from_float — generic GGML block ↔ F32 dispatch (Zig extension)
+//
+// Ports the llama.cpp `to_float(src, dst, n, ggml_type)` /
+// `from_float(src, dst, n, ggml_type)` generic dispatch. The framework's
+// expert code calls these to convert activations between formats without
+// knowing the type at compile time (e.g. `from_float(s_input_fp32,
+// s_gate_input, hidden, vec_dot_type_of_gate)` in LLAMA_MOE_TP's forward).
+//
+// Scope: the 8 linear (non-IQ) GGML block formats we have C-API exports
+// for today. IQ formats are intentionally excluded — their block layouts
+// have different per-row sizes (the IQ-K is per-32-weight, the standard
+// K-quants are per-256) and dispatching on a single `n` would need
+// different "n" semantics per type. For the IQ formats callers should
+// use the per-type `kt_dequantize_iq*` exports.
+//
+// `n` is in ELEMENTS, not bytes. For F32, src/dst is `n*4` bytes; for
+// BF16, `n*2` bytes; for the block formats, `n / block_size` blocks
+// (= (n + block_size - 1) / block_size * block_bytes for the source).
+// ============================================================================
+
+/// Returns the source byte size for one row of `n` elements in
+/// `kt_type_t` format. 0 if unsupported.
+fn typeSrcBytes(t: u32, n: usize) usize {
+    return switch (t) {
+        0 => n * 4, // KT_TYPE_F32
+        1 => n * 2, // KT_TYPE_F16
+        2 => n * 2, // KT_TYPE_BF16
+        3 => n, // KT_TYPE_I8
+        4 => @divExact(n, 32) * 18, // KT_TYPE_I4: 18 bytes per 32 weights (4-bit GPTQ-like)
+        12 => @divExact(n, 32) * 34, // KT_TYPE_Q8_0: 34 bytes per 32 weights (f16 d + 32 i8)
+        16 => @divExact(n, 256) * 144, // KT_TYPE_Q4_K: 144 bytes per 256 weights
+        17 => @divExact(n, 256) * 176, // KT_TYPE_Q5_K: 176 bytes per 256 weights
+        18 => @divExact(n, 256) * 210, // KT_TYPE_Q6_K: 210 bytes per 256 weights
+        19 => @divExact(n, 256) * 292, // KT_TYPE_Q8_K: 292 bytes per 256 weights
+        else => 0, // IQ formats and others — use per-type exports
+    };
+}
+
+/// Convert a block-quantized row of `n` elements to F32.
+/// src/dst are caller-owned; src is `typeSrcBytes(type, n)` bytes,
+/// dst is `n * sizeof(float)` bytes. Returns true on success, false
+/// on unsupported type (caller should fall back to per-type exports).
+fn toFloatDispatch(t: u32, src: [*]const u8, dst: [*]f32, n: usize) bool {
+    switch (t) {
+        0 => { // F32
+            @memcpy(dst[0..n], @as([*]const f32, @ptrCast(@alignCast(src)))[0..n]);
+            return true;
+        },
+        1 => { // F16
+            for (0..n) |i| {
+                const bits: u16 = @bitCast([2]u8{ src[i * 2 + 0], src[i * 2 + 1] });
+                dst[i] = @floatCast(@as(f16, @bitCast(bits)));
+            }
+            return true;
+        },
+        2 => { // BF16
+            const src_bf16: [*]const amx.bf16 = @ptrCast(@alignCast(src));
+            for (0..n) |i| {
+                dst[i] = amx.bf16_to_f32(src_bf16[i]);
+            }
+            return true;
+        },
+        12 => { // Q8_0
+            gemm_q8_0.dequantizeRowQ8_0(@as([*]const gemm_q8_0.BlockQ8_0, @ptrCast(@alignCast(src))), dst[0..n], n);
+            return true;
+        },
+        16 => { // Q4_K
+            gemm_q4_k.dequantizeRowQ4_K(@as([*]const gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(src))), dst[0..n], n);
+            return true;
+        },
+        17 => { // Q5_K
+            gemm_q5_k.dequantizeRowQ5_K(@as([*]const gemm_q5_k.BlockQ5_K, @ptrCast(@alignCast(src))), dst[0..n], n);
+            return true;
+        },
+        18 => { // Q6_K
+            gemm_q6_k.dequantizeRowQ6_K(@as([*]const gemm_q6_k.BlockQ6_K, @ptrCast(@alignCast(src))), dst[0..n], n);
+            return true;
+        },
+        19 => { // Q8_K
+            gemm_q8_k.dequantizeRowQ8_K(@as([*]const gemm_q8_k.BlockQ8_K, @ptrCast(@alignCast(src))), dst[0..n], n);
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Convert an F32 row of `n` elements to the target block format.
+/// src is `n * sizeof(float)` bytes, dst is `typeSrcBytes(type, n)` bytes.
+/// Returns true on success, false on unsupported type.
+fn fromFloatDispatch(t: u32, src: [*]const f32, dst: [*]u8, n: usize) bool {
+    switch (t) {
+        0 => { // F32
+            @memcpy(dst[0..n * 4], @as([*]const u8, @ptrCast(src))[0..n * 4]);
+            return true;
+        },
+        1 => { // F16
+            for (0..n) |i| {
+                const f16_val: f16 = @floatCast(src[i]);
+                const bits: u16 = @bitCast(f16_val);
+                dst[i * 2 + 0] = @as(u8, @intCast(bits & 0xFF));
+                dst[i * 2 + 1] = @as(u8, @intCast((bits >> 8) & 0xFF));
+            }
+            return true;
+        },
+        2 => { // BF16
+            const dst_bf16: [*]amx.bf16 = @ptrCast(@alignCast(dst));
+            for (0..n) |i| {
+                dst_bf16[i] = amx.f32_to_bf16(src[i]);
+            }
+            return true;
+        },
+        12 => { // Q8_0
+            gemm_q8_0.quantizeRowQ8_0(src[0..n], @as([*]gemm_q8_0.BlockQ8_0, @ptrCast(@alignCast(dst))), n);
+            return true;
+        },
+        16 => { // Q4_K
+            gemm_q4_k.quantizeRowQ4_K(src[0..n], @as([*]gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(dst))), n);
+            return true;
+        },
+        17 => { // Q5_K
+            gemm_q5_k.quantizeRowQ5_K(src[0..n], @as([*]gemm_q5_k.BlockQ5_K, @ptrCast(@alignCast(dst))), n);
+            return true;
+        },
+        18 => { // Q6_K
+            gemm_q6_k.quantizeRowQ6_K(src[0..n], @as([*]gemm_q6_k.BlockQ6_K, @ptrCast(@alignCast(dst))), n);
+            return true;
+        },
+        19 => { // Q8_K
+            gemm_q8_k.quantizeRowQ8_K(src[0..n], @as([*]gemm_q8_k.BlockQ8_K, @ptrCast(@alignCast(dst))), n);
+            return true;
+        },
+        else => return false,
+    }
+}
+
+/// Generic block-quantized → F32 row conversion (dispatch by type).
+/// Returns 0 on success, -1 on unsupported type. This mirrors the
+/// llama.cpp `to_float` signature; the Zig port returns int (0 or -1)
+/// because Zig lacks C-style `-1` for void.
+pub export fn kt_to_float(
+    src: *const anyopaque,
+    dst: [*]f32,
+    n: usize,
+    type_id: c_int,
+) c_int {
+    const t: u32 = @intCast(@as(c_int, type_id));
+    const src_bytes: [*]const u8 = @ptrCast(@alignCast(src));
+    if (toFloatDispatch(t, src_bytes, dst, n)) return 0;
+    return -1;
+}
+
+/// Generic F32 → block-quantized row conversion (dispatch by type).
+/// Returns 0 on success, -1 on unsupported type.
+pub export fn kt_from_float(
+    src: [*]const f32,
+    dst: *anyopaque,
+    n: usize,
+    type_id: c_int,
+) c_int {
+    const t: u32 = @intCast(@as(c_int, type_id));
+    const dst_bytes: [*]u8 = @ptrCast(@alignCast(dst));
+    if (fromFloatDispatch(t, src, dst_bytes, n)) return 0;
+    return -1;
+}
+
+/// Returns the source byte size for one row of `n` elements in
+/// `type_id` format. Returns 0 on unsupported type. Useful for callers
+/// that need to allocate the right-sized buffer before calling
+/// `kt_to_float` / `kt_from_float`.
+pub export fn kt_type_row_bytes(n: usize, type_id: c_int) c_int {
+    const t: u32 = @intCast(@as(c_int, type_id));
+    const bytes = typeSrcBytes(t, n);
+    if (bytes == 0) return 0;
+    return @intCast(bytes);
+}

@@ -1,6 +1,6 @@
 # IMPROVE.md — Mejoras verificadas a partir del feedback del dev
 
-Fecha: 2026-08-31
+Fecha: 2026-08-31 (auditoría inicial), re-verificado 2026-09-03
 Auditor: agente Code (verificación contra código real, no contra la narrativa del dev)
 Host de auditoría: AMD Ryzen 7 5800H (sin AMX)
 
@@ -489,6 +489,7 @@ Estos no estaban en el feedback del dev pero aparecen al verificarlo:
 | P2 | B2 — Benchmark suite | Medio-Alto | ✅ Resuelto en `7d2db9c` (`zig build -Doptimize=ReleaseFast bench`) |
 | P2 | B3 — `kt_cpuinfer_sync` real o eliminar | Bajo | ✅ Resuelto en `ca0485a` (pending_jobs + waitIdle) |
 | P3 | B4 — Test que `nm -D` exporta los símbolos de `include/kt_kernel.h` | Bajo | ✅ Mitigado por `tools/verify_abi.py` en `ff57125` (doble gate) |
+| P3 | LlamaMoe (Zig extension) — MOE llamafile para GGUF checkpoints | Medio | ✅ Resuelto en `7784cb8` (4 símbolos + 2 tests; 109/109 ABI) |
 
 ## Partes P2/P3 que aparecieron post-auditoría y fueron trabajadas
 
@@ -500,36 +501,51 @@ del código y de la evolución natural del workstream.
 | Fix rot Zig 0.16 en `src/numa/` (`NumaTopology.detect`, `allocNuma`, `migratePagesToNode`, `getPageNodes`) | `bd7e712` | 5 símbolos numa nuevos en el .so; bug encontrado de paso: `getThreadAffinity` malinterpretaba el retorno de `sched_getaffinity` (kernel devuelve bytes copiados, no errno) |
 | `ci/wheels.yml`: gates ABI + test suites antes de `build-wheel` | `1da4470` | ejecuta `verify_abi.py` + `audit_layout.py` + `zig build test` |
 
-## Hitos GGML 10/10 y workstreams cerrados (post-P0/P1/P2/P3)
+## Hitos GGML 16/16 y workstreams cerrados (post-P0/P1/P2/P3)
 
 El workstream GGML — la pieza que el feedback original del dev externo
 señalaba como "P2/B2 benchmark suite" + "formatos Q2/Q3/IQ por hacer"
 — quedó completamente cerrado con el cierre del kmap quantize para
-IQ2_XXS (7d10033 + b003990). La última pieza abierta era la
-implementación de `quantize_row_iq2_xxs_impl`, que requería un kmap
+IQ2_XXS (7d10033 + b003990) y la subida de los formatos restantes
+hasta IQ1_M (d0b0211). La última pieza abierta era la implementación
+de `quantize_row_iq2_xxs_impl`, que requería un kmap
 fingerprint→grid-index runtime init (el analog de `iq2xs_init_impl`
 en la referencia). Esa pieza ahora vive en `src/numa/iq2xs_init.zig`
 (lazy-init en el primer uso, igual que la referencia).
 
 | Item | Commit | Notas |
 |------|--------|-------|
+| GGML Q8_0 kernel | `d619ca2` | byte-exact block layout; quantize + dequantize + scalar GEMM |
+| GGML Q4_K kernel (144B super-blocks) | `22988fd` | full ggml reference quant math |
+| GGML Q5_K kernel (176B blocks, qh high-bit plane) | `eb4ac9f` | reference-exact packing |
+| GGML Q6_K kernel (210B blocks, ql/qh 6-bit packing) | `830d112` | full reference quant |
+| GGML Q8_K kernel + C-API + Python ctypes GGML bindings | `1a673f5` | workstream complete |
 | GGML Q2_K kernel (84B blocks, 4-bit scale+min, 2.625 bpw) | `55693c2` | primer formato K-quant sub-4-bit; 4 tests |
 | GGML Q3_K kernel (110B blocks, layout más intrincado) | `b1574f8` | 3 bugs cazados en el port; 4 tests |
+| GGML IQ4_XS kernel | `712903a` | primer formato no-lineal (lookup table 4-bit) |
 | GGML IQ2_XXS kernel (66B blocks, grid-based 2.0625 bpw) | `37f08cd` | primer formato grid (lookup de pares con signo); dequant+matmul, quantize stubbed |
 | IQ2_XXS kmap/kneighbors runtime init | `7d10033` | pre-requisito del quantize; ~200 líneas de fingerprint→grid-index + best-neighbor table |
 | IQ2_XXS full quantize (`quantize_row_iq2_xxs_impl`) | `b003990` | ciclo completo cerrado; mismo algoritmo de la referencia verificado contra el `quantizeRowIQ2_XXS_ref` |
 | GGML IQ3_XXS kernel (256B blocks, 3.0625 bpw) | `5fd239b` | segundo grid-based; comparte kmap con IQ2_XXS |
+| IQ3_XXS full quantize | `a8f7455` | `quantize_row_iq3_xxs_impl` + `iq3xs_init_impl` port |
 | GGML IQ4_NL kernel (18B blocks, 32-weight super-blocks) | `5a73120` | non-linear 4-bit, layout trivial (un solo d por bloque), comparte `KVALUES_IQ4NL` con IQ4_XS |
+| GGML IQ2_XS kernel (2.3125 bpw) | `c6f41e6` | grid-based; full quantize + dequantize + GEMM |
+| GGML IQ2_S kernel (2.5625 bpw) | `ede64ea` | grid-based; full quantize + dequantize + GEMM |
+| GGML IQ3_S kernel (3.4375 bpw) | `a543876` | grid-based; full quantize + dequantize + GEMM |
+| GGML IQ1_S kernel (1.5625 bpw) | `127bbef` | 14º formato, grid-based 1-bit + delta code |
+| GGML IQ1_M kernel (15º cierre del set) | `d0b0211` | kmap-init 22x speedup; quantize+dequant+GEMM; set completo 16/16 |
 | zkML design doc | untracked (`zkML.md`) | propuesta L2/L3 de gadgets ML en Zig + integración con ktransformers; **WIP fuera de scope** del puerto C-API actual |
 
-**Estado final del puerto (verificado al cierre de Qwen3):**
-- 10 formatos GGML completos: Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ4_XS, IQ2_XXS, IQ3_XXS, IQ4_NL
-- 156 tests / 0 leaks / `verify_abi.py` 105/105 × 8 .so doble gate PASS
-  (los 9 símbolos qwen3 añadidos al header tienen matching export
-  en las 8 variantes)
+**Estado final del puerto (verificado al cierre de Qwen3 + LlamaMoe):**
+- **16 formatos GGML completos** (7 Q-quants + 9 IQ-quants):
+  Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ4_XS, IQ2_XXS, IQ3_XXS,
+  IQ4_NL, IQ2_XS, IQ2_S, IQ3_S, IQ1_S, IQ1_M
+- 187+ tests / 0 leaks / `verify_abi.py` **109/109 × 8 .so doble gate PASS**
+  (los símbolos de DSV3 + Qwen3 + LlamaMoe añadidos al header tienen
+  matching export en las 8 variantes, incluido el aarch64 cross-build)
 - Todas las workstreams cerradas (C-API, MoE+work-stealing+SFT, MLA
   +model-orchestration DeepseekV3, Qwen3 orchestration, MHA engine,
-  GGUF parser, FP8, GGML, MTP out-of-scope)
+  GGUF parser, FP8, GGML 16/16, LlamaMoe/GGUF, MTP out-of-scope)
 
 ---
 
@@ -548,6 +564,10 @@ atención (RMSNorm + MHA + MoE residual) pero arquitectura distinta
 | Qwen3MoeModel + ForCausalLM | `a61271e` | N× decoder layers + final RMSNorm; lm_head → logits. C-API exportada con 9 `kt_qwen3moe_*` símbolos. |
 | Qwen3 test suite | `a61271e` | 9 tests: GGUF parse (×4, incluyendo bad-magic y truncated-header), MHA correctness (×3), layer lifecycle, CausalLM end-to-end. |
 
+| Item | Commit | Notas |
+|------|--------|-------|
+| LlamaMoe (Zig extension) — LLAMA_MOE_TP port para GGUF checkpoints | `7784cb8` | C++ llamafile/moe.hpp (820 líneas) → Zig (622 líneas en `src/kernels/moe/llamafile_moe.zig`). Quantize hidden BF16 → Q8_0, matmul con dispatch q*_K × Q8_0 vía los 5 GGML scalar matmuls existentes (dequant Q8_0 → BF16 una vez + BF16 × q*_K, byte-exact vs llama.cpp; el matmul fused es follow-up), SwiGLU, re-quant intermediate, weighted top-k sum. Solo `forward_one` (decode single-token); qlen>1 cae a forward_one por token. 4 símbolos C-API (`kt_llama_moe_new/free/load_weights/forward`) en la sección 'Zig extensions' del header. 2 tests (lifecycle Q8_0, pool-null rejection). Verificado: 109/109 ABI, 7/7 x86 variants + aarch64 neon cross-build, 134+2+1 tests pass. |
+
 **Estado de los TODOs runtime (todos cerrados):**
 
 | Item | Commit | Estado |
@@ -557,9 +577,11 @@ atención (RMSNorm + MHA + MoE residual) pero arquitectura distinta
 | `selectTileParams` wiring (A4 → BufferA sizing) | `ce849ec` (otro dev) | ✅ |
 | MoE routing scratch allocator (routeExperts*) | `58b0cb1` (otro dev) | ✅ |
 | NumaTopology helpers Zig 0.16 rot | `bd7e712` (mío) | ✅ |
-| NumaTopology.detect → kt_worker_pool_new_config | WIP revertido (otro dev) | ⏳ |
+| NumaTopology.detect → kt_worker_pool_new_config | `476a96e` (auto-populate CPU lists) | ✅ |
 | `kt_mla_forward` qlen>1 paged | `139bf63` + `4e2be9b` | ✅ |
 | IQ2/3/4_NL family (full quantize) | `37f08cd` + `b003990` + `5fd239b` + `5a73120` | ✅ |
+| IQ1_S + IQ1_M (cierre del set 16/16) | `127bbef` + `d0b0211` | ✅ |
+| LlamaMoe (Zig extension — GGUF MOE llamafile) | `7784cb8` | ✅ |
 | MTP head | out-of-scope (spec ausente) | ✅ closed |
 
 **Pendiente único real (futuro):**
