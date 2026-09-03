@@ -7,10 +7,10 @@ definitions (`kt_moe_config_t`, `kt_fp8_stats_t`, etc.) live in the header; the
 function signatures here are signatures-of-record, not a replacement for the
 header.
 
-As of `tools/verify_abi.py` last PASS, the API is **105 symbols × 7 built
-.so files** (6 x86 variants + 1 aarch64 `neon` cross-build). Any change to
-a symbol's name, signature, or call convention is an ABI break and must
-be gated behind the verifier.
+As of `tools/verify_abi.py` last PASS, the API is **112 symbols × 8 built
+.so files** (6 x86 variants + 1 aarch64 `neon` cross-build, counted per
+installed name). Any change to a symbol's name, signature, or call
+convention is an ABI break and must be gated behind the verifier.
 
 ## Family map
 
@@ -18,23 +18,26 @@ be gated behind the verifier.
 |---|---|---|
 | [Version / detection](#version--detection) | 2 | `kt_version`, `kt_get_cpu_variant` |
 | [BF16 conversion](#bf16-conversion) | 2 | `kt_bf16_to_f32`, `kt_f32_to_bf16` |
-| [Worker pool](#worker-pool) | 3 | `kt_worker_pool_new(_config)`, `kt_worker_pool_free` |
+| [Worker pool](#worker-pool) | 4 | `kt_worker_pool_new(_config)`, `_free`, `_get_thread_num` |
 | [CPUInfer](#cpuinfer) | 6 | `kt_cpuinfer_new(_config)`, `_free`, `_submit`, `_sync`, `_get_backend` |
 | [Gate](#gate) | 3 | `kt_gate_new`, `kt_gate_free`, `kt_gate_forward` |
 | [Linear](#linear) | 3 | `kt_linear_new`, `kt_linear_free`, `kt_linear_forward` |
 | [MLP](#mlp) | 3 | `kt_mlp_new`, `kt_mlp_free`, `kt_mlp_forward` |
-| [MoE (inference + SFT)](#moe) | 10 | `kt_moe_new(_sft)`, `_free`, `_warm_up`, `_load_weights(_with_map)`, `_forward`, `_forward_sft`, `_backward`, `_update_lora_weights` |
-| [MLA (attention)](#mla) | 4 | `kt_mla_new`, `_load_weights`, `_free`, `_forward` |
+| [MoE (inference + SFT)](#moe) | 12 | `kt_moe_new(_sft)`, `_free`, `_warm_up`, `_load_weights(_with_map)`, `_forward`, `forward_gate_up`/`forward_down` (per-expert), `_forward_sft`, `_backward`, `_update_lora_weights` |
+| [MLA (attention)](#mla) | 7 | `kt_mla_new`, `_load_weights`, `_free`, `_forward`, `prefill`, `decode`, `update_kv_cache` |
 | [Qwen3 MoE (model orchestration)](#qwen3-moe-model-orchestration) | 9 | `kt_qwen3moe_{layer,model,causallm}_{new,forward,free}` |
 | [DeepseekV3 (model orchestration)](#deepseekv3-model-orchestration) | 9 | `kt_dsv3_{layer,model,causallm}_{new,forward,free}` |
-| [LlamaMoe (model orchestration)](#llamamoe-model-orchestration--zig-extension) | 4 | `kt_llama_moe_{new,free,load_weights,forward}` |
+| [LlamaMoe (model orchestration)](#llamamoe-model-orchestration--zig-extension) | 4 | `kt_llama_moe_{new,free,load_weights,forward}` — all 16 GGML weight formats |
 | [Quantize / dequantize (per-row)](#quantize--dequantize) | 6 | `kt_quantize/dequantize_{int8, int4_gptq, fp8_e4m3}` |
 | [GGML block formats (Q8_0 / Q4_K / Q5_K / Q6_K / Q8_K)](#ggml-block-formats) | 10 | `kt_quantize/dequantize_q{8_0,4_k,5_k,6_k,8_k}` |
+| [Generic block ↔ F32 dispatch](#generic-block--f32-dispatch) | 3 | `kt_to_float`, `kt_from_float`, `kt_type_row_bytes` |
 | [GGML block matmul](#ggml-block-matmul) | 5 | `kt_matmul_q{8_0,4_k,5_k,6_k,8_k}` |
-| [FP8 layerwise transport](#fp8-layerwise-transport) | 10 | `kt_fp8_layerwise_init`, `kt_fp8_transport_{new,free,close,closed,rank,tp_size,num_experts,run_producer,wait}` |
+| [Scalar GEMM helpers](#scalar-gemm-helpers-bf16--int8--int4-gptq--fp8) | 4 | `kt_matmul_{bf16,int8,int4,fp8}` |
+| [FP8 layerwise transport](#fp8-layerwise-transport) | 14 | `kt_fp8_layerwise_init`, `kt_fp8_transport_*`, `kt_fp8_{quantize,dequantize}(_block)` |
+| [Custom allocator](#custom-allocator-injection) | 1 | `kt_set_default_allocator` |
 | [GGML init (no-op stub)](#ggml-init) | 1 | `kt_ggml_init` |
 
-**105 symbols total** in the C ABI (header is the contract, verified by
+**112 symbols total** in the C ABI (header is the contract, verified by
 `tools/verify_abi.py`). The math primitives
 (`kt_apply_swiglu` / `kt_apply_rms_norm` / `kt_apply_rope` / `kt_softmax`)
 exist as `export fn` in `src/main.zig` and are emitted into the .so, but are
@@ -85,6 +88,7 @@ big-endian bit order). `count` is the number of elements (not bytes).
 KT_WorkerPool* kt_worker_pool_new(int thread_count);
 KT_WorkerPool* kt_worker_pool_new_config(kt_worker_pool_config_t config);  // NUMA-aware
 void kt_worker_pool_free(KT_WorkerPool* pool);
+int kt_worker_pool_get_thread_num(KT_WorkerPool* pool);
 ```
 
 `thread_count` ≤ 0 means "use the hardware parallelism". For NUMA topology
@@ -92,6 +96,8 @@ control (sub-pools pinned to specific nodes), use `new_config` with
 `kt_worker_pool_config_t.subpool_count` / `subpool_numa_map` /
 `subpool_thread_count` arrays. Worker pools are reference-counted by the
 CPUInfer that owns them; free via the CPUInfer, not directly.
+`kt_worker_pool_get_thread_num` returns the live thread count — useful for
+sizing caller-side scratch (e.g. per-thread accumulation buffers).
 
 ---
 
@@ -205,6 +211,23 @@ non-zero to do an in-place accumulate (avoid clearing the output first).
 cache; `backward` then consumes it to compute the six LoRA grads plus base
 weight grads. `update_lora_weights` swaps the active LoRA matrices without
 rebuilding the MoE.
+
+### Per-expert step APIs (Zig extension)
+
+```c
+void kt_moe_forward_gate_up(KT_MOE* moe, int expert_idx, int qlen,
+                            const void* input, void* gate_output, void* up_output);
+void kt_moe_forward_down(KT_MOE* moe, int expert_idx, int qlen,
+                         const void* input, void* output);
+```
+
+Splits the per-expert pass so callers can interleave custom ops between the
+gate+up projection and the down projection (e.g. an alternate SwiGLU
+variant). `forward_gate_up` writes the raw gate and up rows for one expert
+(`gate_output`/`up_output` are `[qlen, intermediate]` F32); `forward_down`
+consumes the caller's intermediate (`input`, `[qlen, intermediate]` F32)
+and writes `[qlen, hidden]` F32 — the weighted sum across experts is the
+caller's job with these entry points. Requires `load_weights` first.
 
 ---
 
@@ -396,6 +419,27 @@ parameter that some signatures have is accepted for ABI stability but ignored
 **Failure mode**: calling `forward` before `load_weights` aborts — this mirrors
 the C++ reference where `forward()` throws "Not Loaded".
 
+### MLA single-sequence conveniences
+
+```c
+void kt_mla_prefill(KT_MLA* mla, const void* input, void* output,
+                    int qlen, const int64_t* position_ids);
+void kt_mla_decode(KT_MLA* mla, const void* input, void* output,
+                   int64_t position);
+void kt_mla_update_kv_cache(KT_MLA* mla, void* kv_cache,
+                            const void* new_kv, int64_t position);
+```
+
+Wrappers for the single-sequence prefill/decode shapes (the paged/batched
+`kt_mla_forward` is the canonical contract; the C++ reference exposes these
+shapes via its paged-attention queues). `kt_mla_prefill` runs `qlen` tokens
+whose absolute positions are given by `position_ids` (RoPE applies at those
+positions, KV appended at the tail); `kt_mla_decode` runs one token at
+`position`. `kt_mla_update_kv_cache` accepts an external cache for API
+symmetry with the C++ binding but currently ignores it — the engine's
+internal `MlaKvCache` is the source of truth. Prefer `kt_mla_forward` with
+`qlen_count=1` for new code; these wrappers exist for drop-in parity.
+
 ---
 
 ## Quantize / dequantize (per-row)
@@ -447,6 +491,44 @@ for the K-quants). The block sizes:
 Quantize one row at a time (`k` is the row length in elements). The dequant
 functions reconstruct an F32 row.
 
+### The other 10 GGML formats (Zig-only, no C exports)
+
+Q2_K, Q3_K, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, IQ1_S, IQ1_M are fully
+implemented (quantize + dequantize + GEMM, byte-exact vs `ggml-common.h`)
+but **intentionally have no `kt_*` C exports** — their per-row byte sizes
+differ per type and a generic `(src, dst, n)` signature would be ambiguous.
+They are reachable in two ways:
+
+1. **`kt_llama_moe_*`** — the LlamaMoe config takes any of the 16 formats
+   per projection (`gate_type`/`up_type`/`down_type`); the dispatch lives in
+   `src/kernels/moe/llamafile_moe.zig::gemmQuant`.
+2. **Zig API** — import the kernel modules directly
+   (`src/kernels/amx/gemm_224_iq2_xxs.zig` etc.) when building Zig-native
+   consumers.
+
+The header comment near `kt_to_float` says "use the per-type
+`kt_dequantize_iq*` / `kt_quantize_iq*` exports" — those exports do NOT
+exist (see [Known gaps](#known-gaps-this-doc-not-the-c-header)).
+
+### Generic block ↔ F32 dispatch
+
+```c
+int kt_to_float(const void* src, float* dst, size_t n, int type);
+int kt_from_float(const float* src, void* dst, size_t n, int type);
+int kt_type_row_bytes(size_t n, int type);
+```
+
+Ports llama.cpp's `to_float`/`from_float`: one entry point per direction,
+dispatching on `kt_type_t`. `kt_to_float(src, dst, n, type)` dequantizes
+`n` weights of `type` starting at `src` into `dst[0..n]` F32;
+`kt_from_float` is the reverse. Covers the 8 linear (non-IQ) GGML formats
+(F32, F16, BF16, Q8_0, Q4_K, Q5_K, Q6_K, Q8_K) — the I-quants and
+1-bit formats are intentionally not dispatched (different per-row size
+semantics; see the note above). Returns 0 on success, -1 on unsupported
+type. `kt_type_row_bytes(n, type)` gives the source byte size for one row
+of `n` elements in `type` (0 if unsupported) — use it to size `dst` before
+calling `kt_from_float`, or to walk a weight blob row by row.
+
 ---
 
 ## GGML block matmul
@@ -484,17 +566,38 @@ trailing group explicitly (both even and odd `k_tail`).
 ### I-quants (grid-based, sub-3-bit)
 
 The non-linear I-quants (IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL,
-IQ4_XS) are also byte-exact vs llama.cpp and live in
+IQ4_XS, IQ1_S, IQ1_M) are also byte-exact vs llama.cpp and live in
 `src/kernels/amx/gemm_224_iq*.zig`. They use grid-based magnitude
-lookups (256–512 entry precomputed tables, fingerprint-matched via the
-2-bit kmap from `src/kernels/amx/iq2xs_init.zig`) plus per-block
-scales and per-weight sign bytes. Quantize is real for the 2-bit
-formats (IQ2_XXS, IQ2_XS); the rest have quantize stubbed in
-llama.cpp too and only dequant + GEMM are ported here. The byte
-layouts match `ggml-common.h` so a `.gguf` with I-quant weights
-drops in without preprocessing. Useful when you need to load a
-sub-3-bpw GGUFs (e.g. the IQ2_XXS GGUFs in `/ai/models/`) and want
-to do the dequant inside the matmul.
+lookups (256–2048 entry precomputed tables, fingerprint-matched via the
+kmap from `src/kernels/amx/{iq2xs_init,iq3xs_init}.zig`) plus per-block
+scales and per-weight sign bytes. **Quantize is real for ALL of them**
+(the grid-search ports of `quantize_row_iq*_impl` from ggml-quants.c,
+including the 1-bit IQ1_S/IQ1_M delta-code split search); the kmap init
+is histogram-based and process-cached (~6s worst case, iq1s). The byte
+layouts match `ggml-common.h` so a `.gguf` with I-quant weights drops in
+without preprocessing. Useful when you need to load sub-3-bpw GGUFs and
+want to do the dequant inside the matmul.
+
+### Scalar GEMM helpers (BF16 / INT8 / INT4 GPTQ / FP8)
+
+```c
+void kt_matmul_bf16(const void* a, const void* b, float* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+void kt_matmul_int8(const void* a, const void* b, int* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+void kt_matmul_int4(const void* a, const void* b, float* c,
+                    size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+void kt_matmul_fp8(const void* a, const void* b, const float* b_scales, float* c,
+                   size_t m, size_t n, size_t k, size_t lda, size_t ldb, size_t ldc);
+```
+
+The non-GGML scalar GEMMs (the kernels behind Linear/MLP when you're not
+using the GGML block formats). `C[m,n] = A[m,k] × B[n,k]ᵀ`; `kt_matmul_int8`
+writes **int32** accumulators (its `c` is `int*`), the others F32.
+`kt_matmul_fp8` takes per-block `b_scales` (one f32 per `block_size`
+columns of B, matching `kt_quantize_fp8_e4m3`). These are the same
+numerics as the Linear/MLP paths; exposed for callers that just want
+one GEMM without a context object.
 
 ---
 
@@ -562,6 +665,24 @@ The callback receives four arrays of `tp_size` host pointer values, one per
 and error fields (`poisoned`, `error_code`, `error_rank`, `error_message`)
 populated on protocol violations (e.g. `wait` called for a never-produced
 epoch). See `tests/kernels/fp8_transport_tests.zig` for a worked example.
+
+### FP8 E4M3 quantize / dequantize
+
+```c
+void kt_fp8_quantize(const void* config, const float* src, uint8_t* dst, size_t count);
+void kt_fp8_dequantize(const void* config, const uint8_t* src, float* dst, size_t count);
+void kt_fp8_quantize_block(const float* src, uint8_t* dst, float* scales,
+                           size_t num_blocks, int block_size);
+void kt_fp8_dequantize_block(const uint8_t* src, const float* scales,
+                             float* dst, size_t num_blocks, int block_size);
+```
+
+The scalar FP8 E4M3 conversions behind the layerwise transport. The
+`_block` variants do per-`block_size` scaling (one f32 scale per block,
+commonly 128) — the same numerics as `kt_quantize_fp8_e4m3` /
+`kt_dequantize_fp8_e4m3` under a batched (num_blocks) shape. The non-block
+`kt_fp8_quantize/dequantize` take an opaque `config` pointer for symmetry
+with the C++ fused variants; pass NULL (unit scale).
 
 ---
 
@@ -729,10 +850,19 @@ void kt_llama_moe_forward(KT_LlamaMoe* moe, int qlen, int k, const int64_t* expe
                          const float* weights, const void* input, void* output);
 ```
 
-**Supported (weight_type, hidden_type) pairs** in the first cut:
-  weight_type ∈ {Q8_0, Q4_K, Q5_K, Q6_K, Q8_K}
+**Supported (weight_type, hidden_type) pairs**:
+  weight_type ∈ **all 16 GGML formats** — {Q8_0, Q4_K, Q5_K, Q6_K, Q8_K,
+  Q2_K, Q3_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS,
+  IQ1_S, IQ1_M}
   hidden_type = BF16
   vec_dot_type for gate/up/down activations = Q8_0 (the llama.cpp default)
+
+Each projection can use a DIFFERENT format (e.g. gate Q8_0 / up Q4_K /
+down Q8_0 — the common llama.cpp mix). The dispatch table
+(`gemmQuant` in `src/kernels/moe/llamafile_moe.zig`) maps each
+`kt_type_t` to its GEMM kernel; the KT_TYPE constants and per-format
+block byte-sizes are comptime-audited against `main.zig`'s `kt_type_t`
+enum and the real block structs (a test pins every arm of the dispatch).
 
 **Algorithm** (per expert, per m_block):
   1. `gate_out = weights[gate] × input_vec`           (Q4_K × Q8_0 → F32, on-the-fly dequant)
@@ -742,20 +872,23 @@ void kt_llama_moe_forward(KT_LlamaMoe* moe, int qlen, int k, const int64_t* expe
   5. `output = weights[down] × intermediate_vec`       (Q4_K × Q8_0 → F32)
   6. Weighted add into the per-token output buffer
 
-**First-cut implementation** (`src/kernels/moe/llamafile_moe.zig`):
+**Implementation** (`src/kernels/moe/llamafile_moe.zig`):
 the Zig port avoids re-implementing llamafile_sgemm by dequantizing the
-Q8_0 activation to BF16 and calling the existing `kt_matmul_q*` (which
-take BF16 × quantized weights → F32). The byte-level dequant is exact
-vs llama.cpp, so the numerical result matches the C++ sgemm. A follow-up
-can add a true Q4_K × Q8_0 matmul to skip the BF16 round-trip.
+Q8_0 activation to BF16 and calling the per-format GEMM kernels (BF16 ×
+quantized weights → F32, via the `gemmQuant` dispatch covering all 16
+formats). The byte-level dequant is exact vs llama.cpp, so the numerical
+result matches the C++ sgemm. A follow-up can add true fused
+q×q matmuls to skip the BF16 round-trip.
 
-**Limitations (first cut)**:
+**Limitations**:
   - Single-token `forward_one` path only; `forward_many` (batched
     per-m-block parallelism via work-stealing) is a follow-up. The
     qlen > 1 path falls back to per-token `forward_one` in the C ABI.
   - The TP path processes `tp_part_idx = 0` only (the C++ exposes a
     subpool index; the Zig port accepts the pool and uses its default
     subpool for now). NUMA binding is owned by the worker pool.
+  - `gpu_experts_mask` (SGLang-style GPU-offload skip) is honored on
+    the Zig side; the C config field passes it through.
 
 **Lifecycle** (same pattern as the other model orchestration):
   pool = kt_worker_pool_new(0)                   // any pool
@@ -764,6 +897,34 @@ can add a true Q4_K × Q8_0 matmul to skip the BF16 round-trip.
   kt_llama_moe_load_weights(moe, complete_intermediate_size, offset)
   kt_llama_moe_forward(moe, qlen, k, expert_ids, weights, input, output)
   kt_llama_moe_free(moe)                          // frees per-expert storage + scratch
+
+---
+
+## Custom allocator injection
+
+```c
+typedef struct kt_allocator_vtable {
+    void* userdata;
+    uint8_t* (*alloc)(void* userdata, size_t size, size_t alignment);
+    void (*free)(void* userdata, uint8_t* ptr, size_t size, size_t alignment);
+    int (*resize)(void* userdata, uint8_t* ptr, size_t old_size,
+                  size_t new_size, size_t alignment);  /* 0 ok, -1 unsupported */
+} kt_allocator_vtable;
+void kt_set_default_allocator(const kt_allocator_vtable* vtable);
+```
+
+Installs a C-ABI allocator used by every subsequent `kt_*_new` construction
+and by per-call scratch. Call it BEFORE creating any context. Pass `NULL` to
+restore the built-in default (mmap-backed page allocator). `resize` may
+return -1 (unsupported); the runtime falls back to alloc+copy+free.
+
+**Capture semantics**: every context captures the allocator at `*_new` time
+and frees through the CAPTURED one — swapping the default between `new` and
+`free` is safe, and a `*_free` never reads the current default. This lets a
+host application inject a tracking/pooling allocator, take a leak snapshot,
+and restore the default mid-session. Python/ctypes binding:
+`python/kt_kernel/__init__.py` wraps the vtable (CFUNCTYPEs) — see the
+end-to-end test in `tests/test_allocator.py`.
 
 ---
 
@@ -803,3 +964,11 @@ can add a true Q4_K × Q8_0 matmul to skip the BF16 round-trip.
 - `tools/verify_abi.py` only scans `zig-out/lib/`. If you build a `.so`
   by hand and copy it in, rename it to match the `libkt_kernel_ext_*`
   pattern, or remove it before running the verifier.
+- The `kt_to_float` header comment says "use the per-type
+  `kt_dequantize_iq*` / `kt_quantize_iq*` exports" for the formats the
+  generic dispatch doesn't cover — **those exports do not exist**. The
+  10 non-linear formats are reachable via `kt_llama_moe_*` or the Zig
+  API only (see
+  [The other 10 GGML formats](#the-other-10-ggml-formats-zig-only-no-c-exports)).
+  Either the comment should drop the reference or the exports should be
+  added; tracked as a follow-up.

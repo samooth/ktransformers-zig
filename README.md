@@ -19,34 +19,39 @@ ktransformers-zig/
 ├── build.zig              # Build system with multi-variant support
 ├── build.zig.zon          # Package configuration
 ├── include/
-│   └── kt_kernel.h        # C API header (matches ktransformers)
+│   └── kt_kernel.h        # C API contract (112 symbols, gated by tools/verify_abi.py)
+├── bindings/              # pybind11 shim (drop-in for kt_kernel_ext)
+├── python/                # ctypes bindings + wheel packaging
 ├── src/
-│   ├── main.zig           # C API exports
-│   ├── runtime/           # Thread pool, task queue, memory, CPU detection
-│   │   ├── memory.zig
-│   │   ├── worker_pool.zig
-│   │   ├── task_queue.zig
-│   │   └── cpu_detect.zig
+│   ├── main.zig           # C API exports (kt_*)
+│   ├── root.zig           # module hub + comptime fn-refs
+│   ├── io/gguf.zig        # GGUF v3 parser
+│   ├── runtime/           # Thread pool (NUMA-pinned), task queue, memory, CPU/L1-L3 detect
+│   ├── numa/              # NUMA syscalls (topology, mbind, affinity)
+│   ├── mla/               # MLA attention (DeepSeek-V2/V3) + KV cache
 │   └── kernels/
-│       ├── arch/          # Architecture-specific intrinsics
-│       │   └── amx.zig    # AMX tile instructions
-│       ├── amx/           # AMX GEMM kernels
-│       │   ├── buffers.zig
-│       │   ├── gemm_224_bf16.zig
-│       │   └── gemm_224_int8.zig
-│       └── moe/           # MoE orchestration
-│           └── moe.zig
-└── tests/
-    └── kernels/
-        └── test_kernels.zig
+│       ├── arch/          # AMX/NEON intrinsics + runtime CPU guards
+│       ├── amx/           # GEMM kernels: BF16, INT8/INT4, FP8, MXFP4/8,
+│       │                  #   + all 15 GGML formats (Q8_0, Q*_K, IQ*_*)
+│       │                  #   with quantize+dequantize+GEMM per format
+│       ├── attn/          # vanilla MHA engine
+│       ├── qwen3/         # Qwen3-MoE model orchestration
+│       └── moe/           # MoE (DeepSeek routing), LlamaMoe (GGML-quantized
+│                          #   GGUF MoE, all 16 weight formats), SFT/LoRA
+├── tests/                 # 210+ tests across the suites (zig build test)
+├── bench/                 # GEMM + MoE micro-benchmarks (ReleaseFast)
+└── tools/                 # ABI gates: verify_abi.py, audit_layout.py
 ```
 
 ## Features
 
-- **CPU Variants**: AVX2, AVX512_base, AVX512_VNNI, AVX512_VBMI, AVX512_BF16, AMX
-- **Quantization**: BF16, INT8 (per-row), INT4 (GPTQ), FP8 E4M3, MXFP4, MXFP8
-- **Tensor Parallelism**: NUMA-aware weight splitting across sockets
-- **Python Compatible**: C API matches `kt_kernel_ext.so` for pybind11
+- **CPU Variants**: AVX2, AVX512_base, AVX512_VNNI, AVX512_VBMI, AVX512_BF16, AMX (+ aarch64 NEON cross-build)
+- **Quantization**: BF16, INT8 (per-row), INT4 (GPTQ), FP8 E4M3, MXFP4, MXFP8, and **all 15 GGML block formats** (Q8_0, Q2_K–Q8_K, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS, IQ1_S/M) — quantize + dequantize + GEMM, byte-exact vs llama.cpp
+- **MoE backends**: DeepSeek-V3 group-top2 routing, LlamaMoe for GGUF checkpoints (16 weight formats per projection), SFT/LoRA forward+backward
+- **Attention**: MLA (DeepSeek-V2/V3, paged/batched) + vanilla MHA
+- **Model orchestration**: DeepseekV3 and Qwen3-MoE decoder stacks (C API `kt_dsv3_*` / `kt_qwen3moe_*`)
+- **Runtime**: NUMA-aware worker pool (sched_setaffinity pinning, mbind), injectable allocator (`kt_set_default_allocator`)
+- **Python Compatible**: C API matches `kt_kernel_ext.so` (pybind11 shim + ctypes path)
 
 ## Building
 

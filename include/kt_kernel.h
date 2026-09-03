@@ -611,11 +611,11 @@ void kt_matmul_fp8(const void* a, const void* b, const float* b_scales, float* c
 // Q5_K, Q6_K, Q8_K. IQ formats (IQ2_XXS, IQ2_XS, IQ3_XXS, IQ4_XS, IQ4_NL,
 // IQ1_S, IQ1_M, IQ2_S, IQ3_S) are intentionally NOT dispatched here —
 // their block layouts have different per-row sizes and dispatching on a
-// single `n` would need different "n" semantics per type. Callers should
-// use the per-type `kt_dequantize_iq*` / `kt_quantize_iq*` exports for those.
+// single `n` would need different "n" semantics per type. There are no
+// per-type C exports for them either: use kt_llama_moe_* (which takes all
+// 16 formats per projection) or the Zig kernel modules directly.
 //
-// Returns 0 on success, -1 on unsupported type (caller should fall back to
-// the per-type exports).
+// Returns 0 on success, -1 on unsupported type.
 int kt_to_float(const void* src, float* dst, size_t n, int type);
 int kt_from_float(const float* src, void* dst, size_t n, int type);
 // Source byte size for one row of `n` elements in `type` format. 0 if unsupported.
@@ -805,7 +805,9 @@ typedef struct kt_llama_moe_config_t {
     size_t layer_idx;
     void* pool;                       /* KT_WorkerPool* or NULL */
 
-    /* GGML types (kt_type_t): {KT_TYPE_Q8_0, KT_TYPE_Q4_K, KT_TYPE_Q5_K, KT_TYPE_Q6_K, KT_TYPE_Q8_K} */
+    /* GGML types (kt_type_t): any of the 16 GGML formats — Q8_0, Q4_K,
+       Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS,
+       IQ3_S, IQ4_NL, IQ4_XS, IQ1_S, IQ1_M. Each projection may differ. */
     uint32_t gate_type;
     uint32_t up_type;
     uint32_t down_type;
