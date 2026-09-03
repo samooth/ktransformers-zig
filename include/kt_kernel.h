@@ -761,4 +761,67 @@ void kt_qwen3moe_causallm_forward(KT_Qwen3MoeCausalLM* clm, size_t qlen, size_t 
                                   const void* input, float* logits);
 void kt_qwen3moe_causallm_free(KT_Qwen3MoeCausalLM* clm);
 
+// ============================================================================
+// LlamaMoe (Zig extension) — GGML-quantized MoE for GGUF checkpoints
+// ============================================================================
+// Ports the C++ LLAMA_MOE_TP from ktransformers/kt-kernel/operators/llamafile/moe.hpp.
+// The framework's archive/experts.py uses this as the default backend for
+// GGUF-loaded checkpoints (the .gguf weights are passed in directly, no
+// re-quantization needed). Supported weight types: Q8_0, Q4_K, Q5_K, Q6_K, Q8_K.
+// hidden_type must be KT_TYPE_BF16. The activation vec_dot_type is Q8_0.
+//
+// First cut: forward_one path (single-token decode). The qlen > 1 path
+// falls back to per-token forward_one (correct, not optimal — see
+// src/kernels/moe/llamafile_moe.zig for the followup).
+//
+// Pool requirement: a KT_WorkerPool* must be passed in (this differs from
+// the C++ which uses a NUMA subpool index). Pass NULL to use the default
+// subpool (the one created by kt_worker_pool_new).
+typedef struct kt_llama_moe_config_t {
+    /* dims */
+    size_t expert_num;
+    size_t num_experts_per_tok;
+    size_t hidden_size;
+    size_t intermediate_size;
+
+    size_t layer_idx;
+    void* pool;                       /* KT_WorkerPool* or NULL */
+
+    /* GGML types (kt_type_t): {KT_TYPE_Q8_0, KT_TYPE_Q4_K, KT_TYPE_Q5_K, KT_TYPE_Q6_K, KT_TYPE_Q8_K} */
+    uint32_t gate_type;
+    uint32_t up_type;
+    uint32_t down_type;
+    uint32_t hidden_type;              /* must be KT_TYPE_BF16 */
+
+    /* tile geometry */
+    size_t m_block;
+    size_t group_min_len;
+    size_t group_max_len;
+
+    /* optional SGLang-style GPU offload mask (1 byte per expert, 1 = skip) */
+    const uint8_t* gpu_experts_mask;
+
+    /* weights: raw GGML blocks, byte-exact vs llama.cpp.
+     *   gate_proj / up_proj:  [expert_num, intermediate, hidden] in <type> blocks
+     *   down_proj:            [expert_num, hidden, intermediate] in <type> blocks */
+    const void* gate_proj;
+    const void* up_proj;
+    const void* down_proj;
+} kt_llama_moe_config_t;
+
+typedef struct KT_LlamaMoe KT_LlamaMoe;
+
+KT_LlamaMoe* kt_llama_moe_new(const kt_llama_moe_config_t* config);
+void kt_llama_moe_free(KT_LlamaMoe* moe);
+/* Copy weights from the caller's GGUF buffer into the per-expert
+ * replicated storage. complete_intermediate_size is the full
+ * intermediate dim across all TP ranks (the Zig port processes one
+ * tp_part_idx = 0 for now). offset is the per-rank offset in
+ * intermediate_size units. */
+void kt_llama_moe_load_weights(KT_LlamaMoe* moe, int complete_intermediate_size, int offset);
+/* Forward: qlen tokens, each with k expert_ids and weights.
+ * input is BF16 [qlen, hidden], output is F32 [qlen, hidden]. */
+void kt_llama_moe_forward(KT_LlamaMoe* moe, int qlen, int k, const int64_t* expert_ids,
+                         const float* weights, const void* input, void* output);
+
 #endif // KTRANSFORMERS_C_API_H

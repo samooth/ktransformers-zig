@@ -260,6 +260,7 @@ pub const mha = @import("kernels/attn/mha.zig");
 pub const gguf = @import("io/gguf.zig");
 pub const qwen3_layer = @import("kernels/qwen3/qwen3_layer.zig");
 pub const qwen3_model = @import("kernels/qwen3/qwen3_model.zig");
+pub const llamafile_moe = @import("kernels/moe/llamafile_moe.zig");
 comptime {
     _ = &mha.MhaEngine.init;
     _ = &mha.MhaEngine.deinit;
@@ -281,6 +282,10 @@ comptime {
     _ = &qwen3_model.Qwen3MoeForCausalLM.init;
     _ = &qwen3_model.Qwen3MoeForCausalLM.forward;
     _ = &qwen3_model.Qwen3MoeForCausalLM.deinit;
+    _ = &llamafile_moe.LlamaMoe.init;
+    _ = &llamafile_moe.LlamaMoe.deinit;
+    _ = &llamafile_moe.LlamaMoe.forward;
+    _ = &llamafile_moe.LlamaMoe.loadWeights;
 }
 
 // NEON Phase-2: force analysis of the NEON-vectorized BF16 GEMM. The

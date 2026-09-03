@@ -27,6 +27,7 @@ be gated behind the verifier.
 | [MLA (attention)](#mla) | 4 | `kt_mla_new`, `_load_weights`, `_free`, `_forward` |
 | [Qwen3 MoE (model orchestration)](#qwen3-moe-model-orchestration) | 9 | `kt_qwen3moe_{layer,model,causallm}_{new,forward,free}` |
 | [DeepseekV3 (model orchestration)](#deepseekv3-model-orchestration) | 9 | `kt_dsv3_{layer,model,causallm}_{new,forward,free}` |
+| [LlamaMoe (model orchestration)](#llamamoe-model-orchestration--zig-extension) | 4 | `kt_llama_moe_{new,free,load_weights,forward}` |
 | [Quantize / dequantize (per-row)](#quantize--dequantize) | 6 | `kt_quantize/dequantize_{int8, int4_gptq, fp8_e4m3}` |
 | [GGML block formats (Q8_0 / Q4_K / Q5_K / Q6_K / Q8_K)](#ggml-block-formats) | 10 | `kt_quantize/dequantize_q{8_0,4_k,5_k,6_k,8_k}` |
 | [GGML block matmul](#ggml-block-matmul) | 5 | `kt_matmul_q{8_0,4_k,5_k,6_k,8_k}` |
@@ -705,6 +706,64 @@ zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu
 The neon variant requires an aarch64 target — passing `-Dvariant=neon` without
 `-Dtarget=aarch64-linux-gnu` exits with a clear error rather than silently
 building a meaningless x86 "neon" library.
+
+---
+
+## LlamaMoe (model orchestration — Zig extension)
+
+The GGML-quantized MoE for GGUF checkpoints. Ports the C++ `LLAMA_MOE_TP` from
+`ktransformers/kt-kernel/operators/llamafile/moe.hpp` — the framework's
+`archive/experts.py` uses this as the default backend for GGUF-loaded
+checkpoints (the .gguf weights are passed in directly, no re-quantization
+needed). The class wraps the C++ path of:
+  1. Convert hidden activations to the gate's vec_dot_type (Q8_0).
+  2. `llamafile_sgemm` for gate, up, down (per-expert per-m-block).
+  3. SwiGLU activation.
+  4. Weighted sum across top-k experts.
+
+```c
+KT_LlamaMoe* kt_llama_moe_new(const kt_llama_moe_config_t* config);
+void kt_llama_moe_free(KT_LlamaMoe* moe);
+void kt_llama_moe_load_weights(KT_LlamaMoe* moe, int complete_intermediate_size, int offset);
+void kt_llama_moe_forward(KT_LlamaMoe* moe, int qlen, int k, const int64_t* expert_ids,
+                         const float* weights, const void* input, void* output);
+```
+
+**Supported (weight_type, hidden_type) pairs** in the first cut:
+  weight_type ∈ {Q8_0, Q4_K, Q5_K, Q6_K, Q8_K}
+  hidden_type = BF16
+  vec_dot_type for gate/up/down activations = Q8_0 (the llama.cpp default)
+
+**Algorithm** (per expert, per m_block):
+  1. `gate_out = weights[gate] × input_vec`           (Q4_K × Q8_0 → F32, on-the-fly dequant)
+  2. `up_out = weights[up] × input_vec`                (ditto)
+  3. `intermediate = silu(gate_out) * up_out`          (SwiGLU)
+  4. Quantize `intermediate` to Q8_0
+  5. `output = weights[down] × intermediate_vec`       (Q4_K × Q8_0 → F32)
+  6. Weighted add into the per-token output buffer
+
+**First-cut implementation** (`src/kernels/moe/llamafile_moe.zig`):
+the Zig port avoids re-implementing llamafile_sgemm by dequantizing the
+Q8_0 activation to BF16 and calling the existing `kt_matmul_q*` (which
+take BF16 × quantized weights → F32). The byte-level dequant is exact
+vs llama.cpp, so the numerical result matches the C++ sgemm. A follow-up
+can add a true Q4_K × Q8_0 matmul to skip the BF16 round-trip.
+
+**Limitations (first cut)**:
+  - Single-token `forward_one` path only; `forward_many` (batched
+    per-m-block parallelism via work-stealing) is a follow-up. The
+    qlen > 1 path falls back to per-token `forward_one` in the C ABI.
+  - The TP path processes `tp_part_idx = 0` only (the C++ exposes a
+    subpool index; the Zig port accepts the pool and uses its default
+    subpool for now). NUMA binding is owned by the worker pool.
+
+**Lifecycle** (same pattern as the other model orchestration):
+  pool = kt_worker_pool_new(0)                   // any pool
+  config = kt_llama_moe_config_t{...}
+  moe = kt_llama_moe_new(&config)                 // validates types
+  kt_llama_moe_load_weights(moe, complete_intermediate_size, offset)
+  kt_llama_moe_forward(moe, qlen, k, expert_ids, weights, input, output)
+  kt_llama_moe_free(moe)                          // frees per-expert storage + scratch
 
 ---
 

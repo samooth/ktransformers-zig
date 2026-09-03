@@ -25,6 +25,7 @@ pub const gemm_q5_k = root.gemm_q5_k;
 pub const gemm_q6_k = root.gemm_q6_k;
 pub const gemm_q8_k = root.gemm_q8_k;
 const moe = root.moe;
+const llamafile_moe = root.llamafile_moe;
 const moe_sft = root.moe_sft;
 // MLA: pub so C-API tests (rooted here) can reference the config/cache
 // types; no ABI effect.
@@ -825,6 +826,123 @@ export fn kt_moe_new(cpuinfer: *KT_CPUInfer, config: kt_moe_config_t) *KT_MOE {
     const moe_inst = allocator.create(moe.TpMoe) catch @panic("OOM");
     moe_inst.* = moe.TpMoe.init(cfg, allocator) catch @panic("Failed to init MoE");
     return @ptrCast(moe_inst);
+}
+
+// ============================================================================
+// LlamaMoe (Zig extension) — GGML-quantized MoE for GGUF checkpoints.
+// Ports the C++ LLAMA_MOE_TP from ktransformers/kt-kernel/operators/llamafile/moe.hpp.
+// Used as the default backend by the framework's archive/experts.py when
+// loading GGUF checkpoints. Supports weight types {Q8_0, Q4_K, Q5_K, Q6_K, Q8_K}
+// with BF16 hidden activations and Q8_0 vec_dot_type for the activations.
+// See src/kernels/moe/llamafile_moe.zig for the full design.
+// ============================================================================
+pub const kt_llama_moe_config_t = extern struct {
+    expert_num: usize,
+    num_experts_per_tok: usize,
+    hidden_size: usize,
+    intermediate_size: usize,
+
+    layer_idx: usize = 0,
+    pool: ?*anyopaque = null, // KT_WorkerPool* or null (not supported in this build)
+
+    // GGML types (kt_type_t): {KT_TYPE_Q8_0, KT_TYPE_Q4_K, KT_TYPE_Q5_K, KT_TYPE_Q6_K, KT_TYPE_Q8_K}.
+    // hidden_type must be KT_TYPE_BF16.
+    gate_type: u32,
+    up_type: u32,
+    down_type: u32,
+    hidden_type: u32 = 2, // KT_TYPE_BF16
+
+    // Tile geometry.
+    m_block: usize = 32,
+    group_min_len: usize = 32,
+    group_max_len: usize = 1024,
+
+    // Optional SGLang-style GPU offload mask (1 byte per expert, 1 = skip).
+    gpu_experts_mask: ?*const u8 = null,
+
+    // Weight pointers (raw GGML blocks, byte-exact vs llama.cpp).
+    //   gate_proj:  [expert_num, intermediate_size, hidden_size] in gate_type blocks
+    //   up_proj:    [expert_num, intermediate_size, hidden_size] in up_type blocks
+    //   down_proj:  [expert_num, hidden_size, intermediate_size] in down_type blocks
+    gate_proj: [*]const u8 = undefined,
+    up_proj: [*]const u8 = undefined,
+    down_proj: [*]const u8 = undefined,
+};
+
+fn toLlamaConfig(c: kt_llama_moe_config_t) llamafile_moe.LlamaConfig {
+    return .{
+        .expert_num = c.expert_num,
+        .num_experts_per_tok = c.num_experts_per_tok,
+        .hidden_size = c.hidden_size,
+        .intermediate_size = c.intermediate_size,
+        .layer_idx = c.layer_idx,
+        .pool = if (c.pool) |p| @ptrCast(@alignCast(p)) else null,
+        .gate_type = c.gate_type,
+        .up_type = c.up_type,
+        .down_type = c.down_type,
+        .hidden_type = c.hidden_type,
+        .m_block = c.m_block,
+        .group_min_len = c.group_min_len,
+        .group_max_len = c.group_max_len,
+        .gpu_experts_mask = if (c.gpu_experts_mask) |p| @as([*]const u8, @ptrCast(p)) else null,
+        .gate_proj = c.gate_proj,
+        .up_proj = c.up_proj,
+        .down_proj = c.down_proj,
+    };
+}
+
+const KT_LlamaMoe = opaque {};
+
+pub export fn kt_llama_moe_new(config: *const kt_llama_moe_config_t) *KT_LlamaMoe {
+    const allocator = defaultAllocator();
+    const init_res = llamafile_moe.LlamaMoe.init(allocator, toLlamaConfig(config.*), 0);
+    const moe_inst = init_res catch @panic("Failed to init LlamaMoe (check pool + weight types)");
+    return @ptrCast(moe_inst);
+}
+
+pub export fn kt_llama_moe_free(llm: *KT_LlamaMoe) void {
+    const m: *llamafile_moe.LlamaMoe = @ptrCast(@alignCast(llm));
+    m.deinit();
+}
+
+pub export fn kt_llama_moe_load_weights(
+    llm: *KT_LlamaMoe,
+    complete_intermediate_size: c_int,
+    offset: c_int,
+) void {
+    const m: *llamafile_moe.LlamaMoe = @ptrCast(@alignCast(llm));
+    m.loadWeights(@intCast(complete_intermediate_size), @intCast(offset));
+}
+
+pub export fn kt_llama_moe_forward(
+    llm: *KT_LlamaMoe,
+    qlen: c_int,
+    k: c_int,
+    expert_ids: [*]const i64,
+    weights: [*]const f32,
+    input: [*]const u8,
+    output: [*]f32,
+) void {
+    const m: *llamafile_moe.LlamaMoe = @ptrCast(@alignCast(llm));
+    // First cut: forward_one (single-token decode). The qlen > 1 path
+    // (forward_many) is a follow-up — the per-row buffers (m_*) are
+    // not yet allocated.
+    if (qlen == 1) {
+        m.forward(@intCast(k), expert_ids, weights, input, output);
+    } else {
+        // Loop: call forward_one per token (correct, not optimal).
+        for (0..@as(usize, @intCast(qlen))) |i| {
+            const in_off: usize = i * m.config.hidden_size * 2; // BF16 = 2 bytes
+            const out_off: usize = i * m.config.hidden_size;
+            m.forward(
+                @intCast(k),
+                expert_ids + i * @as(usize, @intCast(k)),
+                weights + i * @as(usize, @intCast(k)),
+                input + in_off,
+                output + out_off,
+            );
+        }
+    }
 }
 
 export fn kt_moe_new_sft(cpuinfer: *KT_CPUInfer, config: kt_moe_sft_config_t) *KT_MOE {
