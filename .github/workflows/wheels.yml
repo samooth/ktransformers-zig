@@ -26,7 +26,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: master
+          version: 0.16.0
       - name: Build ${{ matrix.variant }}
         run: zig build -Dvariant=${{ matrix.variant }}
       - name: Upload ${{ matrix.variant }} .so
@@ -43,7 +43,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: master
+          version: 0.16.0
       - name: Build all variants
         run: zig build all-variants
       # The ABI is a contract: every prototype in include/kt_kernel.h
@@ -67,7 +67,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v2
         with:
-          version: master
+          version: 0.16.0
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
