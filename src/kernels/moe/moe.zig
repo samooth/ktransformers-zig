@@ -395,7 +395,7 @@ pub fn routeExperts(
     // callers; future work: parallelize the matmul + topk across the
     // pool's threads.
     if (pool) |_| {}
-    var logits = allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
+    const logits = allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
     defer allocator.free(logits);
 
     gemm_bf16.gemmExpert(
@@ -448,7 +448,7 @@ pub fn routeExpertsDeepSeek(
         return;
     }
 
-    var logits = allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
+    const logits = allocator.alloc(f32, qlen * expert_num) catch @panic("OOM");
     defer allocator.free(logits);
 
     gemm_bf16.gemmExpert(
@@ -1026,9 +1026,9 @@ pub const TpMoe = struct {
         // to BF16. The gate_output/up_output params are BF16 arrays that may
         // not be 4-byte aligned (amx.bf16 = u16), so we can't pass them
         // directly to gemmExpert which writes f32.
-        var gate_f32 = std.heap.page_allocator.alloc(f32, m * n) catch @panic("OOM");
+        const gate_f32 = std.heap.page_allocator.alloc(f32, m * n) catch @panic("OOM");
         defer std.heap.page_allocator.free(gate_f32);
-        var up_f32 = std.heap.page_allocator.alloc(f32, m * n) catch @panic("OOM");
+        const up_f32 = std.heap.page_allocator.alloc(f32, m * n) catch @panic("OOM");
         defer std.heap.page_allocator.free(up_f32);
 
         for (0..self.tp_count) |t| {
@@ -1071,7 +1071,7 @@ pub const TpMoe = struct {
         const ldc = n;
 
         // Accumulate FP32 down output into the BF16 output (additive).
-        var down_buf = std.heap.page_allocator.alloc(f32, m * n) catch @panic("OOM");
+        const down_buf = std.heap.page_allocator.alloc(f32, m * n) catch @panic("OOM");
         defer std.heap.page_allocator.free(down_buf);
         @memset(down_buf, 0);
 

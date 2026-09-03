@@ -79,7 +79,7 @@ pub fn detectAmxSupport() bool {
           [edx] "={edx}" (edx),
         : [leaf] "{eax}" (@as(u32, 7)),
           [sub] "{ecx}" (@as(u32, 0)),
-        : "eax"
+        : .{ .eax = true }
     );
     const AMX_BF16: u32 = 1 << 22;
     const AMX_INT8: u32 = 1 << 25;
@@ -244,7 +244,7 @@ pub fn tile_loadconfig(cfg: *const TileConfig) void {
         "ldtilecfg (%[cfg])"
         :
         : [cfg] "r" (cfg),
-        : "memory"
+        : .{ .memory = true }
     );
 }
 
@@ -253,7 +253,7 @@ pub fn tile_loadconfig(cfg: *const TileConfig) void {
 pub fn tile_release() void {
     if (comptime !AmxFeatures.available) return;
     if (!detectAmxSupport()) return;
-    asm volatile ("tilerelease" ::: "memory");
+    asm volatile ("tilerelease" ::: .{ .memory = true });
 }
 
 /// Load tile from memory (row-major)
@@ -269,7 +269,7 @@ pub fn tile_loadd(tile: TileReg, ptr: *const u8, stride: usize) void {
         : [base] "r" (ptr),
           [stride] "r" (stride),
           [tmm] "n" (tmm),
-        : "memory"
+        : .{ .memory = true }
     );
 }
 
@@ -285,7 +285,7 @@ pub fn tile_stored(tile: TileReg, ptr: *u8, stride: usize) void {
         : [base] "r" (ptr),
           [stride] "r" (stride),
           [tmm] "n" (tmm),
-        : "memory"
+        : .{ .memory = true }
     );
 }
 
@@ -299,7 +299,7 @@ pub fn tile_zero(tile: TileReg) void {
         "tilezero %%tmm%[tmm]"
         :
         : [tmm] "n" (tmm),
-        : "memory"
+        : .{ .memory = true }
     );
 }
 
@@ -322,7 +322,7 @@ pub fn tile_dpbf16ps(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
         : [A] "n" (tmmA),
           [B] "n" (tmmB),
           [C] "n" (tmmC),
-        : "memory"
+        : .{ .memory = true }
     );
 }
 
@@ -341,7 +341,7 @@ pub fn tile_dpbssd(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
         : [A] "n" (tmmA),
           [B] "n" (tmmB),
           [C] "n" (tmmC),
-        : "memory"
+        : .{ .memory = true }
     );
 }
 

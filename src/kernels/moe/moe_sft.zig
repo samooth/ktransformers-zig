@@ -98,11 +98,11 @@ fn parallelSftTask(e: usize) void {
         const gate_lora_b_offset = e * ctx.self.lora_rank * inter;
         const up_lora_a_offset = e * ctx.self.lora_rank * hidden;
         const up_lora_b_offset = e * ctx.self.lora_rank * inter;
-        var u_gate = std.heap.page_allocator.alloc(f32, count * ctx.self.lora_rank) catch @panic("OOM");
+        const u_gate = std.heap.page_allocator.alloc(f32, count * ctx.self.lora_rank) catch @panic("OOM");
         defer std.heap.page_allocator.free(u_gate);
         lora.loraBf16MatmulT4r4(expert_in.ptr, gate_lora_a_ptr + gate_lora_a_offset, u_gate.ptr, count, hidden, ctx.self.lora_rank);
         lora.loraFp32Bf16FusedAddTransposed(u_gate.ptr, gate_lora_b_ptr + gate_lora_b_offset, gate_bf16.ptr, count, ctx.self.lora_rank, inter, ctx.self.lora_scaling);
-        var u_up = std.heap.page_allocator.alloc(f32, count * ctx.self.lora_rank) catch @panic("OOM");
+        const u_up = std.heap.page_allocator.alloc(f32, count * ctx.self.lora_rank) catch @panic("OOM");
         defer std.heap.page_allocator.free(u_up);
         lora.loraBf16MatmulT4r4(expert_in.ptr, up_lora_a_ptr + up_lora_a_offset, u_up.ptr, count, hidden, ctx.self.lora_rank);
         lora.loraFp32Bf16FusedAddTransposed(u_up.ptr, up_lora_b_ptr + up_lora_b_offset, up_bf16.ptr, count, ctx.self.lora_rank, inter, ctx.self.lora_scaling);
@@ -324,7 +324,7 @@ pub const TpMoeSft = struct {
                     const up_lora_b_offset = e * self.lora_rank * inter;
 
                     // u_gate = input @ gate_lora_A^T
-                    var u_gate = std.heap.page_allocator.alloc(f32, count * self.lora_rank) catch @panic("OOM");
+                    const u_gate = std.heap.page_allocator.alloc(f32, count * self.lora_rank) catch @panic("OOM");
                     defer std.heap.page_allocator.free(u_gate);
                     lora.loraBf16MatmulT4r4(
                         expert_input.ptr,
@@ -346,7 +346,7 @@ pub const TpMoeSft = struct {
                     );
 
                     // u_up = input @ up_lora_A^T
-                    var u_up = std.heap.page_allocator.alloc(f32, count * self.lora_rank) catch @panic("OOM");
+                    const u_up = std.heap.page_allocator.alloc(f32, count * self.lora_rank) catch @panic("OOM");
                     defer std.heap.page_allocator.free(u_up);
                     lora.loraBf16MatmulT4r4(
                         expert_input.ptr,

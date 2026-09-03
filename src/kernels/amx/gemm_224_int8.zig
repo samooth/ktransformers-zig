@@ -302,7 +302,7 @@ pub const Int8BufferB = struct {
 
                     // Quantize this row
                     const row_src = src[n_idx * src_ld + k_start..][0..k_actual];
-                    var row_dst = self.ptr[n_blk * (self.k * self.n_block) +
+                    const row_dst = self.ptr[n_blk * (self.k * self.n_block) +
                                            k_blk * (self.n_block * self.k_step * self.n_step) +
                                            n_off * (self.k_step * self.n_step) ..][0..k_actual];
 
@@ -337,7 +337,7 @@ pub const Int8BufferB = struct {
                     const row_src = self.ptr[n_blk * (self.k * self.n_block) +
                                            k_blk * (self.n_block * self.k_step * self.n_step) +
                                            n_off * (self.k_step * self.n_step) ..][0..k_actual];
-                    var row_dst = dst[n_idx * dst_ld + k_start..][0..k_actual];
+                    const row_dst = dst[n_idx * dst_ld + k_start..][0..k_actual];
 
                     buffers.dequantizeRowInt8ToBF16(row_src.ptr, scale, row_dst.ptr, k_actual);
                 }

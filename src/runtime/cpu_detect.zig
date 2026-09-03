@@ -270,7 +270,7 @@ fn detectCpuLinux(allocator: Allocator, io: *std.Io.Threaded) !CpuInfo {
 
     // A4: detect the cache hierarchy from sysfs. Best-effort: on
     // failure (no sysfs, container, etc.) the CpuInfo defaults hold.
-    var cache = detectCacheLinux(allocator, io);
+    const cache = detectCacheLinux(allocator, io);
 
     return CpuInfo{
         .vendor = vendor,
