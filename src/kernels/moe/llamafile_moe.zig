@@ -3,7 +3,7 @@
 // Ports the C++ LLAMA_MOE_TP from ktransformers/kt-kernel/operators/llamafile/moe.hpp.
 // The C++ class is the backend-default MoE for GGUF-loaded checkpoints
 // (archive/experts.py:150+). It receives GGML-quantized gate/up/down
-// weights directly (Q4_K, Q5_K, Q6_K, Q8_0, Q8_K) and uses llamafile_sgemm
+// weights directly (Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ4_XS, IQ4_NL, and uses llamafile_sgemm
 // for the per-expert matrix multiplies with on-the-fly dequant + activation
 // quantization to the vec_dot_type.
 //
@@ -47,15 +47,38 @@ const gemm_q4_k = @import("../amx/gemm_224_q4_k.zig");
 const gemm_q5_k = @import("../amx/gemm_224_q5_k.zig");
 const gemm_q6_k = @import("../amx/gemm_224_q6_k.zig");
 const gemm_q8_k = @import("../amx/gemm_224_q8_k.zig");
+const gemm_q2_k = @import("../amx/gemm_224_q2_k.zig");
+const gemm_q3_k = @import("../amx/gemm_224_q3_k.zig");
+const gemm_iq2_xxs = @import("../amx/gemm_224_iq2_xxs.zig");
+const gemm_iq2_xs = @import("../amx/gemm_224_iq2_xs.zig");
+const gemm_iq2_s = @import("../amx/gemm_224_iq2_s.zig");
+const gemm_iq3_xxs = @import("../amx/gemm_224_iq3_xxs.zig");
+const gemm_iq3_s = @import("../amx/gemm_224_iq3_s.zig");
+const gemm_iq1_s = @import("../amx/gemm_224_iq1_s.zig");
+const gemm_iq1_m = @import("../amx/gemm_224_iq1_m.zig");
+const gemm_iq4_nl = @import("../amx/gemm_224_iq4_nl.zig");
+const gemm_iq4_xs = @import("../amx/gemm_224_iq4_xs.zig");
 
 // kt_type_t values (must match include/kt_kernel.h).
 const KT_TYPE_F32: u32 = 0;
 const KT_TYPE_BF16: u32 = 2;
-const KT_TYPE_Q8_0: u32 = 12;
-const KT_TYPE_Q4_K: u32 = 16;
+pub const KT_TYPE_Q8_0: u32 = 12;
+pub const KT_TYPE_Q4_K: u32 = 16;
 const KT_TYPE_Q5_K: u32 = 17;
 const KT_TYPE_Q6_K: u32 = 18;
 const KT_TYPE_Q8_K: u32 = 19;
+const KT_TYPE_Q2_K: u32 = 20;
+const KT_TYPE_Q3_K: u32 = 21;
+const KT_TYPE_Q4_XS: u32 = 23;
+const KT_TYPE_IQ4_XS: u32 = 22;
+const KT_TYPE_IQ4_NL: u32 = 24;
+const KT_TYPE_Q2_XXS: u32 = 25;
+const KT_TYPE_Q2_XS: u32 = 26;
+const KT_TYPE_Q2_S: u32 = 27;
+const KT_TYPE_Q3_XXS: u32 = 28;
+const KT_TYPE_Q3_S: u32 = 29;
+const KT_TYPE_IQ1_S: u32 = 30;
+const KT_TYPE_IQ1_M: u32 = 31;
 
 // Block size (weights per block) for the supported types.
 const Q8_0_BLK: usize = 32;
@@ -112,13 +135,29 @@ pub const LlamaConfig = struct {
     /// matmul matrix. The dispatch is a static switch (no vtable).
     pub fn isWeightTypeSupported(t: u32) bool {
         return t == KT_TYPE_Q8_0 or t == KT_TYPE_Q4_K or t == KT_TYPE_Q5_K or
-            t == KT_TYPE_Q6_K or t == KT_TYPE_Q8_K;
+            t == KT_TYPE_Q6_K or t == KT_TYPE_Q8_K or t == KT_TYPE_Q2_K or
+            t == KT_TYPE_Q3_K or t == KT_TYPE_IQ4_XS or t == KT_TYPE_IQ4_NL or
+            t == KT_TYPE_Q2_XXS or t == KT_TYPE_Q2_XS or t == KT_TYPE_Q2_S or
+            t == KT_TYPE_Q3_XXS or t == KT_TYPE_Q3_S or
+            t == KT_TYPE_IQ1_S or t == KT_TYPE_IQ1_M;
     }
 
     pub fn isHiddenTypeSupported(t: u32) bool {
         return t == KT_TYPE_BF16; // first cut: BF16 only
     }
 };
+
+const Q2_K_BLOCK_BYTES: usize = 84;
+const Q3_K_BLOCK_BYTES: usize = 110;
+const IQ4_XS_BLOCK_BYTES: usize = 68;
+const IQ4_NL_BLOCK_BYTES: usize = 36;
+const Q2_XXS_BLOCK_BYTES: usize = 50;
+const Q2_XS_BLOCK_BYTES: usize = 54;
+const Q2_S_BLOCK_BYTES: usize = 52;
+const Q3_XXS_BLOCK_BYTES: usize = 56;
+const Q3_S_BLOCK_BYTES: usize = 60;
+const IQ1_S_BLOCK_BYTES: usize = 24;
+const IQ1_M_BLOCK_BYTES: usize = 16;
 
 /// Per-type byte-size helper (matches ggml_type_size in llama.cpp).
 fn blockBytes(t: u32) usize {
@@ -128,6 +167,17 @@ fn blockBytes(t: u32) usize {
         KT_TYPE_Q5_K => Q5_K_BLOCK_BYTES,
         KT_TYPE_Q6_K => Q6_K_BLOCK_BYTES,
         KT_TYPE_Q8_K => Q8_K_BLOCK_BYTES,
+        KT_TYPE_Q2_K => Q2_K_BLOCK_BYTES,
+        KT_TYPE_Q3_K => Q3_K_BLOCK_BYTES,
+        KT_TYPE_IQ4_XS => IQ4_XS_BLOCK_BYTES,
+        KT_TYPE_IQ4_NL => IQ4_NL_BLOCK_BYTES,
+        KT_TYPE_Q2_XXS => Q2_XXS_BLOCK_BYTES,
+        KT_TYPE_Q2_XS => Q2_XS_BLOCK_BYTES,
+        KT_TYPE_Q2_S => Q2_S_BLOCK_BYTES,
+        KT_TYPE_Q3_XXS => Q3_XXS_BLOCK_BYTES,
+        KT_TYPE_Q3_S => Q3_S_BLOCK_BYTES,
+        KT_TYPE_IQ1_S => IQ1_S_BLOCK_BYTES,
+        KT_TYPE_IQ1_M => IQ1_M_BLOCK_BYTES,
         else => 0,
     };
 }
@@ -136,7 +186,13 @@ fn blockBytes(t: u32) usize {
 fn blockSize(t: u32) usize {
     return switch (t) {
         KT_TYPE_Q8_0 => Q8_0_BLK,
-        KT_TYPE_Q4_K, KT_TYPE_Q5_K, KT_TYPE_Q6_K, KT_TYPE_Q8_K => QK_K,
+        KT_TYPE_Q4_K, KT_TYPE_Q5_K, KT_TYPE_Q6_K, KT_TYPE_Q8_K,
+        KT_TYPE_Q2_K, KT_TYPE_Q3_K,
+        KT_TYPE_IQ4_XS, KT_TYPE_IQ4_NL,
+        KT_TYPE_Q2_XXS, KT_TYPE_Q2_XS, KT_TYPE_Q2_S,
+        KT_TYPE_Q3_XXS, KT_TYPE_Q3_S,
+        KT_TYPE_IQ1_S, KT_TYPE_IQ1_M,
+        => QK_K,
         else => 0,
     };
 }
@@ -148,6 +204,41 @@ fn expertWeightBytes(t: u32, output_dim: usize, input_dim: usize) usize {
     // Each row in the projection has (input_dim / blksz) blocks.
     // All rows: (output_dim) × (input_dim / blksz) × bytes_per_block.
     return output_dim * (input_dim / blksz) * bytes_per_block;
+}
+
+/// Standalone dispatch: BF16 activation × quantized weight → F32 output.
+/// Tests can call this directly without needing a WorkerPool or LlamaMoe instance.
+pub fn gemmQuant(
+    fmt: u32,
+    a: [*]const amx.bf16,
+    b: [*]const u8,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    const lda = k;
+    const ldb = k / blockSize(fmt);
+    const ldc = n;
+    switch (fmt) {
+        KT_TYPE_Q8_0 => gemm_q8_0.gemmQ8_0Scalar(a, lda, @as([*]const gemm_q8_0.BlockQ8_0, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q4_K => gemm_q4_k.gemmQ4_KScalar(a, lda, @as([*]const gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q5_K => gemm_q5_k.gemmQ5_KScalar(a, lda, @as([*]const gemm_q5_k.BlockQ5_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q6_K => gemm_q6_k.gemmQ6_KScalar(a, lda, @as([*]const gemm_q6_k.BlockQ6_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q8_K => gemm_q8_k.gemmQ8_KScalar(a, lda, @as([*]const gemm_q8_k.BlockQ8_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q2_K => gemm_q2_k.gemmQ2_KScalar(a, lda, @as([*]const gemm_q2_k.BlockQ2_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q3_K => gemm_q3_k.gemmQ3_KScalar(a, lda, @as([*]const gemm_q3_k.BlockQ3_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q2_XXS => gemm_iq2_xxs.gemmIQ2_XXSScalar(a, @as([*]const gemm_iq2_xxs.BlockIQ2_XXS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_Q2_XS => gemm_iq2_xs.gemmIQ2_XSScalar(a, @as([*]const gemm_iq2_xs.BlockIQ2_XS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_Q2_S => gemm_iq2_s.gemmIQ2_SScalar(a, @as([*]const gemm_iq2_s.BlockIQ2_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_Q3_XXS => gemm_iq3_xxs.gemmIQ3_XXSScalar(a, @as([*]const gemm_iq3_xxs.BlockIQ3_XXS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_Q3_S => gemm_iq3_s.gemmIQ3_SScalar(a, @as([*]const gemm_iq3_s.BlockIQ3_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ1_S => gemm_iq1_s.gemmIQ1_SScalar(a, @as([*]const gemm_iq1_s.BlockIQ1_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ1_M => gemm_iq1_m.gemmIQ1_MScalar(a, @as([*]const gemm_iq1_m.BlockIQ1_M, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ4_XS => gemm_iq4_xs.gemmIQ4_XSScalar(a, @as([*]const gemm_iq4_xs.BlockIQ4_XS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ4_NL => gemm_iq4_nl.gemmIQ4_NLScalar(a, @as([*]const gemm_iq4_nl.BlockIQ4_NL, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        else => @panic("unsupported weight type in gemmQuant"),
+    }
 }
 
 /// LlamaMoe (Zig port of LLAMA_MOE_TP). Owns per-expert weight copies
@@ -441,38 +532,8 @@ pub const LlamaMoe = struct {
         defer self.allocator.free(act_bf16);
         dequantQ8_0ToBF16(act_q8_0, act_bf16.ptr, k);
 
-        // 2. Run the existing kt_matmul_q* (BF16 × Q*_K → F32).
-        const ldc = n;
-        const lda = k;
-        const ldb = k / blockSize(weight_type);
-        switch (weight_type) {
-            KT_TYPE_Q8_0 => gemm_q8_0.gemmQ8_0Scalar(
-                act_bf16.ptr, lda,
-                @as([*]const gemm_q8_0.BlockQ8_0, @ptrCast(@alignCast(weight_ptr))),
-                ldb, out, ldc, m, n, k,
-            ),
-            KT_TYPE_Q4_K => gemm_q4_k.gemmQ4_KScalar(
-                act_bf16.ptr, lda,
-                @as([*]const gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(weight_ptr))),
-                ldb, out, ldc, m, n, k,
-            ),
-            KT_TYPE_Q5_K => gemm_q5_k.gemmQ5_KScalar(
-                act_bf16.ptr, lda,
-                @as([*]const gemm_q5_k.BlockQ5_K, @ptrCast(@alignCast(weight_ptr))),
-                ldb, out, ldc, m, n, k,
-            ),
-            KT_TYPE_Q6_K => gemm_q6_k.gemmQ6_KScalar(
-                act_bf16.ptr, lda,
-                @as([*]const gemm_q6_k.BlockQ6_K, @ptrCast(@alignCast(weight_ptr))),
-                ldb, out, ldc, m, n, k,
-            ),
-            KT_TYPE_Q8_K => gemm_q8_k.gemmQ8_KScalar(
-                act_bf16.ptr, lda,
-                @as([*]const gemm_q8_k.BlockQ8_K, @ptrCast(@alignCast(weight_ptr))),
-                ldb, out, ldc, m, n, k,
-            ),
-            else => @panic("unsupported weight type in runMatmul"),
-        }
+        // 2. Dispatch to the right matmul via the shared gemmQuant function.
+        gemmQuant(weight_type, act_bf16.ptr, weight_ptr, out, m, n, k);
     }
 };
 
