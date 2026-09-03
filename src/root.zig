@@ -48,6 +48,7 @@ pub const gemm_iq2_s = @import("kernels/amx/gemm_224_iq2_s.zig");
 pub const gemm_iq3_s = @import("kernels/amx/gemm_224_iq3_s.zig");
 pub const gemm_iq1_s = @import("kernels/amx/gemm_224_iq1_s.zig");
 pub const gemm_iq1_m = @import("kernels/amx/gemm_224_iq1_m.zig");
+pub const llama_moe = @import("kernels/moe/llama_moe.zig");
 pub const iq3xs_init = @import("kernels/amx/iq3xs_init.zig");
 pub const iq3_quantize = @import("kernels/amx/iq3_quantize.zig");
 comptime {
@@ -169,6 +170,9 @@ comptime {
     _ = &gemm_iq1_s.quantizeRowIQ1_S_WithInit;
     _ = &iq2xs_init.KGRID_1BIT_2048;
     _ = &iq2xs_init.initIq1SData;
+    _ = &llama_moe.LlamaMoe.init;
+    _ = &llama_moe.LlamaMoe.forwardOne;
+    _ = &llama_moe.rowBytes;
     _ = &gemm_iq1_m.BlockIQ1_M;
     _ = &gemm_iq1_m.extractScale;
     _ = &gemm_iq1_m.dequantizeRowIQ1_M;

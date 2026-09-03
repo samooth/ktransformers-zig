@@ -4572,3 +4572,191 @@ test "IQ1_M scalar GEMM with constant inputs is consistent" {
 
     for (c) |v| try testing.expectApproxEqAbs(ref_sum, v, 1e-3);
 }
+
+// ============================================================================
+// LlamaMoe — the GGML-quantized MoE (llamafile backend class)
+// ============================================================================
+
+test "LlamaMoe: quantized-weight forward matches dequantized-BF16 reference" {
+    const lm = root.llama_moe;
+    const allocator = testing.allocator;
+
+    // Config: 2 experts, hidden 256 (Q4_K needs K % 256 == 0), inter 32, k=2.
+    const expert_num: usize = 2;
+    const hidden: usize = 256;
+    const inter: usize = 32;
+    const q8_0_mod = root.gemm_q8_0;
+    const q4_k_mod = root.gemm_q4_k;
+
+    // 1. Build BF16 reference weights (distinct values).
+    const gate_f32 = try allocator.alloc(f32, expert_num * inter * hidden);
+    defer allocator.free(gate_f32);
+    const up_f32 = try allocator.alloc(f32, expert_num * inter * hidden);
+    defer allocator.free(up_f32);
+    const down_f32 = try allocator.alloc(f32, expert_num * hidden * inter);
+    defer allocator.free(down_f32);
+    for (0..expert_num * inter * hidden) |i| {
+        gate_f32[i] = 0.02 * @as(f32, @floatFromInt((i * 7) % 31)) - 0.3;
+        up_f32[i] = 0.03 * @as(f32, @floatFromInt((i * 5) % 37)) - 0.55;
+    }
+    for (0..expert_num * hidden * inter) |i| {
+        down_f32[i] = 0.01 * @as(f32, @floatFromInt((i * 11) % 41)) - 0.2;
+    }
+
+    // 2. Quantize to mixed formats: gate Q8_0, up Q4_K, down Q8_0.
+    const gate_blks = (expert_num * inter * hidden) / q8_0_mod.QK8_0;
+    const gate_q = try allocator.alloc(q8_0_mod.BlockQ8_0, gate_blks);
+    defer allocator.free(gate_q);
+    for (0..expert_num * inter) |row| {
+        q8_0_mod.quantizeRowQ8_0(gate_f32[row * hidden ..][0..hidden], gate_q.ptr + (row * hidden / q8_0_mod.QK8_0), hidden);
+    }
+    const up_blks = (expert_num * inter * hidden) / 256;
+    const up_q = try allocator.alloc(q4_k_mod.BlockQ4_K, up_blks);
+    defer allocator.free(up_q);
+    for (0..expert_num * inter) |row| {
+        q4_k_mod.quantizeRowQ4_K(up_f32[row * hidden ..][0..hidden], up_q.ptr + (row * hidden / 256), hidden);
+    }
+    const down_blks = (expert_num * hidden * inter) / q8_0_mod.QK8_0;
+    const down_q = try allocator.alloc(q8_0_mod.BlockQ8_0, down_blks);
+    defer allocator.free(down_q);
+    for (0..expert_num * hidden) |row| {
+        q8_0_mod.quantizeRowQ8_0(down_f32[row * inter ..][0..inter], down_q.ptr + (row * inter / q8_0_mod.QK8_0), inter);
+    }
+
+    // 3. LlamaMoe forward: input [hidden] BF16, experts {0,1} w={0.6,0.4}.
+    var input_bf16: [hidden]amx.bf16 = undefined;
+    var input_f32: [hidden]f32 = undefined;
+    for (0..hidden) |i| {
+        input_f32[i] = 0.1 * @as(f32, @floatFromInt(i % 13)) - 0.6;
+        input_bf16[i] = amx.f32_to_bf16(input_f32[i]);
+    }
+    const cfg = lm.LlamaMoeConfig{
+        .expert_num = expert_num,
+        .hidden_size = hidden,
+        .intermediate_size = inter,
+        .num_experts_per_tok = 2,
+        .gate_proj = @ptrCast(gate_q.ptr),
+        .up_proj = @ptrCast(up_q.ptr),
+        .down_proj = @ptrCast(down_q.ptr),
+        .gate_type = .q8_0,
+        .up_type = .q4_k,
+        .down_type = .q8_0,
+    };
+    var moe_inst = lm.LlamaMoe.init(cfg, allocator);
+    var out_quant: [hidden]f32 = undefined;
+    moe_inst.forwardOne(&input_bf16, &out_quant, 2, &.{ 0, 1 }, &.{ 0.6, 0.4 });
+
+    // 4. Reference: dequantize weights to BF16, run the same math inline.
+    var out_ref: [hidden]f32 = .{0} ** hidden;
+    const gate_dq = try allocator.alloc(f32, expert_num * inter * hidden);
+    defer allocator.free(gate_dq);
+    const up_dq = try allocator.alloc(f32, expert_num * inter * hidden);
+    defer allocator.free(up_dq);
+    const down_dq = try allocator.alloc(f32, expert_num * hidden * inter);
+    defer allocator.free(down_dq);
+    for (0..expert_num * inter) |row| {
+        q8_0_mod.dequantizeRowQ8_0(gate_q.ptr + (row * hidden / q8_0_mod.QK8_0), gate_dq[row * hidden ..][0..hidden], hidden);
+        q4_k_mod.dequantizeRowQ4_K(up_q.ptr + (row * hidden / 256), up_dq[row * hidden ..][0..hidden], hidden);
+    }
+    for (0..expert_num * hidden) |row| {
+        q8_0_mod.dequantizeRowQ8_0(down_q.ptr + (row * inter / q8_0_mod.QK8_0), down_dq[row * inter ..][0..inter], inter);
+    }
+    const ws = [2]f32{ 0.6, 0.4 };
+    for (0..expert_num) |e| {
+        // Phase 1: gate/up rows -> swiglu -> mid[j] (bf16-rounded per
+        // element, same as the LlamaMoe down-activation conversion).
+        const mid = try allocator.alloc(amx.bf16, inter);
+        defer allocator.free(mid);
+        for (0..inter) |j| {
+            var g: f32 = 0;
+            var u: f32 = 0;
+            for (0..hidden) |i| {
+                const act = amx.bf16_to_f32(input_bf16[i]);
+                g += act * gate_dq[(e * inter + j) * hidden + i];
+                u += act * up_dq[(e * inter + j) * hidden + i];
+            }
+            mid[j] = amx.f32_to_bf16((g / (1.0 + @exp(-g))) * u);
+        }
+        // Phase 2: down rows (e*hidden + i) x mid -> accumulate.
+        for (0..hidden) |i| {
+            var dd: f32 = 0;
+            for (0..inter) |jj| {
+                dd += amx.bf16_to_f32(mid[jj]) * down_dq[(e * hidden + i) * inter + jj];
+            }
+            out_ref[i] += dd * ws[e];
+        }
+    }
+
+    // 5. Compare (tolerance: quantization noise from the mixed formats).
+    var max_rel: f32 = 0;
+    for (0..hidden) |i| {
+        const denom = @max(@abs(out_ref[i]), 1e-3);
+        const rel = @abs(out_quant[i] - out_ref[i]) / denom;
+        max_rel = @max(max_rel, rel);
+    }
+    // Q8_0 (~0.2% noise) x3 projections + Q4_K (~6% noise) x1 -> 15% bound.
+    try testing.expect(max_rel < 0.15);
+}
+
+test "LlamaMoe: gpu_experts_mask skips the masked expert" {
+    const lm = root.llama_moe;
+    const allocator = testing.allocator;
+    const q8_0_mod = root.gemm_q8_0;
+
+    const expert_num: usize = 2;
+    const hidden: usize = 64;
+    const inter: usize = 32;
+    const gate_f32 = try allocator.alloc(f32, expert_num * inter * hidden);
+    defer allocator.free(gate_f32);
+    for (0..expert_num * inter * hidden) |i| {
+        gate_f32[i] = 0.05;
+    }
+
+    const blks = (expert_num * inter * hidden) / q8_0_mod.QK8_0;
+    const w_q = try allocator.alloc(q8_0_mod.BlockQ8_0, blks * 3); // gate+up+down in one buffer
+    defer allocator.free(w_q);
+    for (0..expert_num * inter) |row| {
+        q8_0_mod.quantizeRowQ8_0(gate_f32[row * hidden ..][0..hidden], w_q.ptr + (row * hidden / q8_0_mod.QK8_0), hidden);
+    }
+
+    var input_bf16: [hidden]amx.bf16 = undefined;
+    for (&input_bf16) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    const mask = [_]u8{ 1, 0 }; // expert 0 on GPU
+    const cfg = lm.LlamaMoeConfig{
+        .expert_num = expert_num,
+        .hidden_size = hidden,
+        .intermediate_size = inter,
+        .num_experts_per_tok = 2,
+        .gate_proj = @ptrCast(w_q.ptr),
+        .up_proj = @ptrCast(w_q.ptr + blks),
+        .down_proj = @ptrCast(w_q.ptr + 2 * blks),
+        .gate_type = .q8_0,
+        .up_type = .q8_0,
+        .down_type = .q8_0,
+        .gpu_experts_mask = &mask,
+    };
+    var moe_inst2 = lm.LlamaMoe.init(cfg, allocator);
+    var out: [hidden]f32 = undefined;
+
+    // expert 0 masked -> only expert 1 contributes. If BOTH were skipped,
+    // output stays zero — assert non-zero (expert 1 ran).
+    moe_inst2.forwardOne(&input_bf16, &out, 2, &.{ 0, 1 }, &.{ 0.5, 0.5 });
+    var sum: f32 = 0;
+    for (out) |v| sum += @abs(v);
+    try testing.expect(sum > 0);
+
+    // All experts masked -> output exactly zero.
+    const mask_all = [_]u8{ 1, 1 };
+    const cfg_all = LlamaMoeCfgMask(cfg, &mask_all);
+    var moe_all_inst = lm.LlamaMoe.init(cfg_all, allocator);
+    var out_zero: [hidden]f32 = undefined;
+    moe_all_inst.forwardOne(&input_bf16, &out_zero, 2, &.{ 0, 1 }, &.{ 0.5, 0.5 });
+    for (out_zero) |v| try testing.expect(v == 0);
+}
+
+fn LlamaMoeCfgMask(base: anytype, mask: []const u8) root.llama_moe.LlamaMoeConfig {
+    var cfg = base;
+    cfg.gpu_experts_mask = mask.ptr;
+    return cfg;
+}
