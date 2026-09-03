@@ -2691,7 +2691,7 @@ pub export fn kt_matmul_q8_k(
 // Utility Functions
 // ============================================================================
 
-export fn kt_apply_swiglu(
+pub export fn kt_apply_swiglu(
     gate: [*]const amx.bf16,
     up: [*]const amx.bf16,
     dst: [*]amx.bf16,
@@ -2714,7 +2714,7 @@ export fn kt_apply_swiglu(
     }
 }
 
-export fn kt_apply_rms_norm(
+pub export fn kt_apply_rms_norm(
     input: [*]const amx.bf16,
     weight: [*]const amx.bf16,
     output: [*]amx.bf16,
@@ -2737,7 +2737,7 @@ export fn kt_apply_rms_norm(
     }
 }
 
-export fn kt_apply_rope(
+pub export fn kt_apply_rope(
     q: [*]amx.bf16,
     k: [*]amx.bf16,
     position: i64,
@@ -2765,7 +2765,7 @@ export fn kt_apply_rope(
     }
 }
 
-export fn kt_softmax(
+pub export fn kt_softmax(
     input: [*]const f32,
     output: [*]f32,
     size: usize

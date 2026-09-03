@@ -1,6 +1,6 @@
 # ktransformers-zig TODO
 
-## Status: Beta (All workstreams closed; 15/15 GGML formats + 219 tests)
+## Status: Beta (All workstreams closed; 15/15 GGML formats + 226 tests)
 
 Last updated: 2026-09-03
 
@@ -12,7 +12,7 @@ independently ported the same LLAMA_MOE_TP to Zig in the same session).
 Claims are removed when the task is done; abandoned claims can be reclaimed.
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
-**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime) = **219 total pass, 0 leaks, exit 0**.
+**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax)) = **226 total pass, 0 leaks, exit 0**.
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon (8 installed names), each exporting **112 C API symbols** (triple-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). Runs in CI (`wheels.yml` `abi-gate` job).
 **Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
 **Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
@@ -293,7 +293,7 @@ true vs false, with file:line evidence). All real items fixed:
   `tp_part_idx=0` only. **Closes the §1 gap** from the "qué falta" analysis.
 
 ### Documentation
-- [x] **API documentation** — `docs/api.md` (hand-written; toolchain is Zig 0.16.0-dev.2535 which has **no `zig doc` subcommand** and no `-femit-docs` flag, so the doc is not auto-generated). Integrator's quick-reference: family map + per-family signature blocks covering **ALL 112 kt_* symbols** (verified: every header prototype is mentioned; `comm` audit 2026-09-03), pointers + minimal Python ctypes example, ABI contract (header is the source of truth; `tools/verify_abi.py` is the gate; multi-variant layout), known gaps (incl. the header-comment lie about nonexistent `kt_*_iq*` per-type exports — now fixed in the header). Also flags the 4 math-helper exports (`kt_apply_swiglu` / `kt_apply_rms_norm` / `kt_apply_rope` / `kt_softmax`) that exist in the .so but are missing from `include/kt_kernel.h` and therefore not ABI-gated — follow-up to add them to the header.
+- [x] **API documentation** — `docs/api.md` (hand-written; toolchain is Zig 0.16.0-dev.2535 which has **no `zig doc` subcommand** and no `-femit-docs` flag, so the doc is not auto-generated). Integrator's quick-reference: family map + per-family signature blocks covering **ALL 112 kt_* symbols** (verified: every header prototype is mentioned; `comm` audit 2026-09-03), pointers + minimal Python ctypes example, ABI contract (header is the source of truth; `tools/verify_abi.py` is the gate; multi-variant layout), known gaps (the 10 non-linear GGML formats have no per-type C exports BY DESIGN — reachable via kt_llama_moe_* or the Zig API; documented as such). The 4 math-helper exports (`kt_apply_swiglu`/`kt_apply_rms_norm`/`kt_apply_rope`/`kt_softmax`) were headered + ABI-gated in `ff57125` and are now documented in api.md's Math helpers section with the family-map row.
 - [x] **Porting guide from C++** — `docs/porting-guide.md` (181 lines, committed in `e2c900d`): C++ reference file map → Zig counterpart map, lazy-analysis wiring pattern, comptime fn-ref pattern for `.so` symbol emission, AMX arch-gate, the bf16 f16 cast (Zig 0.16 native f16 vs hand-rolled bit math), and the `@Vector` indexing gotchas. Linked from AGENTS.md.
 
 ---

@@ -151,11 +151,11 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
   fully revived (NumaTopology.detect + allocNuma + getThreadAffinity
   work byte-exact; getThreadAffinity bug fixed in route — kernel
   returns bytes-copied, not errno).
-- Tests: **219 across the suites, 0 leaks** (137 in the kernels suite
+- Tests: **226 across the suites, 0 leaks** (137 in the kernels suite
   incl. all 15 GGML formats + the 16-arm gemmQuant dispatch sweep; 11
   MLA + 4+3 MLA C-API + 2 FP8 + 9 GGML C API + 7 aarch64 + NEON +
   allocator + Qwen3 + Qwen3 C-API + GGUF e2e + to/from_float + 3
-  LlamaMoe C-API incl. the KT_TYPE ABI audit + K_BLOCK runtime). Bench:
+  LlamaMoe C-API incl. the KT_TYPE ABI audit + K_BLOCK runtime + 6 math-helpers (swiglu 3 variants/rms_norm/rope/softmax, numerics-pinned)). Bench:
   `zig build bench` (2.8-9.3x measured speedup A1) + `moe_bench.zig`
   (end-to-end MoE forward with tile-param tuning: -20.3% on prefill
   8×4 at K=448 vs the 1792 default on this Ryzen 512K-L2 — validates

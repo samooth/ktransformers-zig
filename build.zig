@@ -167,6 +167,8 @@ pub fn build(b: *std.Build) void {
     RunTest.run(b, test_step, "tests/kernels/llamafile_moe_capi_tests.zig", "src/main.zig", target, optimize);
     // Suite 6d: to_float / from_float dispatch (Zig extension — generic block ↔ F32)
     RunTest.run(b, test_step, "tests/kernels/to_from_float_capi_tests.zig", "src/main.zig", target, optimize);
+    // Suite 6e: math helpers (kt_apply_swiglu/rms_norm/rope + kt_softmax)
+    RunTest.run(b, test_step, "tests/kernels/math_helpers_capi_tests.zig", "src/main.zig", target, optimize);
     // Suite 7: Qwen3 MoE + MHA + GGUF (model orchestration + parser)
     RunTest.run(b, test_step, "tests/kernels/qwen3_moe_tests.zig", "src/root.zig", target, optimize);
     // Suite 7b: GGUF E2E — real on-disk model round-trip

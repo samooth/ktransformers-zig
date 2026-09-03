@@ -35,17 +35,13 @@ convention is an ABI break and must be gated behind the verifier.
 | [Scalar GEMM helpers](#scalar-gemm-helpers-bf16--int8--int4-gptq--fp8) | 4 | `kt_matmul_{bf16,int8,int4,fp8}` |
 | [FP8 layerwise transport](#fp8-layerwise-transport) | 14 | `kt_fp8_layerwise_init`, `kt_fp8_transport_*`, `kt_fp8_{quantize,dequantize}(_block)` |
 | [Custom allocator](#custom-allocator-injection) | 1 | `kt_set_default_allocator` |
+| [Math helpers](#math-helpers) | 4 | `kt_apply_{swiglu,rms_norm,rope}`, `kt_softmax` |
 | [GGML init (no-op stub)](#ggml-init) | 1 | `kt_ggml_init` |
 
 **112 symbols total** in the C ABI (header is the contract, verified by
-`tools/verify_abi.py`). The math primitives
-(`kt_apply_swiglu` / `kt_apply_rms_norm` / `kt_apply_rope` / `kt_softmax`)
-exist as `export fn` in `src/main.zig` and are emitted into the .so, but are
-**not declared in `include/kt_kernel.h`** — they're undocumented
-auxiliaries. The verify_abi gate only checks header-declared symbols, so
-they won't be caught if removed silently. Adding them to the header is a
-follow-up TODO. They're listed in [Math helpers](#math-helpers) for
-reference; treat them as advisory until the header is updated.
+`tools/verify_abi.py` — the family table above sums to it). Every
+header-declared symbol, including the math helpers, is gated: removing
+one from the .so fails the verifier in CI.
 
 All `KT_*` opaque types are created by `kt_*_new` / `kt_*_new_config` calls
 and must be released with the matching `kt_*_free` to avoid leaks. The
@@ -753,20 +749,24 @@ import time doesn't break.
 
 ## Math helpers
 
-The internal kernels (BF16 round-trip, SwiGLU, RMSNorm, RoPE, softmax)
-are also exposed as exports in the .so:
+The BF16 math primitives (SwiGLU, RMSNorm, RoPE, softmax) are declared
+in the header and ABI-gated like every other symbol:
 
 ```c
-void kt_apply_swiglu(void* gate, void* up, void* dst, size_t count, float limit, float alpha);
-void kt_apply_rms_norm(void* input, void* weight, void* output, size_t hidden_size, float eps);
+void kt_apply_swiglu(const void* gate, const void* up, void* dst,
+                     size_t count, float limit, float alpha);
+void kt_apply_rms_norm(const void* input, const void* weight, void* output,
+                       size_t hidden_size, float eps);
 void kt_apply_rope(void* q, void* k, int64_t position, size_t head_dim, double rope_theta);
 void kt_softmax(const float* input, float* output, size_t size);
 ```
 
-These are **not** declared in `include/kt_kernel.h` and therefore not
-covered by the ABI verifier. They exist as `export fn` in `src/main.zig`
-and are present in the .so, but treat them as undocumented — they may
-change or disappear between versions. The GEMM entry points
+All BF16 except `kt_softmax` (F32 in/out). `kt_apply_swiglu` picks the
+variant by parameters: `alpha > 0` → the OpenAI tanh variant
+(`gate·up` limited then rescaled), `limit > 0` → the clamped variant,
+else plain `silu(gate)·up`. `kt_apply_rope` rotates q and k in place
+(half-rotation split layout, `head_dim` must be even) at absolute
+`position` with base `rope_theta`. The GEMM entry points
 (`kt_matmul_q*`) use these internally; you only need them if you're
 assembling a custom layer outside the C API surface.
 
@@ -953,22 +953,18 @@ end-to-end test in `tests/test_allocator.py`.
 - `LESSONS_ZIG.md` — verified Zig 0.16 gotchas (architecture, inline asm,
   allocator patterns, std.simd, etc.).
 - `AGENTS.md` — repo conventions for new contributors.
-- `TODO.md` — open work; read `#101`, `#105`, `#106` for context on
-  what's intentionally out of scope or staged.
+- `TODO.md` — task tracking; the "Limitations (follow-ups)" notes on
+  each entry document what's intentionally staged (fused q×q matmuls,
+  forward_many batching, TP subpool routing).
 
 ## Known gaps (this doc, not the C header)
 
-- The math primitives in [Math helpers](#math-helpers) are emitted into
-  the .so but not declared in `include/kt_kernel.h`. Adding them to the
-  header would close the gap and let `tools/verify_abi.py` gate them too.
 - `tools/verify_abi.py` only scans `zig-out/lib/`. If you build a `.so`
   by hand and copy it in, rename it to match the `libkt_kernel_ext_*`
   pattern, or remove it before running the verifier.
-- The `kt_to_float` header comment says "use the per-type
-  `kt_dequantize_iq*` / `kt_quantize_iq*` exports" for the formats the
-  generic dispatch doesn't cover — **those exports do not exist**. The
-  10 non-linear formats are reachable via `kt_llama_moe_*` or the Zig
-  API only (see
+- The 10 non-linear GGML formats (I-quants + Q2_K/Q3_K) have **no
+  per-type C exports** by design — a generic `(src, dst, n)` signature
+  would be ambiguous across their differing per-row sizes. Reach them
+  via `kt_llama_moe_*` (takes all 16 formats per projection) or the
+  Zig kernel modules (see
   [The other 10 GGML formats](#the-other-10-ggml-formats-zig-only-no-c-exports)).
-  Either the comment should drop the reference or the exports should be
-  added; tracked as a follow-up.
