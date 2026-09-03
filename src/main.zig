@@ -25,7 +25,7 @@ pub const gemm_q5_k = root.gemm_q5_k;
 pub const gemm_q6_k = root.gemm_q6_k;
 pub const gemm_q8_k = root.gemm_q8_k;
 const moe = root.moe;
-const llamafile_moe = root.llamafile_moe;
+pub const llamafile_moe = root.llamafile_moe; // pub: ABI-audit test pins KT_TYPE constants
 const moe_sft = root.moe_sft;
 // MLA: pub so C-API tests (rooted here) can reference the config/cache
 // types; no ABI effect.

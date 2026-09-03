@@ -4637,3 +4637,89 @@ test "LlamaMoe dispatch: gemmQuant Q4_K × Q8_0 constant produces expected range
         try testing.expectApproxEqAbs(@as(f32, 128.0), out[j], 8.0);
     }
 }
+
+test "LlamaMoe dispatch: gemmQuant dispatches every supported format without panic" {
+    // Regression test for the 5177bdf bug class: every arm of the
+    // gemmQuant switch MUST be reachable with its REAL header value.
+    // (The original 16-format extension shipped 11 wrong KT_TYPE
+    // values + 9 wrong block sizes; no test exercised the new arms.)
+    // Zero weights (valid quantized zero blocks) → zero output; the
+    // assertion is dispatch correctness, not numerics.
+    const lm = root.llamafile_moe;
+    const allocator = testing.allocator;
+    const m: usize = 1;
+    const n: usize = 2;
+    const k: usize = 256; // QK_K formats need K%256==0
+
+    var act_bf16: [k]amx.bf16 = undefined;
+    for (&act_bf16) |*v| v.* = amx.f32_to_bf16(1.0);
+
+    const formats = [_]u32{
+        lm.KT_TYPE_Q8_0,  lm.KT_TYPE_Q4_K,  lm.KT_TYPE_Q5_K, lm.KT_TYPE_Q6_K,
+        lm.KT_TYPE_Q8_K,  lm.KT_TYPE_Q2_K,  lm.KT_TYPE_Q3_K, lm.KT_TYPE_IQ4_XS,
+        lm.KT_TYPE_IQ2_XXS, lm.KT_TYPE_IQ2_XS, lm.KT_TYPE_IQ2_S, lm.KT_TYPE_IQ3_XXS,
+        lm.KT_TYPE_IQ3_S, lm.KT_TYPE_IQ1_S, lm.KT_TYPE_IQ1_M,
+    };
+    for (formats) |fmt| {
+        const row_bytes = (k / lm_blockSize(lm, fmt)) * lm_blockBytes(lm, fmt);
+        const w = try allocator.alloc(u8, row_bytes * n);
+        defer allocator.free(w);
+        @memset(w, 0);
+        var out: [n]f32 = undefined;
+        gemmQuantDispatch(lm, fmt, &act_bf16, w.ptr, &out, m, n, k);
+        for (out) |v| try testing.expect(v == 0);
+    }
+
+    // IQ4_NL separately: block size 32 → k=32 suffices.
+    {
+        const k32: usize = 32;
+        var act_nl: [k32]amx.bf16 = undefined;
+        for (&act_nl) |*v| v.* = amx.f32_to_bf16(1.0);
+        const row_bytes = (k32 / lm_blockSize(lm, lm.KT_TYPE_IQ4_NL)) * lm_blockBytes(lm, lm.KT_TYPE_IQ4_NL);
+        const w = try allocator.alloc(u8, row_bytes * n);
+        defer allocator.free(w);
+        @memset(w, 0);
+        var out: [n]f32 = undefined;
+        gemmQuantDispatch(lm, lm.KT_TYPE_IQ4_NL, &act_nl, w.ptr, &out, m, n, k32);
+        for (out) |v| try testing.expect(v == 0);
+    }
+}
+
+// blockSize/blockBytes are private in llamafile_moe.zig — reimplement the
+// table here for the test (kept in lockstep by the kernel file's comptime
+// @sizeOf audit; if the sizes drift the BUILD fails before this runs).
+fn lm_blockSize(lm: anytype, t: u32) usize {
+    _ = lm;
+    return switch (t) {
+        12 => 32, // Q8_0
+        24 => 32, // IQ4_NL
+        else => 256, // all K-quants + IQ formats
+    };
+}
+
+fn lm_blockBytes(lm: anytype, t: u32) usize {
+    _ = lm;
+    return switch (t) {
+        12 => 34,  // Q8_0
+        16 => 144, // Q4_K
+        17 => 176, // Q5_K
+        18 => 210, // Q6_K
+        19 => 292, // Q8_K
+        14 => 84,  // Q2_K
+        15 => 110, // Q3_K
+        27 => 136, // IQ4_XS
+        24 => 18,  // IQ4_NL
+        20 => 66,  // IQ2_XXS
+        21 => 74,  // IQ2_XS
+        26 => 82,  // IQ2_S
+        22 => 98,  // IQ3_XXS
+        25 => 110, // IQ3_S
+        23 => 50,  // IQ1_S
+        28 => 56,  // IQ1_M
+        else => 0,
+    };
+}
+
+fn gemmQuantDispatch(lm: anytype, fmt: u32, a: [*]const amx.bf16, b: [*]const u8, c: [*]f32, m: usize, n: usize, k: usize) void {
+    lm.gemmQuant(fmt, a, b, c, m, n, k);
+}

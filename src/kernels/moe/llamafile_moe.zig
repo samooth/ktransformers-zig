@@ -59,29 +59,30 @@ const gemm_iq1_m = @import("../amx/gemm_224_iq1_m.zig");
 const gemm_iq4_nl = @import("../amx/gemm_224_iq4_nl.zig");
 const gemm_iq4_xs = @import("../amx/gemm_224_iq4_xs.zig");
 
-// kt_type_t values (must match include/kt_kernel.h).
-const KT_TYPE_F32: u32 = 0;
-const KT_TYPE_BF16: u32 = 2;
+// kt_type_t values — MUST match include/kt_kernel.h (the ABI contract)
+// and src/main.zig's kt_type_t enum. Audited 2026-09-03 against the header.
+pub const KT_TYPE_F32: u32 = 0;
+pub const KT_TYPE_BF16: u32 = 2;
 pub const KT_TYPE_Q8_0: u32 = 12;
 pub const KT_TYPE_Q4_K: u32 = 16;
-const KT_TYPE_Q5_K: u32 = 17;
-const KT_TYPE_Q6_K: u32 = 18;
-const KT_TYPE_Q8_K: u32 = 19;
-const KT_TYPE_Q2_K: u32 = 20;
-const KT_TYPE_Q3_K: u32 = 21;
-const KT_TYPE_Q4_XS: u32 = 23;
-const KT_TYPE_IQ4_XS: u32 = 22;
-const KT_TYPE_IQ4_NL: u32 = 24;
-const KT_TYPE_Q2_XXS: u32 = 25;
-const KT_TYPE_Q2_XS: u32 = 26;
-const KT_TYPE_Q2_S: u32 = 27;
-const KT_TYPE_Q3_XXS: u32 = 28;
-const KT_TYPE_Q3_S: u32 = 29;
-const KT_TYPE_IQ1_S: u32 = 30;
-const KT_TYPE_IQ1_M: u32 = 31;
+pub const KT_TYPE_Q5_K: u32 = 17;
+pub const KT_TYPE_Q6_K: u32 = 18;
+pub const KT_TYPE_Q8_K: u32 = 19;
+pub const KT_TYPE_Q2_K: u32 = 14;
+pub const KT_TYPE_Q3_K: u32 = 15;
+pub const KT_TYPE_IQ2_XXS: u32 = 20;
+pub const KT_TYPE_IQ2_XS: u32 = 21;
+pub const KT_TYPE_IQ3_XXS: u32 = 22;
+pub const KT_TYPE_IQ1_S: u32 = 23;
+pub const KT_TYPE_IQ4_NL: u32 = 24;
+pub const KT_TYPE_IQ3_S: u32 = 25;
+pub const KT_TYPE_IQ2_S: u32 = 26;
+pub const KT_TYPE_IQ4_XS: u32 = 27;
+pub const KT_TYPE_IQ1_M: u32 = 28;
 
 // Block size (weights per block) for the supported types.
 const Q8_0_BLK: usize = 32;
+const Q4_NL_BLK: usize = 32; // ggml_blck_size[IQ4_NL]
 const QK_K: usize = 256;
 const Q4_K_BLOCK_BYTES: usize = 144; // f16 d+dmin + 12-byte scales + 128-byte qs
 const Q5_K_BLOCK_BYTES: usize = 176; // f16 d+dmin + 12-byte scales + 32-byte qh + 128-byte qs
@@ -137,8 +138,8 @@ pub const LlamaConfig = struct {
         return t == KT_TYPE_Q8_0 or t == KT_TYPE_Q4_K or t == KT_TYPE_Q5_K or
             t == KT_TYPE_Q6_K or t == KT_TYPE_Q8_K or t == KT_TYPE_Q2_K or
             t == KT_TYPE_Q3_K or t == KT_TYPE_IQ4_XS or t == KT_TYPE_IQ4_NL or
-            t == KT_TYPE_Q2_XXS or t == KT_TYPE_Q2_XS or t == KT_TYPE_Q2_S or
-            t == KT_TYPE_Q3_XXS or t == KT_TYPE_Q3_S or
+            t == KT_TYPE_IQ2_XXS or t == KT_TYPE_IQ2_XS or t == KT_TYPE_IQ2_S or
+            t == KT_TYPE_IQ3_XXS or t == KT_TYPE_IQ3_S or
             t == KT_TYPE_IQ1_S or t == KT_TYPE_IQ1_M;
     }
 
@@ -147,17 +148,21 @@ pub const LlamaConfig = struct {
     }
 };
 
+// Block sizes — verified against @sizeOf of the real Block structs
+// (2026-09-03; IQ2_XXS was 50->66, IQ3_XXS 56->98, IQ3_S 60->110,
+// IQ1_M 16->56, IQ4_NL 36->18 — the invented values were silently
+// wrong in every expert-offset computation).
 const Q2_K_BLOCK_BYTES: usize = 84;
 const Q3_K_BLOCK_BYTES: usize = 110;
-const IQ4_XS_BLOCK_BYTES: usize = 68;
-const IQ4_NL_BLOCK_BYTES: usize = 36;
-const Q2_XXS_BLOCK_BYTES: usize = 50;
-const Q2_XS_BLOCK_BYTES: usize = 54;
-const Q2_S_BLOCK_BYTES: usize = 52;
-const Q3_XXS_BLOCK_BYTES: usize = 56;
-const Q3_S_BLOCK_BYTES: usize = 60;
-const IQ1_S_BLOCK_BYTES: usize = 24;
-const IQ1_M_BLOCK_BYTES: usize = 16;
+const IQ4_XS_BLOCK_BYTES: usize = 136;
+const IQ4_NL_BLOCK_BYTES: usize = 18;
+const IQ2_XXS_BLOCK_BYTES: usize = 66;
+const IQ2_XS_BLOCK_BYTES: usize = 74;
+const IQ2_S_BLOCK_BYTES: usize = 82;
+const IQ3_XXS_BLOCK_BYTES: usize = 98;
+const IQ3_S_BLOCK_BYTES: usize = 110;
+const IQ1_S_BLOCK_BYTES: usize = 50;
+const IQ1_M_BLOCK_BYTES: usize = 56;
 
 /// Per-type byte-size helper (matches ggml_type_size in llama.cpp).
 fn blockBytes(t: u32) usize {
@@ -171,11 +176,11 @@ fn blockBytes(t: u32) usize {
         KT_TYPE_Q3_K => Q3_K_BLOCK_BYTES,
         KT_TYPE_IQ4_XS => IQ4_XS_BLOCK_BYTES,
         KT_TYPE_IQ4_NL => IQ4_NL_BLOCK_BYTES,
-        KT_TYPE_Q2_XXS => Q2_XXS_BLOCK_BYTES,
-        KT_TYPE_Q2_XS => Q2_XS_BLOCK_BYTES,
-        KT_TYPE_Q2_S => Q2_S_BLOCK_BYTES,
-        KT_TYPE_Q3_XXS => Q3_XXS_BLOCK_BYTES,
-        KT_TYPE_Q3_S => Q3_S_BLOCK_BYTES,
+        KT_TYPE_IQ2_XXS => IQ2_XXS_BLOCK_BYTES,
+        KT_TYPE_IQ2_XS => IQ2_XS_BLOCK_BYTES,
+        KT_TYPE_IQ2_S => IQ2_S_BLOCK_BYTES,
+        KT_TYPE_IQ3_XXS => IQ3_XXS_BLOCK_BYTES,
+        KT_TYPE_IQ3_S => IQ3_S_BLOCK_BYTES,
         KT_TYPE_IQ1_S => IQ1_S_BLOCK_BYTES,
         KT_TYPE_IQ1_M => IQ1_M_BLOCK_BYTES,
         else => 0,
@@ -186,11 +191,12 @@ fn blockBytes(t: u32) usize {
 fn blockSize(t: u32) usize {
     return switch (t) {
         KT_TYPE_Q8_0 => Q8_0_BLK,
+        KT_TYPE_IQ4_NL => Q4_NL_BLK, // 32 — NOT 256 (ggml_blck_size[IQ4_NL])
         KT_TYPE_Q4_K, KT_TYPE_Q5_K, KT_TYPE_Q6_K, KT_TYPE_Q8_K,
         KT_TYPE_Q2_K, KT_TYPE_Q3_K,
-        KT_TYPE_IQ4_XS, KT_TYPE_IQ4_NL,
-        KT_TYPE_Q2_XXS, KT_TYPE_Q2_XS, KT_TYPE_Q2_S,
-        KT_TYPE_Q3_XXS, KT_TYPE_Q3_S,
+        KT_TYPE_IQ4_XS,
+        KT_TYPE_IQ2_XXS, KT_TYPE_IQ2_XS, KT_TYPE_IQ2_S,
+        KT_TYPE_IQ3_XXS, KT_TYPE_IQ3_S,
         KT_TYPE_IQ1_S, KT_TYPE_IQ1_M,
         => QK_K,
         else => 0,
@@ -228,11 +234,11 @@ pub fn gemmQuant(
         KT_TYPE_Q8_K => gemm_q8_k.gemmQ8_KScalar(a, lda, @as([*]const gemm_q8_k.BlockQ8_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
         KT_TYPE_Q2_K => gemm_q2_k.gemmQ2_KScalar(a, lda, @as([*]const gemm_q2_k.BlockQ2_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
         KT_TYPE_Q3_K => gemm_q3_k.gemmQ3_KScalar(a, lda, @as([*]const gemm_q3_k.BlockQ3_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
-        KT_TYPE_Q2_XXS => gemm_iq2_xxs.gemmIQ2_XXSScalar(a, @as([*]const gemm_iq2_xxs.BlockIQ2_XXS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
-        KT_TYPE_Q2_XS => gemm_iq2_xs.gemmIQ2_XSScalar(a, @as([*]const gemm_iq2_xs.BlockIQ2_XS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
-        KT_TYPE_Q2_S => gemm_iq2_s.gemmIQ2_SScalar(a, @as([*]const gemm_iq2_s.BlockIQ2_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
-        KT_TYPE_Q3_XXS => gemm_iq3_xxs.gemmIQ3_XXSScalar(a, @as([*]const gemm_iq3_xxs.BlockIQ3_XXS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
-        KT_TYPE_Q3_S => gemm_iq3_s.gemmIQ3_SScalar(a, @as([*]const gemm_iq3_s.BlockIQ3_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ2_XXS => gemm_iq2_xxs.gemmIQ2_XXSScalar(a, @as([*]const gemm_iq2_xxs.BlockIQ2_XXS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ2_XS => gemm_iq2_xs.gemmIQ2_XSScalar(a, @as([*]const gemm_iq2_xs.BlockIQ2_XS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ2_S => gemm_iq2_s.gemmIQ2_SScalar(a, @as([*]const gemm_iq2_s.BlockIQ2_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ3_XXS => gemm_iq3_xxs.gemmIQ3_XXSScalar(a, @as([*]const gemm_iq3_xxs.BlockIQ3_XXS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ3_S => gemm_iq3_s.gemmIQ3_SScalar(a, @as([*]const gemm_iq3_s.BlockIQ3_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ1_S => gemm_iq1_s.gemmIQ1_SScalar(a, @as([*]const gemm_iq1_s.BlockIQ1_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ1_M => gemm_iq1_m.gemmIQ1_MScalar(a, @as([*]const gemm_iq1_m.BlockIQ1_M, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ4_XS => gemm_iq4_xs.gemmIQ4_XSScalar(a, @as([*]const gemm_iq4_xs.BlockIQ4_XS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
@@ -681,3 +687,34 @@ test "LlamaMoe: forward with zero weights produces 0 input" {
     // work fine but the test is gated to keep the suite fast).
     moe.loadWeights(inter, 0);
 }
+
+// ============================================================================
+// Comptime audit: block byte-sizes are ABI contracts.
+// Cross-checked against @sizeOf of the real Block structs — any drift
+// fails the BUILD, not at a customer's runtime. (Added after the
+// 2026-09-03 audit caught 9 wrong block sizes shipped in 5177bdf.)
+// NOTE: the KT_TYPE-vs-main.zig enum audit lives in
+// tests/kernels/llamafile_moe_capi_tests.zig — kernels may NOT import
+// main.zig (sentrux layering contract, .sentrux/rules.toml).
+// ============================================================================
+
+comptime {
+    // Block byte-sizes must match @sizeOf of the real structs.
+    if (Q8_0_BLOCK_BYTES != @sizeOf(gemm_q8_0.BlockQ8_0)) @compileError("Q8_0_BLOCK_BYTES != @sizeOf(BlockQ8_0)");
+    if (Q4_K_BLOCK_BYTES != @sizeOf(gemm_q4_k.BlockQ4_K)) @compileError("Q4_K_BLOCK_BYTES != @sizeOf(BlockQ4_K)");
+    if (Q5_K_BLOCK_BYTES != @sizeOf(gemm_q5_k.BlockQ5_K)) @compileError("Q5_K_BLOCK_BYTES != @sizeOf(BlockQ5_K)");
+    if (Q6_K_BLOCK_BYTES != @sizeOf(gemm_q6_k.BlockQ6_K)) @compileError("Q6_K_BLOCK_BYTES != @sizeOf(BlockQ6_K)");
+    if (Q8_K_BLOCK_BYTES != @sizeOf(gemm_q8_k.BlockQ8_K)) @compileError("Q8_K_BLOCK_BYTES != @sizeOf(BlockQ8_K)");
+    if (Q2_K_BLOCK_BYTES != @sizeOf(gemm_q2_k.BlockQ2_K)) @compileError("Q2_K_BLOCK_BYTES != @sizeOf(BlockQ2_K)");
+    if (Q3_K_BLOCK_BYTES != @sizeOf(gemm_q3_k.BlockQ3_K)) @compileError("Q3_K_BLOCK_BYTES != @sizeOf(BlockQ3_K)");
+    if (IQ2_XXS_BLOCK_BYTES != @sizeOf(gemm_iq2_xxs.BlockIQ2_XXS)) @compileError("IQ2_XXS_BLOCK_BYTES != @sizeOf(BlockIQ2_XXS)");
+    if (IQ2_XS_BLOCK_BYTES != @sizeOf(gemm_iq2_xs.BlockIQ2_XS)) @compileError("IQ2_XS_BLOCK_BYTES != @sizeOf(BlockIQ2_XS)");
+    if (IQ2_S_BLOCK_BYTES != @sizeOf(gemm_iq2_s.BlockIQ2_S)) @compileError("IQ2_S_BLOCK_BYTES != @sizeOf(BlockIQ2_S)");
+    if (IQ3_XXS_BLOCK_BYTES != @sizeOf(gemm_iq3_xxs.BlockIQ3_XXS)) @compileError("IQ3_XXS_BLOCK_BYTES != @sizeOf(BlockIQ3_XXS)");
+    if (IQ3_S_BLOCK_BYTES != @sizeOf(gemm_iq3_s.BlockIQ3_S)) @compileError("IQ3_S_BLOCK_BYTES != @sizeOf(BlockIQ3_S)");
+    if (IQ1_S_BLOCK_BYTES != @sizeOf(gemm_iq1_s.BlockIQ1_S)) @compileError("IQ1_S_BLOCK_BYTES != @sizeOf(BlockIQ1_S)");
+    if (IQ1_M_BLOCK_BYTES != @sizeOf(gemm_iq1_m.BlockIQ1_M)) @compileError("IQ1_M_BLOCK_BYTES != @sizeOf(BlockIQ1_M)");
+    if (IQ4_NL_BLOCK_BYTES != @sizeOf(gemm_iq4_nl.BlockIQ4_NL)) @compileError("IQ4_NL_BLOCK_BYTES != @sizeOf(BlockIQ4_NL)");
+    if (IQ4_XS_BLOCK_BYTES != @sizeOf(gemm_iq4_xs.BlockIQ4_XS)) @compileError("IQ4_XS_BLOCK_BYTES != @sizeOf(BlockIQ4_XS)");
+}
+

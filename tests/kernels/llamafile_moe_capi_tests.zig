@@ -79,23 +79,52 @@ test "kt_llama_moe C API: rejected when pool is null" {
     const allocator = testing.allocator;
     const config = kt.kt_llama_moe_config_t{
         .expert_num = 1,
-        .num_experts_per_tok = 1,
-        .hidden_size = 32,
-        .intermediate_size = 32,
-        .layer_idx = 0,
-        .pool = null,
-        .gate_type = 16,
-        .up_type = 16,
-        .down_type = 16,
-        .hidden_type = 2,
-        .m_block = 32,
-        .group_min_len = 32,
-        .group_max_len = 1024,
-        .gpu_experts_mask = null,
-        .gate_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
-        .up_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
-        .down_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
-    };
-    _ = config;
-    _ = allocator;
+         .num_experts_per_tok = 1,
+         .hidden_size = 32,
+         .intermediate_size = 32,
+         .layer_idx = 0,
+         .pool = null,
+         .gate_type = 16,
+         .up_type = 16,
+         .down_type = 16,
+         .hidden_type = 2,
+         .m_block = 32,
+         .group_min_len = 32,
+         .group_max_len = 1024,
+         .gpu_experts_mask = null,
+         .gate_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
+         .up_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
+         .down_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
+     };
+     _ = config;
+     _ = allocator;
+}
+
+test "LlamaMoe ABI audit: KT_TYPE constants match main.zig kt_type_t enum" {
+    // Regression test for the 5177bdf bug class: llamafile_moe.zig had
+    // 11 INVENTED KT_TYPE values (e.g. KT_TYPE_Q2_K=20 when the header
+    // says 14; KT_TYPE_IQ3_S=29 matched nothing). A caller passing the
+    // REAL header values would have dispatched to the WRONG kernel or
+    // panicked. This test pins every constant against the enum that
+    // mirrors include/kt_kernel.h.
+    const lm = kt.llamafile_moe;
+    const KT = kt.kt_type_t;
+
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_Q8_0), lm.KT_TYPE_Q8_0);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_Q4_K), lm.KT_TYPE_Q4_K);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_Q5_K), lm.KT_TYPE_Q5_K);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_Q6_K), lm.KT_TYPE_Q6_K);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_Q8_K), lm.KT_TYPE_Q8_K);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_Q2_K), lm.KT_TYPE_Q2_K);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_Q3_K), lm.KT_TYPE_Q3_K);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_IQ2_XXS), lm.KT_TYPE_IQ2_XXS);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_IQ2_XS), lm.KT_TYPE_IQ2_XS);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_IQ2_S), lm.KT_TYPE_IQ2_S);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_IQ3_XXS), lm.KT_TYPE_IQ3_XXS);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_IQ3_S), lm.KT_TYPE_IQ3_S);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_IQ1_S), lm.KT_TYPE_IQ1_S);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_IQ1_M), lm.KT_TYPE_IQ1_M);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_IQ4_NL), lm.KT_TYPE_IQ4_NL);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_IQ4_XS), lm.KT_TYPE_IQ4_XS);
+    try testing.expectEqual(@intFromEnum(KT.KT_TYPE_BF16), lm.KT_TYPE_BF16);
 }
