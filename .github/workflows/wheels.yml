@@ -51,6 +51,8 @@ jobs:
       # exact arity (verify_abi.py) — and the pybind11 shim's struct
       # layouts must match byte-for-byte (audit_layout.py). A silent
       # symbol regression otherwise ships in the wheel.
+      - name: Build default variant for layout audit
+        run: zig build -Dvariant=avx2
       - name: "ABI gate: exports + arity (all variants)"
         run: python3 tools/verify_abi.py
       - name: "ABI gate: pybind11 struct layouts"
