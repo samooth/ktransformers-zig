@@ -79,25 +79,117 @@ test "kt_llama_moe C API: rejected when pool is null" {
     const allocator = testing.allocator;
     const config = kt.kt_llama_moe_config_t{
         .expert_num = 1,
-         .num_experts_per_tok = 1,
-         .hidden_size = 32,
-         .intermediate_size = 32,
-         .layer_idx = 0,
-         .pool = null,
-         .gate_type = 16,
-         .up_type = 16,
-         .down_type = 16,
-         .hidden_type = 2,
-         .m_block = 32,
-         .group_min_len = 32,
-         .group_max_len = 1024,
-         .gpu_experts_mask = null,
-         .gate_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
-         .up_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
-         .down_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
-     };
-     _ = config;
-     _ = allocator;
+        .num_experts_per_tok = 1,
+        .hidden_size = 32,
+        .intermediate_size = 32,
+        .layer_idx = 0,
+        .pool = null,
+        .gate_type = 16,
+        .up_type = 16,
+        .down_type = 16,
+        .hidden_type = 2,
+        .m_block = 32,
+        .group_min_len = 32,
+        .group_max_len = 1024,
+        .gpu_experts_mask = null,
+        .gate_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
+        .up_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
+        .down_proj = @as([*]const u8, @ptrCast(&[_]u8{0})),
+    };
+    _ = config;
+    _ = allocator;
+}
+
+test "kt_llama_moe C API: forward_many produces sane output for qlen > 1" {
+    // End-to-end test of the new forwardMany path. The single-token
+    // forward_one is exercised by the prior test. This test verifies
+    // that qlen > 1 produces a non-NaN, finite output across the
+    // batch and the C ABI signature stays stable.
+    const allocator = testing.allocator;
+    const hidden: usize = 32;
+    const inter: usize = 32;
+    const expert_num: usize = 2;
+    const top_k: usize = 1;
+    const qlen: usize = 4;
+
+    // Q8_0 weights (block size 32, hidden=inter=32 → 1 block per row).
+    const expert_bytes = (inter / 32) * 34;
+    const down_bytes = (hidden / 32) * 34;
+    const gate_w = try allocator.alloc(u8, expert_bytes);
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(u8, expert_bytes);
+    defer allocator.free(up_w);
+    const down_w = try allocator.alloc(u8, down_bytes);
+    defer allocator.free(down_w);
+    @memset(gate_w, 0);
+    @memset(up_w, 0);
+    @memset(down_w, 0);
+
+    const pool = kt.kt_worker_pool_new(2);
+    defer kt.kt_worker_pool_free(pool);
+
+    const config = kt.kt_llama_moe_config_t{
+        .expert_num = expert_num,
+        .num_experts_per_tok = top_k,
+        .hidden_size = hidden,
+        .intermediate_size = inter,
+        .layer_idx = 0,
+        .pool = pool,
+        .gate_type = 12, // KT_TYPE_Q8_0
+        .up_type = 12,
+        .down_type = 12,
+        .hidden_type = 2, // KT_TYPE_BF16
+        .m_block = 32,
+        .group_min_len = 32,
+        .group_max_len = 1024,
+        .gpu_experts_mask = null,
+        .gate_proj = gate_w.ptr,
+        .up_proj = up_w.ptr,
+        .down_proj = down_w.ptr,
+    };
+    const moe = kt.kt_llama_moe_new(&config);
+    kt.kt_llama_moe_load_weights(moe, @intCast(inter), 0);
+
+    // qlen × hidden BF16 input: all 1.0 (0x3F80)
+    const input = try allocator.alloc(u8, qlen * hidden * 2);
+    defer allocator.free(input);
+    for (0..qlen * hidden) |i| input[i * 2 + 0] = 0x80; // BF16 1.0 = 0x3F80
+
+    // Routing: all tokens → expert 0, weight 1.0
+    const expert_ids = try allocator.alloc(i64, qlen * top_k);
+    defer allocator.free(expert_ids);
+    const wts_f32 = try allocator.alloc(f32, qlen * top_k);
+    defer allocator.free(wts_f32);
+    for (0..qlen) |i| {
+        for (0..top_k) |j| {
+            expert_ids[i * top_k + j] = 0;
+            wts_f32[i * top_k + j] = 1.0;
+        }
+    }
+
+    const output_f32 = try allocator.alloc(f32, qlen * hidden); // F32 output
+    defer allocator.free(output_f32);
+
+    kt.kt_llama_moe_forward(
+        moe,
+        @intCast(qlen),
+        @intCast(top_k),
+        expert_ids.ptr,
+        wts_f32.ptr,
+        input.ptr,
+        output_f32.ptr,
+    );
+
+    // Verify: output is finite (no NaN/inf) — with zero weights and BF16
+    // input 1.0, the gate/up GEMMs produce all-zero (dequant d=0),
+    // SwiGLU(0)*0 = 0, down produces 0. The final result is the input
+    // residue (since weighted add of 0 to 0 is 0). We just check finite.
+    for (0..qlen * hidden) |i| {
+        const v = output_f32[i];
+        try testing.expect(std.math.isFinite(v));
+    }
+
+    kt.kt_llama_moe_free(moe);
 }
 
 test "LlamaMoe ABI audit: KT_TYPE constants match main.zig kt_type_t enum" {

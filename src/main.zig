@@ -939,25 +939,19 @@ pub export fn kt_llama_moe_forward(
     output: [*]f32,
 ) void {
     const m: *llamafile_moe.LlamaMoe = @ptrCast(@alignCast(llm));
-    // First cut: forward_one (single-token decode). The qlen > 1 path
-    // (forward_many) is a follow-up — the per-row buffers (m_*) are
-    // not yet allocated.
-    if (qlen == 1) {
-        m.forward(@intCast(k), expert_ids, weights, input, output);
-    } else {
-        // Loop: call forward_one per token (correct, not optimal).
-        for (0..@as(usize, @intCast(qlen))) |i| {
-            const in_off: usize = i * m.config.hidden_size * 2; // BF16 = 2 bytes
-            const out_off: usize = i * m.config.hidden_size;
-            m.forward(
-                @intCast(k),
-                expert_ids + i * @as(usize, @intCast(k)),
-                weights + i * @as(usize, @intCast(k)),
-                input + in_off,
-                output + out_off,
-            );
-        }
-    }
+    // forwardMany handles qlen=1 and qlen>1 in one path (per-token
+    // sequential for now; per-expert batched parallel is the follow-up
+    // — see the TODO in src/kernels/moe/llamafile_moe.zig). The C ABI
+    // always passes output as BF16 [qlen, hidden_size] (the F32->BF16
+    // conversion happens inside forwardMany).
+    m.forwardMany(
+        @intCast(qlen),
+        @intCast(k),
+        expert_ids,
+        weights,
+        input,
+        output,
+    );
 }
 
 export fn kt_moe_new_sft(cpuinfer: *KT_CPUInfer, config: kt_moe_sft_config_t) *KT_MOE {
