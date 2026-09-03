@@ -66,8 +66,30 @@ pub const GemmKernel224Int4 = struct {
     pub const N_STEP = 32;
     pub const K_STEP = 64;
 
-    pub const N_BLOCK = 64;
-    pub const K_BLOCK = 3584;
+    // A4: runtime-overridable block sizes (mirrors gemm_224_bf16.zig).
+    pub var N_BLOCK: usize = 64;
+    pub var K_BLOCK: usize = 3584;
+
+    pub const DEFAULT_N_BLOCK: usize = 64;
+    pub const DEFAULT_K_BLOCK: usize = 3584;
+
+    /// Override the block sizes from measured cache hierarchy. Invalid
+    /// or out-of-range values keep the defaults.
+    pub fn setTileParams(n_block_in: usize, k_block_in: usize) void {
+        if (n_block_in >= N_STEP and n_block_in % N_STEP == 0) {
+            N_BLOCK = n_block_in;
+        }
+        if (k_block_in >= K_STEP and k_block_in % K_STEP == 0) {
+            K_BLOCK = k_block_in;
+        }
+    }
+
+    /// Restore the compiled-in defaults.
+    pub fn resetTileParams() void {
+        N_BLOCK = DEFAULT_N_BLOCK;
+        K_BLOCK = DEFAULT_K_BLOCK;
+    }
+
     pub const GROUP_SIZE = 32;   // GPTQ group size
 
     pub fn name() []const u8 { return "INT4_GPTQ"; }

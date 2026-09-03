@@ -13,6 +13,8 @@ const gemm_bf16 = root.gemm_bf16;
 const gemm_int8 = root.gemm_int8;
 const gemm_int4 = root.gemm_int4;
 const gemm_fp8 = root.gemm_fp8;
+const gemm_mxfp4 = root.gemm_mxfp4;
+const gemm_mxfp8 = root.gemm_mxfp8;
 const cpu_detect = root.cpu_detect;
 const worker_pool = root.worker_pool;
 const memory = root.memory;
@@ -4722,4 +4724,109 @@ fn lm_blockBytes(lm: anytype, t: u32) usize {
 
 fn gemmQuantDispatch(lm: anytype, fmt: u32, a: [*]const amx.bf16, b: [*]const u8, c: [*]f32, m: usize, n: usize, k: usize) void {
     lm.gemmQuant(fmt, a, b, c, m, n, k);
+}
+
+// ============================================================================
+// K_BLOCK runtime override (extends the BF16 pattern to INT8/INT4/FP8/MXFP4/MXFP8)
+// ============================================================================
+
+test "K_BLOCK runtime override: BF16 set/reset round-trip" {
+    // Mirrors the BF16 setTileParams + resetTileParams pattern (gemm_224_bf16.zig:42-55).
+    // After this commit, the same pattern is replicated across all 6 AMX kernels.
+    const original = gemm_bf16.GemmKernel224BF.K_BLOCK;
+    defer gemm_bf16.GemmKernel224BF.K_BLOCK = original;
+
+    const test_values = [_]usize{ 1792, 448, 896, 3584 };
+    for (test_values) |v| {
+        gemm_bf16.GemmKernel224BF.K_BLOCK = v;
+        try testing.expectEqual(v, gemm_bf16.GemmKernel224BF.K_BLOCK);
+    }
+    // resetTileParams restores the compiled-in default
+    gemm_bf16.GemmKernel224BF.resetTileParams();
+    try testing.expectEqual(@as(usize, 1792), gemm_bf16.GemmKernel224BF.K_BLOCK);
+}
+
+test "K_BLOCK runtime override: INT8 set/reset round-trip" {
+    const original = gemm_int8.GemmKernel224Int8.K_BLOCK;
+    defer gemm_int8.GemmKernel224Int8.K_BLOCK = original;
+
+    const test_values = [_]usize{ 3584, 448, 896, 1792 };
+    for (test_values) |v| {
+        gemm_int8.GemmKernel224Int8.K_BLOCK = v;
+        try testing.expectEqual(v, gemm_int8.GemmKernel224Int8.K_BLOCK);
+    }
+    gemm_int8.GemmKernel224Int8.resetTileParams();
+    try testing.expectEqual(@as(usize, 3584), gemm_int8.GemmKernel224Int8.K_BLOCK);
+}
+
+test "K_BLOCK runtime override: INT4 set/reset round-trip" {
+    const original = gemm_int4.GemmKernel224Int4.K_BLOCK;
+    defer gemm_int4.GemmKernel224Int4.K_BLOCK = original;
+
+    const test_values = [_]usize{ 3584, 448, 896, 1792 };
+    for (test_values) |v| {
+        gemm_int4.GemmKernel224Int4.K_BLOCK = v;
+        try testing.expectEqual(v, gemm_int4.GemmKernel224Int4.K_BLOCK);
+    }
+    gemm_int4.GemmKernel224Int4.resetTileParams();
+    try testing.expectEqual(@as(usize, 3584), gemm_int4.GemmKernel224Int4.K_BLOCK);
+}
+
+test "K_BLOCK runtime override: FP8 set/reset round-trip" {
+    const original = gemm_fp8.GemmKernel224FP8.K_BLOCK;
+    defer gemm_fp8.GemmKernel224FP8.K_BLOCK = original;
+
+    const test_values = [_]usize{ 3584, 448, 896, 1792 };
+    for (test_values) |v| {
+        gemm_fp8.GemmKernel224FP8.K_BLOCK = v;
+        try testing.expectEqual(v, gemm_fp8.GemmKernel224FP8.K_BLOCK);
+    }
+    gemm_fp8.GemmKernel224FP8.resetTileParams();
+    try testing.expectEqual(@as(usize, 3584), gemm_fp8.GemmKernel224FP8.K_BLOCK);
+}
+
+test "K_BLOCK runtime override: MXFP4 set/reset round-trip" {
+    const original = gemm_mxfp4.GemmKernel224MXFP4.K_BLOCK;
+    defer gemm_mxfp4.GemmKernel224MXFP4.K_BLOCK = original;
+
+    const test_values = [_]usize{ 3584, 448, 896, 1792 };
+    for (test_values) |v| {
+        gemm_mxfp4.GemmKernel224MXFP4.K_BLOCK = v;
+        try testing.expectEqual(v, gemm_mxfp4.GemmKernel224MXFP4.K_BLOCK);
+    }
+    gemm_mxfp4.GemmKernel224MXFP4.resetTileParams();
+    try testing.expectEqual(@as(usize, 3584), gemm_mxfp4.GemmKernel224MXFP4.K_BLOCK);
+}
+
+test "K_BLOCK runtime override: MXFP8 set/reset round-trip" {
+    const original = gemm_mxfp8.GemmKernel224MXFP8.K_BLOCK;
+    defer gemm_mxfp8.GemmKernel224MXFP8.K_BLOCK = original;
+
+    const test_values = [_]usize{ 3584, 448, 896, 1792 };
+    for (test_values) |v| {
+        gemm_mxfp8.GemmKernel224MXFP8.K_BLOCK = v;
+        try testing.expectEqual(v, gemm_mxfp8.GemmKernel224MXFP8.K_BLOCK);
+    }
+    gemm_mxfp8.GemmKernel224MXFP8.resetTileParams();
+    try testing.expectEqual(@as(usize, 3584), gemm_mxfp8.GemmKernel224MXFP8.K_BLOCK);
+}
+
+test "K_BLOCK setTileParams rejects non-aligned values (validation)" {
+    // Per the BF16 pattern: values below K_STEP or not aligned to K_STEP
+    // are silently rejected (the default is kept). This is a safety net
+    // so a bad tune can't corrupt the kernel state.
+    const original = gemm_bf16.GemmKernel224BF.K_BLOCK;
+    defer gemm_bf16.GemmKernel224BF.K_BLOCK = original;
+
+    // Non-aligned value (K_STEP=32 for BF16, so 100 is not a multiple)
+    gemm_bf16.GemmKernel224BF.setTileParams(256, 100);
+    try testing.expectEqual(@as(usize, 1792), gemm_bf16.GemmKernel224BF.K_BLOCK); // default kept
+
+    // Below K_STEP
+    gemm_bf16.GemmKernel224BF.setTileParams(256, 16);
+    try testing.expectEqual(@as(usize, 1792), gemm_bf16.GemmKernel224BF.K_BLOCK); // default kept
+
+    // Aligned, valid
+    gemm_bf16.GemmKernel224BF.setTileParams(256, 224);
+    try testing.expectEqual(@as(usize, 224), gemm_bf16.GemmKernel224BF.K_BLOCK);
 }

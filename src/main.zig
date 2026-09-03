@@ -738,11 +738,26 @@ fn tuneTileParamsForHost() void {
     const allocator = defaultAllocator();
     var cpu = cpu_detect.detectCpu(allocator) catch {
         gemm_bf16.GemmKernel224BF.resetTileParams();
+        gemm_int8.GemmKernel224Int8.resetTileParams();
+        gemm_int4.GemmKernel224Int4.resetTileParams();
+        gemm_fp8.GemmKernel224FP8.resetTileParams();
+        gemm_mxfp4.GemmKernel224MXFP4.resetTileParams();
+        gemm_mxfp8.GemmKernel224MXFP8.resetTileParams();
         return;
     };
     defer cpu.deinit(allocator);
     const tp = cpu_detect.selectTileParams(cpu);
+    // The tile params are derived from the same measured cache hierarchy for
+    // all 6 kernels (BF16, INT8, INT4, FP8, MXFP4, MXFP8). Each kernel
+    // re-validates the input against its own K_STEP / N_STEP in its
+    // setTileParams function and falls back to the per-kernel default on
+    // out-of-range or non-aligned values.
     gemm_bf16.GemmKernel224BF.setTileParams(tp.n_block, tp.k_block);
+    gemm_int8.GemmKernel224Int8.setTileParams(tp.n_block, tp.k_block);
+    gemm_int4.GemmKernel224Int4.setTileParams(tp.n_block, tp.k_block);
+    gemm_fp8.GemmKernel224FP8.setTileParams(tp.n_block, tp.k_block);
+    gemm_mxfp4.GemmKernel224MXFP4.setTileParams(tp.n_block, tp.k_block);
+    gemm_mxfp8.GemmKernel224MXFP8.setTileParams(tp.n_block, tp.k_block);
 }
 
 export fn kt_cpuinfer_new(thread_count: c_int) *KT_CPUInfer {
