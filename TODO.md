@@ -1,8 +1,15 @@
 # ktransformers-zig TODO
 
-## Status: Beta (All workstreams closed; 10/10 GGML formats + 156 tests)
+## Status: Beta (All workstreams closed; 15/15 GGML formats + 200+ tests)
 
-Last updated: 2026-09-02
+Last updated: 2026-09-03
+
+### Coordination protocol (multi-agent)
+**CLAIM before you code.** Before starting a new task, add a claim line
+in the relevant section: `- [ ] <task> — CLAIMED by <agent> since <date>`.
+This prevents parallel collisions (we hit one with LlamaMoe: two agents
+independently ported the same LLAMA_MOE_TP to Zig in the same session).
+Claims are removed when the task is done; abandoned claims can be reclaimed.
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
 **Tests: WORKING** - `zig build test` runs all suites: 73 kernels + 11 MLA + 9 MLA C-API + 9 Qwen3 MoE + 2 FP8 + 9 GGML C API + 7 aarch64 + 4 NEON kernel + 2 allocator C API = **156 total pass, 0 leaks, exit 0**.
