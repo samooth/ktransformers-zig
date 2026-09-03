@@ -28,7 +28,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0-dev
+          version: master
 
       - name: Build ${{ matrix.variant }}
         run: zig build -Dvariant=${{ matrix.variant }}
@@ -49,7 +49,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0-dev
+          version: master
 
       - name: Build all variants
         run: zig build all-variants
@@ -79,7 +79,7 @@ jobs:
       - name: Install Zig
         uses: mlugg/setup-zig@v1
         with:
-          version: 0.16.0-dev
+          version: master
 
       - name: Set up Python
         uses: actions/setup-python@v5
