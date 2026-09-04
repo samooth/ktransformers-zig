@@ -28,7 +28,7 @@ pub const std_options: std.Options = .{
 var log_err_count: usize = 0;
 var fba: std.heap.FixedBufferAllocator = .init(&fba_buffer);
 var fba_buffer: [8192]u8 = undefined;
-const runner_threaded_io: Io = Io.Threaded.global_single_threaded.ioBasic();
+const runner_threaded_io: Io = Io.Threaded.global_single_threaded.io();
 
 var is_fuzz_test: bool = false;
 

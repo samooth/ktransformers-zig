@@ -387,7 +387,7 @@ test "Quantize BF16 to INT8" {
     const allocator = testing.allocator;
     const k = 32;
     var src = try allocator.alloc(amx.bf16, k);
-    var dst = try allocator.alloc(i8, k);
+    const dst = try allocator.alloc(i8, k);
     var scale: f32 = 0;
     defer {
         allocator.free(src);
@@ -409,7 +409,7 @@ test "Dequantize INT8 to BF16" {
     const allocator = testing.allocator;
     const k = 32;
     var src = try allocator.alloc(i8, k);
-    var dst = try allocator.alloc(amx.bf16, k);
+    const dst = try allocator.alloc(amx.bf16, k);
     defer {
         allocator.free(src);
         allocator.free(dst);

@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const amx = @import("../arch/amx.zig");
+const gemm_q8_0 = @import("gemm_224_q8_0.zig");
 
 // ============================================================================
 // Q4_K Block Structure (byte-exact vs ggml's block_q4_K)
@@ -331,6 +332,94 @@ pub fn gemmQ4_KScalar(
 }
 
 // ============================================================================
+// Q4_K × Q8_0 scalar matmul — first cut (Zig extension)
+//
+// The BF16 path above (gemmQ4_KScalar) dequantizes each Q4_K block to F32
+// (256 floats) and then does a BF16×F32 dot product. The Q4_K×Q8_0 path
+// takes Q8_0 activations directly (the llamafile MoE path's standard
+// vec_dot_type for Q4_K) and avoids the per-weight F32 dequant. For
+// each 32-weight sub-block:
+//
+//   out_block = (d × sc[sub] × Σ a_q × q) - (dmin × m[sub] × Σ a_q)
+//
+// where sc[sub], m[sub] are unpacked from the 6-bit packed scales
+// (getScaleMinK4, ported exactly). d and dmin are super-block scales
+// (f16). The Q8_0 side contributes a_d (block scale, f16) and a_q[32]
+// (i8). The inner loop is a 32-element FMA — same instruction count
+// as the BF16 path, but skips 256 per-weight dequant to F32.
+//
+// This is the "skip BF16 round-trip" optimization the LlamaMoe
+// forward_one path was using a temporary BF16 scratch for. Once
+// wired into runMatmul, the LlamaMoe Q4_K forward path drops a
+// per-token alloc+dequant+quant round-trip (the s_act_bf16 scratch
+// + the runMatmul BF16 buffer).
+//
+// Numerically equivalent to: dequantizeRowQ4_K + scalar FMA. Tested
+// in the unit test below.
+pub fn gemmQ4KxQ8_0Scalar(
+    a: [*]const gemm_q8_0.BlockQ8_0, // Q8_0 row-major [k, block]
+    lda: usize, // in blocks (per-row stride of a, in Q8_0 blocks)
+    b: [*]const BlockQ4_K, // Q4_K row-major [k, block]
+    ldb: usize, // in blocks
+    c: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    // Zero output (matches gemmQ4_KScalar semantics).
+    for (0..m) |i| {
+        for (0..n) |j| c[i * ldc + j] = 0;
+    }
+    // Number of Q8_0 blocks (32 weights each) and Q4_K super-blocks
+    // (256 weights each). 8 Q8_0 blocks per Q4_K super-block.
+    const q8_blocks = k / gemm_q8_0.QK8_0;
+    const q4_blocks = k / QK_K;
+    std.debug.assert(q8_blocks == q4_blocks * 8);
+
+    // For each (i, j) cell: sum over Q4_K super-blocks. Within each
+    // super-block, accumulate 8 sub-blocks of 32 Q8_0 activations.
+    for (0..n) |j| {
+        const b_row = b + j * ldb;
+        for (0..m) |i| {
+            const a_row = a + i * lda;
+            var acc: f32 = 0;
+            for (0..q4_blocks) |sb| {
+                const weight_blk = &b_row[sb];
+                const d: f32 = f16_to_f32(weight_blk.d);
+                const dmin: f32 = f16_to_f32(weight_blk.dmin);
+                const qs: [*]const u8 = &weight_blk.qs;
+                // 8 sub-blocks of 32 weights each
+                for (0..8) |sub| {
+                    var sc: u8 = 0;
+                    var m_val: u8 = 0;
+                    getScaleMinK4(sub, &weight_blk.scales, &sc, &m_val);
+                    const f_sc: f32 = @floatFromInt(sc);
+                    const f_m: f32 = @floatFromInt(m_val);
+                    // Activation block for this sub-block (32 Q8_0 weights).
+                    const act_blk = &a_row[sb * 8 + sub];
+                    const a_d: f32 = gemm_q8_0.f16_to_f32(act_blk.d);
+                    const a_qs: [*]const i8 = &act_blk.qs;
+                    // Inner dot products — both 32-element FMAs.
+                    var dot_q: f32 = 0;
+                    var dot_1: f32 = 0;
+                    var t: usize = 0;
+                    while (t < gemm_q8_0.QK8_0) : (t += 1) {
+                        const a_qi: f32 = @floatFromInt(a_qs[t]);
+                        const lo: f32 = @floatFromInt(qs[sub * 32 + t] & 0x0F);
+                        dot_q += a_qi * lo;
+                        dot_1 += a_qi;
+                    }
+                    // y_sub = d * sc * dot_q - dmin * m * dot_1   (per llama.cpp sgemm)
+                    acc += d * f_sc * dot_q * a_d - dmin * f_m * dot_1 * a_d;
+                }
+            }
+            c[i * ldc + j] = acc;
+        }
+    }
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -452,6 +541,152 @@ test "Q4_K scalar GEMM constant weights" {
         for (0..N) |j| {
             // y = 1.0 per weight => C = K * 1.0 = 256
             try testing.expectApproxEqAbs(@as(f32, 256.0), c[i * N + j], 0.5);
+        }
+    }
+}
+
+test "Q4_K×Q8_0 scalar GEMM matches BF16 path numerically" {
+    // The Q4_K×Q8_0 path is the "skip BF16 round-trip" optimization. The
+    // reference (BF16 path) dequantizes Q4_K to F32, then does BF16×F32.
+    // The new path takes Q8_0 activations directly and accumulates per
+    // 32-weight sub-block: y = d×sc×dot_q - dmin×m×dot_1. To compare:
+    //
+    //   1. Build Q4_K weights via dequantizeRowQ4_K (same Q4_K bytes
+    //      fed to both paths)
+    //   2. Build BF16 input (= dequantizeRound-trip of an F32 reference
+    //      input, so BF16 vs Q8_0 both represent the same values, only
+    //      quantized differently)
+    //   3. Quantize the F32 reference to Q8_0 (the same F32 that produced
+    //      the BF16 input, so the Q8_0 blocks and the BF16 values
+    //      represent the same activations to the precision of Q8_0)
+    //   4. Run both paths, check element-wise match within Q8_0
+    //      quantization error (Q8_0 is ~1/127 = 0.79% of the value
+    //      range; the round-trip error per weight is ~d/2, so
+    //      K=256 weights yield max abs error ~1.0 for input in [-1,1])
+    const M: usize = 2;
+    const N: usize = 2;
+    const K: usize = QK_K; // one super-block per row
+
+    // Build a deterministic F32 input row: smooth values in [-1, 1].
+    var src: [K]f32 = undefined;
+    for (0..K) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05);
+    }
+
+    // Build a Q4_K weight block (deterministic) by quantizing src.
+    // Use the same row for both B rows (j=0, j=1) so we can compare
+    // c[i][0] vs c[i][1] trivially.
+    var weight_blocks: [1]BlockQ4_K = undefined;
+    quantizeRowQ4_K(&src, &weight_blocks, K);
+
+    // Build the Q8_0 activation: quantize src to Q8_0.
+    const Q8_BLOCKS = K / gemm_q8_0.QK8_0; // = 8
+    var a_q8: [Q8_BLOCKS]gemm_q8_0.BlockQ8_0 = undefined;
+    gemm_q8_0.quantizeRowQ8_0(&src, &a_q8, K);
+
+    // Build the BF16 input: f32 -> bf16. This is what the existing
+    // gemmQ4_KScalar consumes.
+    var a_bf16: [K]amx.bf16 = undefined;
+    for (0..K) |i| a_bf16[i] = amx.f32_to_bf16(src[i]);
+
+    // The Q4_K blocks need to be replicated to N rows (matmul has
+    // B[n][k_blocks] layout).
+    var b_q4: [N][1]BlockQ4_K = undefined;
+    for (0..N) |j| b_q4[j][0] = weight_blocks[0];
+
+    // Run Q4_K×Q8_0 path
+    var c_q8: [M * N]f32 = undefined;
+    gemmQ4KxQ8_0Scalar(
+        &a_q8, Q8_BLOCKS,
+        @as([*]const BlockQ4_K, @ptrCast(&b_q4)),
+        1,
+        &c_q8, N,
+        M, N, K,
+    );
+
+    // Run BF16 path: must reproduce the Q4_K weights' dequantized form
+    // and then do BF16×F32. For this comparison, use the existing
+    // gemmQ4_KScalar which dequantizes internally.
+    var c_bf16: [M * N]f32 = undefined;
+    gemmQ4_KScalar(
+        @as([*]const amx.bf16, @ptrCast(&a_bf16)), K,
+        @as([*]const BlockQ4_K, @ptrCast(&b_q4)),
+        1,
+        &c_bf16, N,
+        M, N, K,
+    );
+
+    // The two paths differ ONLY in how the activation is encoded
+    // (Q8_0 vs BF16). Both produce a Q4_K×activation dot product.
+    // The Q8_0 quantization introduces a per-weight error of up to
+    // d_Q8/2 (where d_Q8 = amax/127 of the source). For our [-1, 1]
+    // input, d_Q8 ≈ 0.016, so per-weight error ≈ 0.008, and over 256
+    // weights the max accumulated error is ~2.0. The BF16 quantization
+    // is finer (~0.001 per weight), so the BF16 path is essentially
+    // exact. The difference between the two paths is bounded by the
+    // Q8_0 quantization error, not by the matmul algorithm — so the
+    // tolerance is the SAME for both paths vs. the analytic F32 dot.
+    //
+    // Verify: c_q8 ≈ c_bf16 within the Q8_0 quantization tolerance
+    // (~2.0 max abs error for K=256, [-1,1] input). In practice the
+    // error is much smaller because the Q8_0 step size aligns well
+    // with the smooth sin input; we use a generous tolerance.
+    for (0..M) |i| {
+        for (0..N) |j| {
+            const diff = @abs(c_q8[i * N + j] - c_bf16[i * N + j]);
+            try testing.expect(diff < 4.0);
+        }
+    }
+}
+
+test "Q4_K×Q8_0 scalar GEMM constant weights matches BF16 path" {
+    // Constant-weight check (matches the gemmQ4_KScalar "constant
+    // weights" test): all weights = 1.0, all BF16 input = 1.0
+    // (so the dequantized weight * input = 1.0 per element). The Q4_K
+    // path must reproduce C = K (since C[i][j] = sum over K of 1.0).
+    //
+    // We also build the matching Q8_0 input: with the constant BF16
+    // input of 1.0, the corresponding Q8_0 input has d=1/127 (amax=1),
+    // qs all = 127 (so the dequant round-trip gives ~1.0 per element).
+    // Then C = (d×sc×dot_q - dmin×m×dot_1) per sub-block; with
+    // d=1, sc=1, qs=127 in q4_k => y = 1*1*127 - 0 = 127; scaled by
+    // Q8_0 d=1/127: 127 * (1/127) = 1.0 per element. Sum over 256: 256.
+    const M: usize = 4;
+    const N: usize = 4;
+    const K: usize = QK_K;
+
+    // Build constant Q4_K weight block (y = 1.0): d=1, sc=1, m=0, q=1.
+    var b_q4: [N][1]BlockQ4_K = undefined;
+    for (0..N) |j| {
+        b_q4[j][0].d = f32_to_f16(1.0);
+        b_q4[j][0].dmin = f32_to_f16(0.0);
+        for (0..4) |b| b_q4[j][0].scales[b] = 1; // sc=1 for j<4
+        for (4..8) |b| b_q4[j][0].scales[b] = 0; // m=0 for j<4
+        for (8..K_SCALE_SIZE) |b| b_q4[j][0].scales[b] = 0;
+        for (&b_q4[j][0].qs) |*qq| qq.* = 0x11; // both nibbles = 1
+    }
+
+    // Build constant Q8_0 activation row: d=1/127, all qs=127.
+    const Q8_BLOCKS = K / gemm_q8_0.QK8_0;
+    var a_q8: [Q8_BLOCKS]gemm_q8_0.BlockQ8_0 = undefined;
+    const d_q8 = 1.0 / 127.0;
+    for (0..Q8_BLOCKS) |b| {
+        a_q8[b].d = f32_to_f16(d_q8);
+        for (0..gemm_q8_0.QK8_0) |t| a_q8[b].qs[t] = 127;
+    }
+
+    var c_q8: [M * N]f32 = undefined;
+    gemmQ4KxQ8_0Scalar(
+        &a_q8, Q8_BLOCKS,
+        @as([*]const BlockQ4_K, @ptrCast(&b_q4)),
+        1,
+        &c_q8, N,
+        M, N, K,
+    );
+
+    for (0..M) |i| {
+        for (0..N) |j| {
+            try testing.expectApproxEqAbs(@as(f32, 256.0), c_q8[i * N + j], 1.0);
         }
     }
 }

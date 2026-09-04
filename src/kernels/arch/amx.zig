@@ -146,7 +146,7 @@ pub fn requestAmxPermission() bool {
 
     // Slow path: try to enable.
     var features: usize = 0;
-    const rc = linux.syscall1(.arch_prctl, ARCH_GET_XCOMP_SUPP, @intFromPtr(&features));
+    const rc = linux.syscall2(.arch_prctl, ARCH_GET_XCOMP_SUPP, @intFromPtr(&features));
     // On x86_64, negative return from syscall is -errno (in range -4095..-1).
     if (rc > 0xFFFFFFFFFFFFF000) {
         amx_enable_state.store(2, .release);
