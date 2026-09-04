@@ -220,3 +220,141 @@ test "LlamaMoe ABI audit: KT_TYPE constants match main.zig kt_type_t enum" {
     try testing.expectEqual(@intFromEnum(KT.KT_TYPE_IQ4_XS), lm.KT_TYPE_IQ4_XS);
     try testing.expectEqual(@intFromEnum(KT.KT_TYPE_BF16), lm.KT_TYPE_BF16);
 }
+
+test "kt_llama_moe C API: parallel (4-thread) == sequential (1-thread) forward" {
+    // Review of 1130d0b: the work-stealing branch shared the instance
+    // s_* scratches across worker threads — a REAL data race (with
+    // valid random Q8_0 weights, 1-thread vs 4-thread outputs diverged
+    // non-deterministically: ~4096/8192 values, different every run).
+    // Fixed with per-token TokenScratch. This test pins the fix:
+    // random-weight forward through a 1-thread pool MUST equal the
+    // same forward through a 4-thread pool, bit for bit.
+    const allocator = testing.allocator;
+    const amx = kt.amx;
+    const q8 = kt.gemm_q8_0;
+
+    const hidden: usize = 256;
+    const inter: usize = 128;
+    const expert_num: usize = 4;
+    const top_k: usize = 2;
+    const qlen: usize = 32;
+
+    // Random (seeded) VALID Q8_0 weights — raw random BYTES would put
+    // NaN f16 scales in the blocks and poison any comparison.
+    const gate_bytes = expert_num * inter * (hidden / 32) * 34;
+    const up_bytes = expert_num * inter * (hidden / 32) * 34;
+    const down_bytes = expert_num * hidden * (inter / 32) * 34;
+    const gate_w = try allocator.alloc(u8, gate_bytes);
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(u8, up_bytes);
+    defer allocator.free(up_w);
+    const down_w = try allocator.alloc(u8, down_bytes);
+    defer allocator.free(down_w);
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+    {
+        const row_f = try allocator.alloc(f32, hidden);
+        defer allocator.free(row_f);
+        for (0..expert_num * inter) |r| {
+            for (row_f) |*v| v.* = @as(f32, @floatFromInt(rnd.int(u8))) / 255.0 - 0.5;
+            q8.quantizeRowQ8_0(row_f, @as([*]q8.BlockQ8_0, @ptrCast(@alignCast(gate_w.ptr + r * (hidden / 32) * 34))), hidden);
+        }
+        for (0..expert_num * inter) |r| {
+            for (row_f) |*v| v.* = @as(f32, @floatFromInt(rnd.int(u8))) / 255.0 - 0.5;
+            q8.quantizeRowQ8_0(row_f, @as([*]q8.BlockQ8_0, @ptrCast(@alignCast(up_w.ptr + r * (hidden / 32) * 34))), hidden);
+        }
+        for (0..expert_num * hidden) |r| {
+            for (row_f[0..inter]) |*v| v.* = @as(f32, @floatFromInt(rnd.int(u8))) / 255.0 - 0.5;
+            q8.quantizeRowQ8_0(row_f[0..inter], @as([*]q8.BlockQ8_0, @ptrCast(@alignCast(down_w.ptr + r * (inter / 32) * 34))), inter);
+        }
+    }
+
+    // Random BF16 input.
+    const input = try allocator.alloc(u8, qlen * hidden * 2);
+    defer allocator.free(input);
+    {
+        const in_bf: [*]amx.bf16 = @ptrCast(@alignCast(input.ptr));
+        for (0..qlen * hidden) |i| {
+            in_bf[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(rnd.int(u8))) / 255.0 - 0.5);
+        }
+    }
+
+    // Routing: every token -> experts {0, 1} with fixed weights.
+    const eids = try allocator.alloc(i64, qlen * top_k);
+    defer allocator.free(eids);
+    const wts = try allocator.alloc(f32, qlen * top_k);
+    defer allocator.free(wts);
+    for (0..qlen) |t| {
+        eids[t * top_k] = 0;
+        eids[t * top_k + 1] = 1;
+        wts[t * top_k] = 0.6;
+        wts[t * top_k + 1] = 0.4;
+    }
+
+    const out_seq = try allocator.alloc(f32, qlen * hidden);
+    defer allocator.free(out_seq);
+    const out_par = try allocator.alloc(f32, qlen * hidden);
+    defer allocator.free(out_par);
+
+    // Sequential (1-thread pool).
+    {
+        const pool = kt.kt_worker_pool_new(1);
+        defer kt.kt_worker_pool_free(pool);
+        const cfg = kt.kt_llama_moe_config_t{
+            .expert_num = expert_num,
+            .num_experts_per_tok = top_k,
+            .hidden_size = hidden,
+            .intermediate_size = inter,
+            .layer_idx = 0,
+            .pool = @ptrCast(pool),
+            .gate_type = 12,
+            .up_type = 12,
+            .down_type = 12,
+            .hidden_type = 2,
+            .m_block = 32,
+            .group_min_len = 32,
+            .group_max_len = 1024,
+            .gpu_experts_mask = null,
+            .gate_proj = gate_w.ptr,
+            .up_proj = up_w.ptr,
+            .down_proj = down_w.ptr,
+        };
+        const moe = kt.kt_llama_moe_new(&cfg);
+        kt.kt_llama_moe_load_weights(moe, @intCast(inter), 0);
+        kt.kt_llama_moe_forward(moe, @intCast(qlen), @intCast(top_k), eids.ptr, wts.ptr, input.ptr, out_seq.ptr);
+        kt.kt_llama_moe_free(moe);
+    }
+    // Parallel (4-thread pool).
+    {
+        const pool = kt.kt_worker_pool_new(4);
+        defer kt.kt_worker_pool_free(pool);
+        const cfg = kt.kt_llama_moe_config_t{
+            .expert_num = expert_num,
+            .num_experts_per_tok = top_k,
+            .hidden_size = hidden,
+            .intermediate_size = inter,
+            .layer_idx = 0,
+            .pool = @ptrCast(pool),
+            .gate_type = 12,
+            .up_type = 12,
+            .down_type = 12,
+            .hidden_type = 2,
+            .m_block = 32,
+            .group_min_len = 32,
+            .group_max_len = 1024,
+            .gpu_experts_mask = null,
+            .gate_proj = gate_w.ptr,
+            .up_proj = up_w.ptr,
+            .down_proj = down_w.ptr,
+        };
+        const moe = kt.kt_llama_moe_new(&cfg);
+        kt.kt_llama_moe_load_weights(moe, @intCast(inter), 0);
+        kt.kt_llama_moe_forward(moe, @intCast(qlen), @intCast(top_k), eids.ptr, wts.ptr, input.ptr, out_par.ptr);
+        kt.kt_llama_moe_free(moe);
+    }
+
+    // Bit-exact: same math, isolated scratch per task.
+    for (0..qlen * hidden) |i| {
+        try testing.expectEqual(out_seq[i], out_par[i]);
+    }
+}

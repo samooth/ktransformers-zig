@@ -939,11 +939,10 @@ pub export fn kt_llama_moe_forward(
     output: [*]f32,
 ) void {
     const m: *llamafile_moe.LlamaMoe = @ptrCast(@alignCast(llm));
-    // forwardMany handles qlen=1 and qlen>1 in one path (per-token
-    // sequential for now; per-expert batched parallel is the follow-up
-    // — see the TODO in src/kernels/moe/llamafile_moe.zig). The C ABI
-    // always passes output as BF16 [qlen, hidden_size] (the F32->BF16
-    // conversion happens inside forwardMany).
+    // forwardMany handles qlen=1 and qlen>1 in one path (sequential
+    // per-token, or work-stealing with isolated per-token scratch).
+    // OUTPUT CONTRACT: output is F32 [qlen, hidden] per the header
+    // ("output is F32") and the C++ forward_many (moe.hpp:726).
     m.forwardMany(
         @intCast(qlen),
         @intCast(k),

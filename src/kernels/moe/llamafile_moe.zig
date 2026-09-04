@@ -520,9 +520,64 @@ pub const LlamaMoe = struct {
         expert_ids: [*]const i64, // [qlen, k]
         weights: [*]const f32, // [qlen, k]
         output_f32: [*]f32, // [qlen, hidden_size]
+        // Per-task scratch (one per token in the chunk). RACE FIX
+        // (review of 1130d0b): the s_* instance scratches were shared
+        // across work-stealing threads — confirmed empirically (1-thread
+        // vs 4-thread runs with identical inputs diverged in
+        // ~1900/8192 outputs, non-deterministic across runs). Each task
+        // now gets an isolated TokenScratch; the instance s_* are only
+        // used by the sequential path.
+        scratches: []TokenScratch,
     };
 
-    var g_token_ctx: ?TokenCtx = null;
+    /// Per-token working set: the 9 s_* scratch buffers, sized for one
+    /// token. Allocated as one contiguous block per token (allocation
+    /// happens once per chunk in forwardMany, NOT per task — this also
+    /// removes the per-task alloc/free in runMatmul that would have
+    /// raced the allocator).
+    const TokenScratch = struct {
+        input_fp32: []f32,
+        gate_input: []u8, // Q8_0 bytes
+        up_input: []u8,
+        gate_output: []f32,
+        up_output: []f32,
+        intermediate_fp32: []f32,
+        down_input: []u8, // Q8_0 bytes
+        down_output: []f32,
+        output_fp32: []f32,
+        act_bf16: []amx.bf16, // dequant target (sized max(hidden, inter))
+
+        fn init(alloc: std.mem.Allocator, hidden: usize, inter: usize) !TokenScratch {
+            const act_len = @max(hidden, inter);
+            return .{
+                .input_fp32 = try alloc.alloc(f32, hidden),
+                .gate_input = try alloc.alloc(u8, q8_0RowBytes(hidden)),
+                .up_input = try alloc.alloc(u8, q8_0RowBytes(hidden)),
+                .gate_output = try alloc.alloc(f32, inter),
+                .up_output = try alloc.alloc(f32, inter),
+                .intermediate_fp32 = try alloc.alloc(f32, inter),
+                .down_input = try alloc.alloc(u8, q8_0RowBytes(inter)),
+                .down_output = try alloc.alloc(f32, hidden),
+                .output_fp32 = try alloc.alloc(f32, hidden),
+                .act_bf16 = try alloc.alloc(amx.bf16, act_len),
+            };
+        }
+
+        fn deinit(self: *TokenScratch, alloc: std.mem.Allocator) void {
+            alloc.free(self.input_fp32);
+            alloc.free(self.gate_input);
+            alloc.free(self.up_input);
+            alloc.free(self.gate_output);
+            alloc.free(self.up_output);
+            alloc.free(self.intermediate_fp32);
+            alloc.free(self.down_input);
+            alloc.free(self.down_output);
+            alloc.free(self.output_fp32);
+            alloc.free(self.act_bf16);
+        }
+    };
+
+    var g_token_ctx: ?*TokenCtx = null;
 
     fn parallelTokenTask(t: usize) void {
         const ctx = g_token_ctx orelse @panic("parallelTokenTask: no ctx");
@@ -531,35 +586,145 @@ pub const LlamaMoe = struct {
         const output_token: [*]f32 = ctx.output_f32 + t * hidden;
         const eids: [*]const i64 = ctx.expert_ids + t * ctx.k;
         const wts: [*]const f32 = ctx.weights + t * ctx.k;
-        // The s_input_fp32, s_gate_input, s_up_input, s_gate_output,
-        // s_up_output, s_intermediate_fp32, s_down_input, s_down_output,
-        // s_output_fp32 scratches are all instance-level (s_*) and are
-        // not shared across tasks in the parallel branch (work-stealing
-        // jobs run on different threads but each task uses its own MoE
-        // instance — see the LlamaMoe.copy_in_threads_ pattern in the
-        // C++). For the single-instance parallel path, we'd need
-        // per-task scratch arrays, which is the follow-up mentioned
-        // above. For now, we run the parallel path on the
-        // single-task fallback.
-        ctx.self.forwardOne(
-            t,
+        // t indexes the per-task scratch — no shared writes remain
+        // except output_f32 rows, which are disjoint per task.
+        ctx.self.forwardOneScratch(
             ctx.k,
             eids,
             wts,
             input_token,
             output_token,
+            &ctx.scratches[t],
         );
     }
 
-    /// Batch forward (qlen ≥ 1). When `qlen == 1` or no pool is
-    /// configured, runs sequentially via `forward_one` (the existing
-    /// single-token path). For qlen > 1 with a pool, currently also
-    /// uses the sequential path per token (the per-expert batched
-    /// path is the follow-up). The wrapper ensures the C ABI is
-    /// honored in both cases.
+    /// The scratch-driven variant of forwardOne: identical math, but
+    /// all intermediates live in `scr` (per-task) instead of the
+    /// instance s_*. forwardOneExpertScratch is the same split below.
+    fn forwardOneScratch(
+        self: *LlamaMoe,
+        k: usize,
+        expert_ids: [*]const i64,
+        weights: [*]const f32,
+        input: [*]const u8, // BF16 [hidden_size]
+        output: [*]f32, // F32 [hidden_size]
+        scr: *TokenScratch,
+    ) void {
+        const cfg = self.config;
+        const hidden = cfg.hidden_size;
+
+        bf16ToF32(input[0 .. hidden * 2], scr.input_fp32);
+        f32ToQ8_0(scr.input_fp32, scr.gate_input.ptr);
+        @memcpy(scr.up_input, scr.gate_input);
+
+        @memset(scr.output_fp32[0..hidden], 0);
+        for (0..k) |j| {
+            const eid = expert_ids[j];
+            if (self.shouldSkipExpert(eid)) continue;
+            const w = weights[j];
+            self.forwardOneExpertScratch(eid, w, scr);
+        }
+        @memcpy(output[0..hidden], scr.output_fp32[0..hidden]);
+    }
+
+    fn forwardOneExpertScratch(
+        self: *LlamaMoe,
+        eid: i64,
+        weight: f32,
+        scr: *TokenScratch,
+    ) void {
+        const cfg = self.config;
+        const hidden_size = cfg.hidden_size;
+        const intermediate_size = cfg.intermediate_size;
+        const ei: usize = @intCast(eid);
+
+        // gate @ input → scr.gate_output
+        self.runMatmulScratch(
+            cfg.gate_type,
+            self.m_local_gate_proj.ptr + ei * expertWeightBytes(cfg.gate_type, intermediate_size, hidden_size),
+            scr.gate_input.ptr,
+            scr.gate_output.ptr,
+            1,
+            intermediate_size,
+            hidden_size,
+            scr,
+        );
+        // up @ input → scr.up_output
+        self.runMatmulScratch(
+            cfg.up_type,
+            self.m_local_up_proj.ptr + ei * expertWeightBytes(cfg.up_type, intermediate_size, hidden_size),
+            scr.up_input.ptr,
+            scr.up_output.ptr,
+            1,
+            intermediate_size,
+            hidden_size,
+            scr,
+        );
+
+        // SwiGLU: intermediate = silu(gate) * up
+        for (0..intermediate_size) |i| {
+            const g = scr.gate_output[i];
+            const u = scr.up_output[i];
+            scr.intermediate_fp32[i] = silu(g) * u;
+        }
+
+        // Quantize intermediate → Q8_0
+        f32ToQ8_0(scr.intermediate_fp32, scr.down_input.ptr);
+
+        // down @ intermediate → scr.down_output
+        self.runMatmulScratch(
+            cfg.down_type,
+            self.m_local_down_proj.ptr + ei * expertWeightBytes(cfg.down_type, hidden_size, intermediate_size),
+            scr.down_input.ptr,
+            scr.down_output.ptr,
+            1,
+            hidden_size,
+            intermediate_size,
+            scr,
+        );
+
+        // Weighted add into scr.output_fp32
+        for (0..hidden_size) |i| {
+            scr.output_fp32[i] += scr.down_output[i] * weight;
+        }
+    }
+
+    /// runMatmul variant that uses the per-task scratch for the BF16
+    /// activation dequant (removes the per-task allocator.alloc/free —
+    /// the scratch slice is sized to the larger of gate/up/down k).
+    fn runMatmulScratch(
+        self: *LlamaMoe,
+        weight_type: u32,
+        weight_ptr: [*]const u8,
+        act_q8_0: [*]const u8,
+        out: [*]f32,
+        m: usize,
+        n: usize,
+        kk: usize,
+        scr: *TokenScratch,
+    ) void {
+        _ = self;
+        // The act_bf16 scratch is sized for `hidden` and `inter`;
+        // both are ≤ max(hidden, inter) so one buffer covers all
+        // three projections.
+        const scr_len = scr.act_bf16.len;
+        if (scr_len < kk) @panic("TokenScratch act_bf16 too small");
+        dequantQ8_0ToBF16(act_q8_0, scr.act_bf16.ptr, kk);
+        gemmQuant(weight_type, scr.act_bf16.ptr, weight_ptr, out, m, n, kk);
+    }
+
+    /// Batch forward (qlen ≥ 1). Sequential per-token when no pool or
+    /// qlen == 1; work-stealing per-token otherwise (each task owns an
+    /// isolated TokenScratch — see the RACE FIX note on TokenCtx).
     ///
     /// For qlen > group_max_len, multiple rounds are issued (mirrors
     /// the C++ `forward_long_tokens` path in moe.hpp:159).
+    ///
+    /// OUTPUT CONTRACT (review of 1130d0b): `output` is **F32**
+    /// [qlen, hidden] — per include/kt_kernel.h ("output is F32") and
+    /// the C++ forward_many (moe.hpp:726 writes float* directly). The
+    /// previous version wrote BF16 bytes through the f32 pointer,
+    /// corrupting the upper half of the caller's buffer.
     pub fn forwardMany(
         self: *LlamaMoe,
         qlen: usize,
@@ -572,28 +737,18 @@ pub const LlamaMoe = struct {
         const cfg = self.config;
         const hidden = cfg.hidden_size;
 
-        // Allocate F32 output buffer (the per-token reduction is
-        // F32 internally; the chunk converts to BF16 at the end).
-        const out_f32 = self.allocator.alloc(f32, qlen * hidden) catch @panic("OOM out_f32");
-        defer self.allocator.free(out_f32);
-        @memset(out_f32[0..qlen * hidden], 0);
-
-        // Per-token forward (sequential). For qlen > group_max_len, we
-        // chunk the batch in slices of group_max_len tokens (mirrors
-        // the C++ `forward_long_tokens` path in moe.hpp:165-175). The
-        // qlen = 1 fast path is a single chunk.
         const chunk = @min(cfg.group_max_len, qlen);
-        const out_f32_ptr: [*]f32 = out_f32.ptr;
         var chunk_start: usize = 0;
         while (chunk_start < qlen) {
             const chunk_len = @min(chunk, qlen - chunk_start);
             const base_in: [*]const u8 = input + chunk_start * hidden * 2; // BF16
-            const base_out: [*]f32 = out_f32_ptr + chunk_start * hidden;
+            const base_out: [*]f32 = output + chunk_start * hidden;
             const base_eids: [*]const i64 = expert_ids + chunk_start * k;
             const base_wts: [*]const f32 = weights + chunk_start * k;
 
             if (chunk_len == 1 or cfg.pool == null) {
-                // Sequential per-token.
+                // Sequential per-token (the s_* instance scratches are
+                // safe here — single thread).
                 for (0..chunk_len) |t| {
                     self.forwardOne(
                         t,
@@ -605,14 +760,20 @@ pub const LlamaMoe = struct {
                     );
                 }
             } else {
-                // Parallel per-token. Each task computes one token's
-                // contribution into its own out_f32 slice. Per-task
-                // scratch is currently the shared s_*_* (correct for
-                // single-task sequential but would need a copy in the
-                // parallel branch — see the follow-up TODO at the
-                // bottom of this file). For now, the parallel branch
-                // behaves identically to the sequential branch.
-                g_token_ctx = .{
+                // Parallel per-token: allocate chunk_len isolated
+                // scratches up front (one alloc burst, freed after the
+                // job — no allocator traffic inside the tasks, no
+                // shared state between tasks).
+                const scratches = self.allocator.alloc(TokenScratch, chunk_len) catch @panic("OOM scratches");
+                defer self.allocator.free(scratches);
+                for (scratches) |*scr| {
+                    scr.* = TokenScratch.init(self.allocator, hidden, cfg.intermediate_size) catch @panic("OOM scratch");
+                }
+                defer for (scratches) |*scr| {
+                    scr.deinit(self.allocator);
+                };
+
+                var ctx = TokenCtx{
                     .self = self,
                     .input = base_in,
                     .qlen = chunk_len,
@@ -621,7 +782,9 @@ pub const LlamaMoe = struct {
                     .expert_ids = base_eids,
                     .weights = base_wts,
                     .output_f32 = base_out,
+                    .scratches = scratches,
                 };
+                g_token_ctx = &ctx;
                 defer g_token_ctx = null;
                 const pool: *worker_pool.WorkerPool = cfg.pool.?;
                 const subpool = pool.subpools[0];
@@ -629,13 +792,9 @@ pub const LlamaMoe = struct {
             }
             chunk_start += chunk;
         }
-
-        // F32 → BF16: caller (the C ABI for kt_llama_moe_forward)
-        // expects BF16 output [qlen, hidden_size].
-        for (0..qlen * hidden) |i| {
-            const out_bytes: [*]amx.bf16 = @ptrCast(@alignCast(output));
-            out_bytes[i] = amx.f32_to_bf16(out_f32[i]);
-        }
+        // Output is F32 [qlen, hidden] — written in place by the tasks
+        // (per-token rows are disjoint). No BF16 conversion: the C ABI
+        // contract (header) and the C++ both use float*.
     }
 
     /// Single-token forward: quantize BF16 → Q8_0, then per-expert
