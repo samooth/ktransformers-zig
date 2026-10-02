@@ -7,3 +7,8 @@ toinclude/
 *.backup
 *.backup2
 __pycache__/
+
+# bench/cpp_vs_zig build artifacts + captured outputs
+bench/cpp_vs_zig/out/
+bench/cpp_vs_zig/cpp_bench
+bench/cpp_vs_zig/zig_bench

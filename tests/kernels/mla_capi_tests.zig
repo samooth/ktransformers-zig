@@ -348,10 +348,10 @@ fn makePagedMla(
 test "kt_mla_forward paged: scrambled pages match identity pages" {
     const allocator = testing.allocator;
 
-    var run_a = try makePagedMla(allocator, 0.01);
+    const run_a = try makePagedMla(allocator, 0.01);
     defer allocator.free(run_a.weights);
     defer kt.kt_mla_free(run_a.mla);
-    var run_b = try makePagedMla(allocator, 0.01);
+    const run_b = try makePagedMla(allocator, 0.01);
     defer allocator.free(run_b.weights);
     defer kt.kt_mla_free(run_b.mla);
 
@@ -409,10 +409,10 @@ test "kt_mla_forward paged: scrambled pages match identity pages" {
 test "kt_mla_forward paged: identity page table matches legacy sequential" {
     const allocator = testing.allocator;
 
-    var run_paged = try makePagedMla(allocator, 0.01);
+    const run_paged = try makePagedMla(allocator, 0.01);
     defer allocator.free(run_paged.weights);
     defer kt.kt_mla_free(run_paged.mla);
-    var run_seq = try makePagedMla(allocator, 0.01);
+    const run_seq = try makePagedMla(allocator, 0.01);
     defer allocator.free(run_seq.weights);
     defer kt.kt_mla_free(run_seq.mla);
 

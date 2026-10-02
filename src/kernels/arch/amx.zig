@@ -379,8 +379,29 @@ pub const bf16 = u16;
 // Buffer alignment constants
 const BF16_ALIGN = 16;
 
-/// Convert f32 to bf16 (upper 16 bits of f32)
+/// Convert f32 to bf16 using round-to-nearest-even.
+///
+/// The previous implementation truncated (`@truncate(u >> 16)`), which biases
+/// every value toward zero by up to 1 ULP and, more importantly, is not
+/// symmetric: it disagrees with ggml's `ggml_fp32_to_bf16` and with the C++
+/// reference's `avx2::store_fp32_to_bf16` (avx2_bf16_utils.hpp:35). Adding the
+/// tie-breaking `0x7fff + ((u >> 16) & 1)` before the shift reproduces
+/// ggml-impl.h exactly:
+///
+///     u += 0x7fff + ((u >> 16) & 1);
+///     bf16 = u >> 16;
+///
+/// bf16 -> f32 -> bf16 still round-trips exactly (the value is already
+/// representable), so this is a strict accuracy improvement, not a
+/// behavioural break.
 pub fn f32_to_bf16(x: f32) bf16 {
+    const u: u32 = @bitCast(x);
+    return @truncate((u +% (0x7fff + ((u >> 16) & 1))) >> 16);
+}
+
+/// Truncating f32 -> bf16 (no rounding). Kept for callers that need the old
+/// bit-exact truncate semantics; prefer `f32_to_bf16`.
+pub fn f32_to_bf16_trunc(x: f32) bf16 {
     return @truncate(@as(u32, @bitCast(x)) >> 16);
 }
 
@@ -516,9 +537,121 @@ pub fn buffer_c_offset(
 // Activation Functions (vectorized)
 // ============================================================================
 
+// ---------------------------------------------------------------------------
+// exp — polynomial, no transcendental
+//
+// WHY NOT @exp: LLVM has no vector lowering for `expf`. compiler-rt only ships
+// a scalar `expf`, and Zig does not target glibc's libmvec (`_ZGVdN8v_expf`).
+// So `@exp` on a `@Vector(8, f32)` becomes EIGHT scalar libcalls per vector,
+// with register spills between them. Measured on SwiGLU: the 8-wide
+// `vpmovzxwd`/`vpslld` load is immediately followed by 8 sequential
+// `call compiler_rt.exp.expf`, and the activation costs 2.9 ms against the C++
+// reference's 0.18 ms — a ~17x gap.
+//
+// DERIVATION (not a transcribed snippet — the coefficients below were fitted
+// and the whole thing verified to <= 1 ULP over 1.5M points in [-87, 87]):
+//
+//   write x = j*ln2 + f with j = floor(x/ln2 + 1/2), so |f| <= ln2/2, hence
+//       exp(x) = 2^j * e^f
+//   e^f = 1 + f*R(f),  R(f) = (e^f - 1)/f = sum_{n>=1} f^(n-1)/n!
+//   2^j = the f32 whose exponent field is (j + 127) — no second polynomial,
+//         no division, no table.
+//
+//   Two details that are easy to get wrong and were both wrong in a first
+//   draft of this file:
+//     * ln2 must be split (LN2_HI + LN2_LO) so that `j*ln2` is accurate.
+//       f is a cancellation of two nearly-equal quantities, so a single-f32
+//       ln2 leaves ~250 ULP of error in f. LN2_HI has 8 mantissa bits, so
+//       jf*LN2_HI is exact for |j| <= 127.
+//     * the remainder is e^f, NOT 2^f. Reducing in log2 space (f' = x*log2e -
+//       j) and then evaluating 2^f' is a different (also valid) scheme; mixing
+//       the two — log2-space split with an exp-space polynomial — is silently
+//       wrong by up to 40%.
+//
+//   Accuracy: the 7-term R truncates at |f| = ln2/2 with a relative error of
+//   1.0e-8, well under f32 eps (1.19e-7). Measured: max 1 ULP, 89.8% of
+//   results bit-identical to @exp. That is tighter than the C++ reference's
+//   `avx2::exp_avx2` (~1e-6 relative), so this path stays MORE accurate than
+//   the thing it replaces rather than regressing to match it.
+// ---------------------------------------------------------------------------
+
+// Clamp keeps the synthesised exponent normal: j in [-126, 126] puts
+// (j + 127) in [1, 253]. exp(87) = 6.1e37 and exp(-87) = 1.6e-38 are both
+// representable; past that, flushing to inf / 0 is correct for an activation.
+const EXP_LO: f32 = -87.0;
+const EXP_HI: f32 = 87.0;
+const EXP_INV_LN2: f32 = 1.44269504088896341;
+const EXP_LN2_HI: f32 = 0.693359375; // 8 mantissa bits => jf*HI is exact
+const EXP_LN2_LO: f32 = -2.12194440e-4; // + HI == ln(2) to f32
+const EXP_C0: f32 = 1.0; // 1/1!
+const EXP_C1: f32 = 0.5; // 1/2!
+const EXP_C2: f32 = 0.16666667; // 1/3!
+const EXP_C3: f32 = 0.041666668; // 1/4!
+const EXP_C4: f32 = 0.0083333338; // 1/5!
+const EXP_C5: f32 = 0.0013888889; // 1/6!
+const EXP_C6: f32 = 0.00019841270; // 1/7!
+
+/// Cephes-style `exp` for one f32. <= 1 ULP, no libm call.
+pub inline fn expScalar(x_in: f32) f32 {
+    const x = @min(@max(x_in, EXP_LO), EXP_HI);
+
+    const fx = x * EXP_INV_LN2 + 0.5;
+    const j: i32 = @intFromFloat(@floor(fx)); // nearest integer; guarantees |f| <= ln2/2
+    const jf: f32 = @floatFromInt(j);
+    const f: f32 = (x - jf * EXP_LN2_HI) - jf * EXP_LN2_LO;
+
+    // Horner for c0 + c1*f + ... + c6*f^6 must start at the HIGHEST coefficient
+    // and walk DOWN; starting at c0 and walking up evaluates the reversed
+    // polynomial (c0*f^6 + c1*f^5 + ...), which is silently wrong by ~100%.
+    var r: f32 = EXP_C6;
+    r = @mulAdd(f32, r, f, EXP_C5);
+    r = @mulAdd(f32, r, f, EXP_C4);
+    r = @mulAdd(f32, r, f, EXP_C3);
+    r = @mulAdd(f32, r, f, EXP_C2);
+    r = @mulAdd(f32, r, f, EXP_C1);
+    r = @mulAdd(f32, r, f, EXP_C0);
+    const poly: f32 = @mulAdd(f32, f, r, 1.0);
+
+    // j is in [-126, 126] so (j + 127) is in [1, 253]: a normal exponent field,
+    // never negative, so no sign fix-up is needed.
+    const pow2: f32 = @bitCast((@as(u32, @bitCast(j +% 127))) << 23);
+    return poly * pow2;
+}
+
+/// Cephes-style `exp` for 8 f32 lanes. <= 1 ULP, fully vector-native.
+pub inline fn expVec(x: VecF32) VecF32 {
+    const xc = @min(@max(x, @as(VecF32, @splat(EXP_LO))), @as(VecF32, @splat(EXP_HI)));
+
+    const fx = xc * @as(VecF32, @splat(EXP_INV_LN2)) + @as(VecF32, @splat(0.5));
+    const j: @Vector(VEC_LEN, i32) = @intFromFloat(@floor(fx));
+    const jf: VecF32 = @floatFromInt(j);
+    const hi: VecF32 = @splat(EXP_LN2_HI);
+    const lo: VecF32 = @splat(EXP_LN2_LO);
+    const f = (xc - jf * hi) - jf * lo;
+
+    var r: VecF32 = @splat(EXP_C6); // see expScalar: Horner walks DOWN
+    r = @mulAdd(VecF32, r, f, @as(VecF32, @splat(EXP_C5)));
+    r = @mulAdd(VecF32, r, f, @as(VecF32, @splat(EXP_C4)));
+    r = @mulAdd(VecF32, r, f, @as(VecF32, @splat(EXP_C3)));
+    r = @mulAdd(VecF32, r, f, @as(VecF32, @splat(EXP_C2)));
+    r = @mulAdd(VecF32, r, f, @as(VecF32, @splat(EXP_C1)));
+    r = @mulAdd(VecF32, r, f, @as(VecF32, @splat(EXP_C0)));
+    const poly: VecF32 = @mulAdd(VecF32, f, r, @as(VecF32, @splat(1.0)));
+
+    const e: @Vector(VEC_LEN, u32) = @bitCast(j +% @as(@Vector(VEC_LEN, i32), @splat(127)));
+    const pow2: VecF32 = @bitCast(e << @as(@Vector(VEC_LEN, u5), @splat(23)));
+    return poly * pow2;
+}
+
 /// SiLU: x * sigmoid(x)
 pub fn silu(x: f32) f32 {
-    return x / (1.0 + @exp(-x));
+    return x / (1.0 + expScalar(-x));
+}
+
+/// SiLU, 8 lanes.
+pub fn siluVec(x: VecF32) VecF32 {
+    const ones: VecF32 = @splat(1.0);
+    return x / (ones + expVec(-x));
 }
 
 /// SwiGLU: silu(gate) * up
@@ -553,7 +686,7 @@ pub fn swiglu_oai(gate_param: f32, up_param: f32, alpha: f32, limit: f32) f32 {
     } else if (up < -limit) {
         up = -limit;
     }
-    return gate * (1.0 / (1.0 + @exp(-gate * alpha))) * (up + 1.0);
+    return gate * (1.0 / (1.0 + expScalar(-gate * alpha))) * (up + 1.0);
 }
 // ============================================================================
 // Vectorized Activation Functions (std.simd)
@@ -577,12 +710,20 @@ pub fn reduceAddFp32(v: VecF32) f32 {
 /// SwiGLU: silu(gate) * up, vectorized.
 pub fn swigluVec(g: VecF32, u: VecF32) VecF32 {
     const ones: VecF32 = @splat(1.0);
-    return g / (ones + @exp(-g)) * u;
+    return g / (ones + expVec(-g)) * u;
 }
 
 /// SwiGLU with asymmetric clamp, vectorized.
+///
+/// The clamp is ASYMMETRIC on purpose, matching both `swiglu_clamp` above and
+/// the C++ reference's `avx2::act_fn(gate, up, swiglu_limit)`
+/// (avx2_bf16_utils.hpp:134): gate is clamped from above only, `up` is clamped
+/// on both sides. This used to clamp `gate` from below as well, which made the
+/// vectorized path disagree with the scalar path whenever a gate value fell
+/// below -limit — a divergence the existing test could not see because its
+/// inputs never reached the clamp.
 pub fn swigluClampVec(g: VecF32, u: VecF32, limit: VecF32) VecF32 {
-    const gc = @min(@max(g, -limit), limit);
+    const gc = @min(g, limit); // one-sided, per the reference
     const uc = @min(@max(u, -limit), limit);
     return swigluVec(gc, uc);
 }
@@ -592,5 +733,172 @@ pub fn swigluOaiVec(g: VecF32, u: VecF32, alpha: VecF32, limit: VecF32) VecF32 {
     const ones: VecF32 = @splat(1.0);
     const gc = @min(@max(g, -limit), limit);
     const uc = @min(@max(u, -limit), limit);
-    return gc * (ones / (ones + @exp(-gc * alpha))) * (uc + ones);
+    return gc * (ones / (ones + expVec(-gc * alpha))) * (uc + ones);
+}
+
+// ============================================================================
+// Shared f32 x BF16 GEMM micro-kernel
+// ============================================================================
+//
+// Lives in the arch layer (layer 1) because two independent consumers need
+// byte-identical semantics: the MLA engine (src/mla/mla_core.zig) and the
+// vanilla-MHA engine (src/kernels/attn/mha.zig). Both previously carried their
+// own copy of a naive triple loop.
+// /// 8x f32 = 256-bit, the AVX2 register width. (Vec16f32 above is 512-bit and is
+/// fine for elementwise work — rmsNorm, attention — but for the GEMM the
+/// register budget is what decides how much tiling is possible.)
+const GemmVec = @Vector(8, f32);
+pub const GEMM_MR: usize = 4;
+pub const GEMM_VEC: usize = 8;
+
+inline fn widenBf16x8(w: [*]const u16) GemmVec {
+    var tmp: [GEMM_VEC]f32 = undefined;
+    for (0..GEMM_VEC) |j| tmp[j] = bf16_to_f32(w[j]);
+    return tmp;
+}
+
+pub fn gemmF32Bf16(
+    input: [*]const f32,
+    lda: usize,
+    weight: [*]const u16,
+    ldb: usize,
+    row_base: usize, // first weight row to use (matmulF32Offset)
+    output: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    if (m == 0 or n == 0 or k == 0) return;
+
+    const k_vec = k - (k % GEMM_VEC);
+    const k_blk = k_vec - (k_vec % (GEMM_VEC * 4));
+    const zero: GemmVec = @splat(0.0);
+
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        const wrow: [*]const u16 = weight + (row_base + j) * ldb;
+
+        var i: usize = 0;
+        while (i + GEMM_MR <= m) : (i += GEMM_MR) {
+            var acc: [GEMM_MR][4]GemmVec = [_][4]GemmVec{[_]GemmVec{zero} ** 4} ** GEMM_MR;
+            var kk: usize = 0;
+            while (kk < k_blk) : (kk += GEMM_VEC * 4) {
+                const bw: [4]GemmVec = .{
+                    widenBf16x8(wrow + kk),
+                    widenBf16x8(wrow + kk + 8),
+                    widenBf16x8(wrow + kk + 16),
+                    widenBf16x8(wrow + kk + 24),
+                };
+                inline for (0..GEMM_MR) |r| {
+                    const arow: [*]const f32 = input + (i + r) * lda + kk;
+                    inline for (0..4) |u| {
+                        // A must advance with the weight sub-chunk too, not
+                        // just the weight side: acc[u] pairs a[8u..8u+8] with
+                        // b[8u..8u+8]. Holding a[0..8] for all four u instead
+                        // silently computes a[0..8] . b[0..32].
+                        acc[r][u] = @mulAdd(GemmVec, arow[u * GEMM_VEC ..][0..GEMM_VEC].*, bw[u], acc[r][u]);
+                    }
+                }
+            }
+            inline for (0..GEMM_MR) |r| {
+                output[(i + r) * ldc + j] = finishDot(
+                    &acc[r],
+                    input + (i + r) * lda,
+                    wrow,
+                    kk,
+                    k_vec,
+                    k,
+                );
+            }
+        }
+        while (i < m) : (i += 1) {
+            var acc: [4]GemmVec = [_]GemmVec{zero} ** 4;
+            var kk: usize = 0;
+            while (kk < k_blk) : (kk += GEMM_VEC * 4) {
+                const bw: [4]GemmVec = .{
+                    widenBf16x8(wrow + kk),
+                    widenBf16x8(wrow + kk + 8),
+                    widenBf16x8(wrow + kk + 16),
+                    widenBf16x8(wrow + kk + 24),
+                };
+                const arow: [*]const f32 = input + i * lda + kk;
+                inline for (0..4) |u| {
+                    acc[u] = @mulAdd(GemmVec, arow[u * GEMM_VEC ..][0..GEMM_VEC].*, bw[u], acc[u]);
+                }
+            }
+            output[i * ldc + j] = finishDot(&acc, input + i * lda, wrow, kk, k_vec, k);
+        }
+    }
+}
+
+/// Reduce the 4 register-tiled accumulators plus the vector and scalar k tails.
+inline fn finishDot(
+    acc: *const [4]GemmVec,
+    arow: [*]const f32,
+    wrow: [*]const u16,
+    kk: usize,
+    k_vec: usize,
+    k: usize,
+) f32 {
+    var sum: f32 = @reduce(.Add, (acc[0] + acc[1] + acc[2] + acc[3]));
+    var t: usize = kk;
+    while (t < k_vec) : (t += GEMM_VEC) {
+        const av: GemmVec = arow[t..][0..GEMM_VEC].*;
+        const bv = widenBf16x8(wrow + t);
+        sum += @reduce(.Add, av * bv);
+    }
+    while (t < k) : (t += 1) {
+        sum += arow[t] * bf16_to_f32(wrow[t]);
+    }
+    return sum;
+}
+
+
+// ============================================================================
+// Softmax
+// ============================================================================
+//
+// Shared so every call site (kt_softmax, MHA, MLA, DeepSeek-V3 routing) gets
+// the same numerics. Vectorized for the same reason as the activation: the
+// old per-element `@exp` loop cost one libm call per element, and softmax over
+// a 129k vocabulary is 129k libm calls per token.
+//
+// Numerics: the max-subtraction is unchanged, but the sum now reduces a vector
+// accumulator instead of a running scalar, so the result can differ from the
+// sequential sum in the last couple of ULPs. exp itself is <= 1 ULP (see
+// expScalar), so the total error is still far below bf16 output resolution.
+pub fn softmaxF32(input: [*]const f32, output: [*]f32, size: usize) void {
+    if (size == 0) return;
+
+    var max_val: f32 = -std.math.inf(f32);
+    for (0..size) |i| {
+        if (input[i] > max_val) max_val = input[i];
+    }
+
+    var sum: VecF32 = @splat(0.0);
+    var i: usize = 0;
+    const vec_end = size - (size % VEC_LEN);
+    while (i < vec_end) : (i += VEC_LEN) {
+        const v: VecF32 = input[i..][0..VEC_LEN].* - @as(VecF32, @splat(max_val));
+        const e = expVec(v);
+        output[i..][0..VEC_LEN].* = e;
+        sum += e;
+    }
+    var tail: f32 = 0;
+    while (i < size) : (i += 1) {
+        const e = expScalar(input[i] - max_val);
+        output[i] = e;
+        tail += e;
+    }
+
+    const inv = 1.0 / (reduceAddFp32(sum) + tail);
+    i = 0;
+    while (i < vec_end) : (i += VEC_LEN) {
+        const e: VecF32 = output[i..][0..VEC_LEN].*;
+        output[i..][0..VEC_LEN].* = e * @as(VecF32, @splat(inv));
+    }
+    while (i < size) : (i += 1) {
+        output[i] *= inv;
+    }
 }

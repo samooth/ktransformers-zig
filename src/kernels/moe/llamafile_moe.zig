@@ -947,7 +947,7 @@ fn q8_0RowBytes(n: usize) usize {
 /// SwiGLU (silu · gate) using the standard "x / (1 + exp(-x))" form
 /// matches the C++ `LLAMA_MOE_TP::act_fn` (line 269 of moe.hpp).
 fn silu(x: f32) f32 {
-    return x / (1.0 + @exp(-x));
+    return x / (1.0 + amx.expScalar(-x));
 }
 
 // ============================================================================

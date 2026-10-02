@@ -72,21 +72,7 @@ fn ropeRotate(
 
 /// Softmax over `size` entries (numerically stable, in-place OK).
 pub fn softmaxInPlace(buf: [*]f32, size: usize) void {
-    var max_val: f32 = -std.math.inf(f32);
-    var i: usize = 0;
-    while (i < size) : (i += 1) {
-        if (buf[i] > max_val) max_val = buf[i];
-    }
-    var sum: f32 = 0;
-    i = 0;
-    while (i < size) : (i += 1) {
-        const e = @exp(buf[i] - max_val);
-        buf[i] = e;
-        sum += e;
-    }
-    const inv = 1.0 / sum;
-    i = 0;
-    while (i < size) : (i += 1) buf[i] *= inv;
+    amx.softmaxF32(buf, buf, size); // in place
 }
 
 // ============================================================================
@@ -398,7 +384,10 @@ pub const MhaEngine = struct {
 };
 
 // ============================================================================
-// Linear projection (reused from MLA; identical math).
+// Linear projection. Delegates to the shared arch-layer micro-kernel so this
+// cannot drift from the MLA engine's copy (it used to be a second, separately
+// maintained naive triple loop with the same two defects: a `@reduce` inside
+// the k loop and an m-outer nest that re-streamed the weight matrix per row).
 // ============================================================================
 
 pub fn matmulF32(
@@ -412,21 +401,7 @@ pub fn matmulF32(
     n: usize,
     k: usize,
 ) void {
-    for (0..m) |i| {
-        for (0..n) |j| {
-            var sum: f32 = 0;
-            var kk: usize = 0;
-            while (kk + 16 <= k) : (kk += 16) {
-                const a = loadVec16(input + i * lda + kk);
-                const b = loadVec16Bf16(weight + j * ldb + kk);
-                sum += @reduce(.Add, a * b);
-            }
-            while (kk < k) : (kk += 1) {
-                sum += input[i * lda + kk] * bf16ToF32(weight[j * ldb + kk]);
-            }
-            output[i * ldc + j] = sum;
-        }
-    }
+    amx.gemmF32Bf16(input, lda, weight, ldb, 0, output, ldc, m, n, k);
 }
 
 /// Simple RMSNorm exported for use by model-orchestration layers

@@ -2,10 +2,18 @@
 // Run standalone: zig test src/mla/mla_tests.zig
 const std = @import("std");
 const testing = std.testing;
-const MlaConfig = @import("mla_config.zig").MlaConfig;
-const MlaKvCache = @import("mla_cache.zig").MlaCachePage;
-const MlaCache = @import("mla_cache.zig").MlaKvCache;
-const MlaEngine = @import("mla_core.zig").MlaEngine;
+// Import through the `kt` hub, not by relative path. This suite is the only
+// one whose root lives inside src/, so a direct `@import("mla_core.zig")`
+// would make mla_core.zig part of THIS module — whose root directory is
+// src/mla/ — and any import of ../kernels/... from there escapes the module
+// path and fails to compile. Going through `kt` (rooted at src/root.zig) keeps
+// every module boundary where build.zig put it. Same reason the NEON kernel
+// suite imports via `kt`.
+const kt = @import("kt");
+const MlaConfig = kt.mla_config.MlaConfig;
+const MlaKvCache = kt.mla_cache.MlaCachePage;
+const MlaCache = kt.mla_cache.MlaKvCache;
+const MlaEngine = kt.mla_core.MlaEngine;
 
 // BF16 encoding of 1.0 is 0x3F80 (NOT 0x3C00 — that is FP16!)
 const BF16_ONE: u16 = 0x3F80;
@@ -308,7 +316,7 @@ test "MlaEngine q_pe RoPE uses absolute position" {
 test "RMSNorm correctness" {
     // Verifies the basic math: with weight 1.0, output RMS is 1.0
     const eps = 1e-6;
-    var input: [4]f32 = .{ 1.0, 2.0, 3.0, 4.0 };
+    const input: [4]f32 = .{ 1.0, 2.0, 3.0, 4.0 };
 
     // Manual RMSNorm
     var sum_sq: f32 = 0;

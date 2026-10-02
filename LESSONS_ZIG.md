@@ -1739,3 +1739,140 @@ Gotchas (verified the hard way):
 - `std.Thread.getCpuCount()` returns an error union (`catch`, not `orelse`).
 - `AutoHashMap.getOrPut` does NOT zero-initialize new entries — set to 0
   explicitly before `+= 1` or you add to uninitialized memory.
+
+---
+
+## SIMD / numerics gotchas (Oct 3, 2026 — AVX2 SIMD rework)
+
+Every one of these cost real debugging time. All were found by *measuring*
+(disassembly, a ULP sweep, a controlled variant probe), not by reading code.
+
+### 1. `@exp` on a vector does NOT vectorize — it becomes N scalar libcalls
+
+compiler-rt only ships a scalar `expf`, and Zig does not target glibc's libmvec
+(`_ZGVdN8v_expf`). So `@exp` on `@Vector(8, f32)` lowers to EIGHT
+`call compiler_rt.exp.expf` per vector, with register spills between them.
+Measured on SwiGLU: 2.9 ms vs the C++ reference's 0.18 ms — **17x**.
+
+Check for this before optimizing anything:
+```bash
+objdump -d libkt_kernel_ext.so | grep -c "call.*expf"   # want 0 in hot loops
+```
+Write the exponential as elementwise vector arithmetic instead. See
+`amx.expScalar` / `amx.expVec`.
+
+### 2. Three ways to get a Cephes-style `exp` wrong (all silent, all ~40-100% off)
+
+The working construction, with the traps:
+
+```
+j = floor(x * (1/ln2) + 0.5)          // nearest integer => |f| <= ln2/2
+f = (x - j*LN2_HI) - j*LN2_LO         // ln2 SPLIT in two
+2^j = reinterpret((j + 127) << 23)    // j in [-126,126] so no sign fixup needed
+e^f = 1 + f * R(f),  R(f) = sum f^(n-1)/n!
+```
+
+- **Exponent shift before sign OR.** `((j+127) | signbit) << 23` pushes the sign
+  bit straight out of the 32-bit word, so every negative `j` yields a positive
+  power. Do `(j+127) << 23` FIRST, then OR the sign.
+- **log2-space split + exp-space polynomial.** Splitting `f = x*log2e - j` and
+  then evaluating `e^f` (rather than `2^f`) is wrong by up to 40%. Pick one
+  space and stay in it.
+- **Horner walks the coefficients DOWN.** For `c0 + c1*f + ... + c6*f^6`,
+  `r = c0; r = r*f + c1; ...` evaluates the REVERSED polynomial
+  (`c0*f^6 + c1*f^5 + ...`). Start at the highest coefficient.
+
+Also: `ln2` must be split (`LN2_HI = 0.693359375`, `LN2_LO = -2.12194440e-4`).
+`f` is a cancellation of two nearly-equal quantities, so a single-f32 `ln2`
+leaves ~250 ULP of error in `f`. `LN2_HI` has 8 mantissa bits, which makes
+`j*LN2_HI` exact for `|j| <= 127`.
+
+**Fit the coefficients yourself and verify numerically** — do not trust
+recalled "standard" constants. Taylor truncation of `R` at degree 6 is already
+below f32 eps over `|f| <= ln2/2` (1.0e-8 relative), so no minimax fit is
+needed. Verify with a sweep, measuring max ULP against `@exp`, not just a few
+hand-picked points.
+
+### 3. `@mulAdd` is required; FP contraction is off by default
+
+Zig defaults `fp-contract=off`, so `a * b + c` in a vector loop emits
+`vmulps` + `vaddps` (2 uops, a serial dependency) instead of `vfmadd231ps`
+(1 uop). Before the rework there were **zero** `vfmadd` instructions in the
+whole `.so`. Use `@mulAdd(T, a, b, c)` explicitly.
+
+Corollary: a single accumulator makes the loop LATENCY-bound regardless of
+memory bandwidth. Zen3's FMA latency is 4 cycles; you need >= 8 independent
+chains to saturate 2 FMA pipes. Four accumulators is enough to escape the worst
+of it — but measure, because for a bandwidth-bound GEMM this is worth only
+~1.1x while the loop order is worth 3.4x.
+
+### 4. Loop order dominates instruction selection in a bandwidth-bound GEMM
+
+When one operand dwarfs the other (weights are 29 MB, activations 1.8 MB),
+m-outer/n-inner re-streams the huge operand once per row of the small one.
+n-outer/m-inner keeps one row of the big operand L1-resident. Same logical
+traffic either way; the difference is DRAM (~7 GB/s) vs L2/L3 (~20 GB/s).
+
+**Never "simplify" a GEMM back to a triple loop.** And when a kernel is
+suspiciously slow, check the conversion cost first: bf16→f32 is 2 uops per 8
+elements per operand and you need 2 operands per 8 MACs, so conversion is
+~0.5 uops/MAC while the FMA is 0.125. Conversion, not arithmetic, is the
+budget. Register-tile the M direction so each converted chunk feeds several
+accumulators.
+
+### 5. Do not put `@reduce` inside a k-loop
+
+`sum += @reduce(.Add, a * b)` inside the k-loop pays a full horizontal
+reduction (~8 shuffle+add uops) every 16 MACs. Accumulate into a vector
+register and reduce ONCE after the loop. This alone was a large part of the
+MLA/MHA matmul cost.
+
+### 6. bf16 round-to-nearest-even, and the exact formula
+
+```zig
+const u: u32 = @bitCast(x);
+return @truncate((u +% (0x7fff + ((u >> 16) & 1))) >> 16);
+```
+This is ggml-impl.h's rule and matches the C++ reference's
+`store_fp32_to_bf16`. Truncating instead biases every value toward zero and
+disagrees with both. `bf16 -> f32 -> bf16` round-trips exactly under RNE for
+all 65536 patterns (good invariant to test).
+
+### 7. F16C does nothing for bf16 on AVX2
+
+F16C converts IEEE **f16**. bf16 needs AVX512_BF16, or AVX512VL+VBMI2's
+`vcvtnebf162ps`. On plain AVX2 the widening is `vpmovzxwd` + `vpslld $16`, which
+LLVM emits for free when you widen bf16 to f32. Don't spend time "enabling
+F16C"; `KT_TYPE_F16` exists in the ABI but has no kernel.
+
+### 8. Zig 0.16 build/test API rot hit while doing this work
+
+- `@errorReturnTrace()` returns `?*builtin.StackTrace`
+  (`index`, `instruction_addresses`), but `std.debug.dumpStackTrace` wants
+  `*const debug.StackTrace` (`return_addresses`, `skipped`). Bridge explicitly:
+  ```zig
+  const t: std.debug.StackTrace = .{
+      .return_addresses = trace.instruction_addresses[trace.index..],
+      .skipped = .none,
+  };
+  ```
+  This broke `tools/test_runner.zig`, which silently disabled the whole
+  `zig build test` step.
+- A test suite whose ROOT lives inside `src/` (e.g. `src/mla/mla_tests.zig`)
+  makes every relative import below it part of THAT module — so a
+  `@import("../kernels/...")` from a file it pulls in fails with "import of file
+  outside module path". Import such suites through the `kt` hub instead.
+- Nested arrays need a real initializer: `@splat` is a *vector* splat and will
+  not fill `[MR][4]VecF32`. Use `[_][4]VecF32{[_]VecF32{zero} ** 4} ** MR`.
+- `std.fs.cwd()` is gone. Use the `Io` interface:
+  `std.Io.Dir.cwd().createFile(io.io(), path, ...)` then
+  `std.Io.File.writePositionalAll(file, io.io(), bytes, 0)`.
+- `std.time.Timer` is gone; use the `clock_gettime(MONOTONIC)` syscall (the
+  pattern already in `bench/gemm_bench.zig`).
+- `std.heap.GeneralPurposeAllocator` -> `std.heap.DebugAllocator`.
+- `%` on signed integers needs `@mod`/`@rem`; on vectors of mixed signedness it
+  is an error. Prefer `u32` arithmetic for test-data generation.
+- `{d:.2f}` is rejected ("extraneous trailing character") — the Zig 0.16 float
+  format specifier is `{d:.2}`.
+- A vector needs a comptime index to read; stage through an array
+  (`const out: [8]f32 = vec;`) as the existing kernels already do.

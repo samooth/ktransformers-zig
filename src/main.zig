@@ -2769,21 +2769,10 @@ pub export fn kt_softmax(
     output: [*]f32,
     size: usize
 ) void {
-    var max_val: f32 = -std.math.inf(f32);
-    for (0..size) |i| {
-        if (input[i] > max_val) max_val = input[i];
-    }
-
-    var sum: f32 = 0;
-    for (0..size) |i| {
-        output[i] = @exp(input[i] - max_val);
-        sum += output[i];
-    }
-
-    const inv_sum = 1.0 / sum;
-    for (0..size) |i| {
-        output[i] *= inv_sum;
-    }
+    // Vectorized shared implementation (see amx.softmaxF32): the old body made
+    // one scalar libm call per element, which for a 129k vocab is 129k calls
+    // per token.
+    amx.softmaxF32(input, output, size);
 }
 
 export fn kt_matmul_bf16(

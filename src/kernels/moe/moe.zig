@@ -225,7 +225,7 @@ fn routeExpertsWithOpts(
         switch (opts.scoring) {
             .sigmoid => {
                 for (0..expert_num) |e| {
-                    score_row[e] = 1.0 / (1.0 + @exp(-logit_row[e]));
+                    score_row[e] = 1.0 / (1.0 + amx.expScalar(-logit_row[e]));
                 }
             },
             .softmax => {
@@ -236,7 +236,7 @@ fn routeExpertsWithOpts(
                 }
                 var sum: f32 = 0;
                 for (0..expert_num) |e| {
-                    const e_x = @exp(logit_row[e] - max_logit);
+                    const e_x = amx.expScalar(logit_row[e] - max_logit);
                     score_row[e] = e_x;
                     sum += e_x;
                 }
@@ -1080,7 +1080,13 @@ pub const TpMoe = struct {
             const in_off_t = t * m * k;
             // Down projection: gate [m, k] @ down_weight [n, k]^T -> down_f32 [m, n]
             // gemmExpert: weight is [n=hidden, k=intermediate/tp] row-major, weight_ld=k.
-            gemm_bf16.gemmExpert(
+            //
+            // ACCUMULATES on purpose: every tensor-parallel rank adds its shard
+            // into the same buffer. This used to call the overwrite-only
+            // `gemmExpert`, whose entry-time zeroing wiped every previous
+            // rank's contribution — so with tp_count > 1 the result was just
+            // the last rank's partial sum.
+            gemm_bf16.gemmExpertAccum(
                 input + in_off_t,
                 down_bf16_storage + weight_off,
                 down_buf.ptr,

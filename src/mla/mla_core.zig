@@ -25,6 +25,7 @@
 //      position. The draft used the within-batch position only.
 
 const std = @import("std");
+const amx = @import("../kernels/arch/amx.zig");
 const MlaConfig = @import("mla_config.zig").MlaConfig;
 const MlaKvCache = @import("mla_cache.zig").MlaKvCache;
 
@@ -98,8 +99,36 @@ pub fn rmsNorm(
     }
 }
 
+// ============================================================================
+// Linear projection: output = input @ weight^T
+// input: [m, k] f32, weight: [n, k] row-major BF16, output: [m, n] f32
+// ============================================================================
+//
+// Both matmuls below used to be a plain m/n/k triple loop that did
+// `@reduce(.Add, a * b)` INSIDE the k loop, i.e. a full horizontal reduction
+// every 16 elements, with an m-outer / n-inner nest.
+//
+// Measured cost of that shape on this host: MLA's o_proj
+// ([m=1, n=7168, k=18432], the single largest projection in DeepSeek-V3) took
+// 63.5 ms and moved only 4.16 GB/s — ~16x off the memory-bandwidth-bound
+// limit. Two independent defects:
+//
+//  1. `@reduce` per k-iteration. A horizontal reduce of a 16-lane vector costs
+//     ~8 shuffle+add uops, so every 16 MACs paid ~8 uops of reduction. Fixed by
+//     accumulating in a vector register and reducing ONCE at the end.
+//  2. Loop order. `weight` is n*k (264 MB for o_proj — far past DRAM), so
+//     m-outer / n-inner re-streams the entire weight matrix once per token
+//     row. n-outer / m-inner keeps one weight row (37 KB here) hot and reads
+//     the weights from DRAM exactly once. Same fix as gemmExpert.
+//
+// Plus the same register-tiling idea as the BF16 kernel: with `MR` rows of the
+// activation in flight, each widened weight chunk feeds MR accumulators. The
+// bf16 -> f32 conversion is 2 uops per 8 elements and dominates the uop budget,
+// so sharing it across MR rows is where the win comes from.
+
 /// Linear projection: output = input @ weight^T
 /// input: [m, k], weight: [n, k] (row-major BF16), output: [m, n]
+/// Overwrites `output`.
 pub fn matmulF32(
     input: [*]const f32,
     lda: usize,
@@ -111,24 +140,11 @@ pub fn matmulF32(
     n: usize,
     k: usize,
 ) void {
-    for (0..m) |i| {
-        for (0..n) |j| {
-            var sum: f32 = 0;
-            var kk: usize = 0;
-            while (kk + 16 <= k) : (kk += 16) {
-                const a = loadVec16(input + i * lda + kk);
-                const b = loadVec16Bf16(weight + j * ldb + kk);
-                sum += @reduce(.Add, a * b);
-            }
-            while (kk < k) : (kk += 1) {
-                sum += input[i * lda + kk] * bf16ToF32(weight[j * ldb + kk]);
-            }
-            output[i * ldc + j] = sum;
-        }
-    }
+    amx.gemmF32Bf16(input, lda, weight, ldb, 0, output, ldc, m, n, k);
 }
 
 /// Linear projection with weight row offset: output = input @ weight[offset..offset+n, :]^T
+/// Overwrites `output`.
 pub fn matmulF32Offset(
     input: [*]const f32,
     lda: usize,
@@ -141,15 +157,7 @@ pub fn matmulF32Offset(
     n: usize,
     k: usize,
 ) void {
-    for (0..m) |i| {
-        for (0..n) |j| {
-            var sum: f32 = 0;
-            for (0..k) |kk| {
-                sum += input[i * lda + kk] * bf16ToF32(weight[(offset + j) * ldb + kk]);
-            }
-            output[i * ldc + j] = sum;
-        }
-    }
+    amx.gemmF32Bf16(input, lda, weight, ldb, offset, output, ldc, m, n, k);
 }
 
 // ============================================================================
@@ -197,21 +205,7 @@ fn softmax(
     output: [*]f32,
     size: usize,
 ) void {
-    var max_val: f32 = -std.math.inf(f32);
-    for (0..size) |i| {
-        if (input[i] > max_val) max_val = input[i];
-    }
-
-    var sum: f32 = 0;
-    for (0..size) |i| {
-        output[i] = @exp(input[i] - max_val);
-        sum += output[i];
-    }
-
-    const inv_sum = 1.0 / sum;
-    for (0..size) |i| {
-        output[i] *= inv_sum;
-    }
+    amx.softmaxF32(input, output, size);
 }
 
 // ============================================================================

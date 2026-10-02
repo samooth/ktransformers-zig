@@ -214,6 +214,46 @@ ranks, slice per-rank output offsets, accumulate down-proj in FP32 -> BF16.
 Both are real implementations (the guarded no-op era ended with the
 loadWeights fix); D3 fixed the `ldc` for tp_count > 1.
 
+## SIMD on AVX2 (the perf contract — read before touching a kernel)
+
+Benchmarked against the C++ reference's own AVX2 kernels
+(`kt-kernel/operators/avx2/avx2_bf16_gemm.hpp`) with
+`bench/cpp_vs_zig/run.sh`; as of the SIMD rework the Zig port is **1.0-1.27x
+the reference** on BF16 GEMM and **0.66x** on SwiGLU (with bit-identical
+output). Four rules carry almost all of it:
+
+1. **`@exp` does not vectorize.** compiler-rt has only scalar `expf` and Zig
+   does not target libmvec, so `@exp` on `@Vector(8, f32)` becomes 8 scalar
+   libcalls with stack spills (17x slower than a polynomial). Use
+   `amx.expScalar` / `amx.expVec` — the Cephes construction in
+   `arch/amx.zig`, derived (not transcribed) and verified to <= 1 ULP, which
+   is *tighter* than the reference's ~1e-6 polynomial. Never reintroduce
+   `@exp` in a vector loop; `grep -rn "@exp" src/` should only hit comments.
+2. **F16C is irrelevant here.** The weights are BF16, and AVX2 has no BF16
+   conversion instruction — the widening is `vpmovzxwd` + `vpslld $16`, which
+   LLVM already emits for both sides. F16C is IEEE-f16. Don't spend effort
+   "enabling F16C"; `KT_TYPE_F16` exists in the ABI but has no kernel.
+3. **Loop order is worth more than instruction selection.** `gemmExpert` and
+   `gemmF32Bf16` are n-outer / m-inner so the *weight* matrix (the huge
+   operand) streams from DRAM once instead of once per token row. Measured
+   3.4-4.0x — far more than the ~1.1x from FMA or extra accumulators. Never
+   "simplify" these back to a m/n/k triple loop.
+4. **GEMM accumulation is an explicit choice.** `gemmExpert` OVERWRITES its
+   output (callers may pass uninitialised memory); `gemmExpertAccum` ADDS to
+   it (tensor-parallel rank loops). This split fixed a real bug:
+   `forwardDown` used to call the overwrite-only entry point once per tp rank
+   into one shared buffer, silently discarding every rank but the last.
+
+Also: `f32_to_bf16` rounds to nearest even (matching ggml / the reference);
+`f32_to_bf16_trunc` keeps the old truncating behaviour. And `-Dvariant` does
+**not** set Zig CPU features — it only sets C macros for the pybind path, so
+the feature set comes from the native target. `zig build -Dtarget=x86_64-linux-gnu
+-Dvariant=avx2` really does produce an SSE2-only library that still prints
+"Building variant: avx2".
+
+Tests for all of the above live in `tests/kernels/simd_kernels_tests.zig`
+(kept separate from `test_kernels.zig`).
+
 ## sentrux (architecture sensor — MCP + CLI)
 
 `.sentrux/rules.toml` is the **layering contract** for this repo, enforced by

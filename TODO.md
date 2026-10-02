@@ -24,6 +24,97 @@ Claims are removed when the task is done; abandoned claims can be reclaimed.
 
 ---
 
+## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
+
+Benchmarked against the reference's own AVX2 kernels
+(`kt-kernel/operators/avx2/avx2_bf16_gemm.hpp`) with the new harness
+`bench/cpp_vs_zig/run.sh` (compiles the reference headers unmodified behind a
+25-line `ggml.h` shim; same host, same shapes, same inputs, numerical
+cross-check). Before this work the port was **0.06x–0.46x** of the reference;
+it is now **1.19x–1.79x** on GEMM and **0.71x** on SwiGLU (bit-identical
+output). Attribution was measured with a controlled variant probe
+(`bench/cpp_vs_zig/zig_probe.zig`) that changes one structural property at a
+time, not guessed.
+
+- [x] **`@exp` on `@Vector(8, f32)` scalarizes — 17x on SwiGLU** — LLVM has
+  no vector lowering for `expf`; compiler-rt ships only a scalar one and Zig
+  does not target glibc's libmvec, so every vector became 8 `call
+  compiler_rt.exp.expf` with register spills (verified in the disassembly).
+  Replaced with `amx.expScalar` / `amx.expVec`: a Cephes-style construction
+  (`x = j·ln2 + f`, `exp = 2^j·(1 + f·R(f))`) that was **derived and fitted,
+  not transcribed** — three separate bugs in the first drafts are documented
+  inline (exponent-field shift applied before the sign OR; log2-space split
+  paired with an exp-space polynomial, silently 40% off; Horner walked the
+  coefficients upward and evaluated the reversed polynomial).
+  **Verified ≤ 1 ULP, 89.8% bit-identical to `@exp` over 1.5M points** —
+  tighter than the reference's own ~1e-6 polynomial, so the port ends up more
+  accurate than what it replaced rather than bit-mismatched with it.
+- [x] **GEMM loop order — 3.4x–4.0x, the dominant factor** — `gemmExpert` was
+  m-outer/n-inner, which re-streams the *entire* weight matrix (29 MB for a
+  DSV3 gate/up projection, past this host's L3) from DRAM once per token row.
+  Now n-outer/m-inner: one weight row stays L1-resident across all m, weights
+  are read from DRAM exactly once, only the small activation matrix is
+  re-read (out of L2/L3). Measured with a 4-variant probe: loop order alone
+  accounted for essentially the whole gap (164→47.7 ms at m=32); accumulator
+  count and FMA were ~1.1x each by comparison.
+- [x] **BF16→F32 conversion, not the FMA, is the uop budget** — 2 uops per 8
+  elements per operand vs 2 operands per 8 MACs. Added MR=4 register tiling so
+  each converted 32-element weight chunk feeds 4 accumulators (32→20
+  conversions per k-block). This is why the port now *beats* the reference,
+  which re-converts the weight row for every m.
+- [x] **MLA/MHA matmuls — 4.6x** — both engines carried their own copy of a
+  naive triple loop with `@reduce(.Add, ...)` *inside* the k loop (a full
+  horizontal reduce every 16 MACs). MLA's o_proj `[m=1,n=7168,k=18432]` went
+  **63.5 ms → 13.7 ms**, i.e. 4.16 → 19.3 GB/s, which is memory-bound — at the
+  hardware limit rather than 16x off it. Consolidated into one shared
+  `amx.gemmF32Bf16` in the arch layer so the two copies cannot drift again.
+- [x] **Explicit GEMM accumulation contract + tp>1 bug fix** — `gemmExpert`
+  OVERWRITES its output (callers legitimately pass uninitialised memory);
+  `gemmExpertAccum` ADDS to it. `forwardDown` was calling the overwrite-only
+  entry once per tensor-parallel rank into one shared FP32 buffer, so **every
+  rank but the last was silently discarded** whenever `tp_count > 1`. Making
+  the contract explicit fixes it; regression test added.
+- [x] **`f32_to_bf16` now rounds to nearest even** — it truncated, biasing every
+  value toward zero and disagreeing with ggml's `ggml_fp32_to_bf16` and the
+  reference's `avx2::store_fp32_to_bf16`. `f32_to_bf16_trunc` keeps the old
+  behaviour. bf16→f32→bf16 still round-trips exactly for all 65536 patterns.
+- [x] **Vectorized softmax** — `amx.softmaxF32` shared by `kt_softmax`, MHA,
+  MLA and DeepSeek-V3 routing; the old bodies made one scalar libm call per
+  element (129k calls/token for a 129k vocab).
+- [x] **`swigluClampVec` clamped `gate` from below** — the scalar
+  `swiglu_clamp` and the C++ `act_fn` clamp `gate` from above only (`up` is
+  symmetric), so the vectorized and scalar paths disagreed whenever a gate
+  value fell below `-limit`. The pre-existing test could not see it because its
+  inputs never reached the clamp.
+- [x] **Test infra unblocked (pre-existing)** — `tools/test_runner.zig` did not
+  compile on Zig 0.16.0 (`@errorReturnTrace()` returns `*builtin.StackTrace`,
+  `dumpStackTrace` wants `*const debug.StackTrace`), so `zig build test`
+  could not run at all; plus 5 `var`-never-mutated errors in the MLA suites.
+  `src/mla/mla_tests.zig` also had to import through the `kt` hub instead of
+  by relative path, because its root lives inside `src/` and a direct
+  `@import("mla_core.zig")` would then reject any `../kernels/...` import.
+- [x] **Tests: 241/243 pass** — new `tests/kernels/simd_kernels_tests.zig`
+  (17 tests: exp ULP, expVec==expScalar incl. clamp, RNE property test +
+  all-65536 round-trip, softmax tails/in-place, gemmExpert vs naive reference
+  across MR/32/8/1 tails and non-default `ld`s, overwrite-vs-accumulate,
+  `gemmExpertAccum` tp>1 guard, `gemmF32Bf16`, `matmulF32Offset`). The 2
+  failures are the `Q4_KxQ8_0` tests added by a concurrent agent's
+  uncommitted WIP, which fail on their own in-progress work.
+
+### Known gap left in place (deliberately)
+
+`-Dvariant` still does **not** pin Zig CPU features — it only sets C macros for
+the pybind path, so the feature set comes from the native target. Verified:
+`zig build -Dvariant=avx2 -Dtarget=x86_64-linux-gnu` emits SSE2-only code
+while printing "Building variant: avx2". Not fixed here because wiring AMX
+features into an AVX2 host path would emit instructions this hardware cannot
+execute, and there is no AMX hardware to validate against. Documented in
+AGENTS.md instead. **F16C remains irrelevant**: the weights are BF16, and AVX2
+has no BF16 conversion instruction — the widening is `vpmovzxwd` + `vpslld
+$16`, which both implementations already emit.
+
+---
+
 ## ✅ Completed (2026-08-31 — dev-feedback audit, IMPROVE.md P0-P3 ALL RESOLVED)
 
 Verified audit of external dev feedback (see IMPROVE.md: which claims were

@@ -88,7 +88,17 @@ pub fn main(init: std.process.Init.Minimal) void {
                     std.debug.print("FAIL ({t})\n", .{err});
                 }
                 if (@errorReturnTrace()) |trace| {
-                    std.debug.dumpStackTrace(trace);
+                    // Zig 0.16.0: `@errorReturnTrace()` hands back a
+                    // `*builtin.StackTrace` (index + instruction_addresses),
+                    // but `std.debug.dumpStackTrace` wants a
+                    // `*const debug.StackTrace` (return_addresses + skipped).
+                    // Bridge the two explicitly; the field layouts are not
+                    // interchangeable.
+                    const debug_trace: std.debug.StackTrace = .{
+                        .return_addresses = trace.instruction_addresses[trace.index..],
+                        .skipped = .none,
+                    };
+                    std.debug.dumpStackTrace(&debug_trace);
                 }
                 test_node.end();
             },
