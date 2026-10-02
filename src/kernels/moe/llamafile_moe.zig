@@ -692,6 +692,20 @@ pub const LlamaMoe = struct {
     /// runMatmul variant that uses the per-task scratch for the BF16
     /// activation dequant (removes the per-task allocator.alloc/free —
     /// the scratch slice is sized to the larger of gate/up/down k).
+    ///
+    /// Q4_K fast path (Zig extension, 2026-09-04): when the weight
+    /// type is Q4_K, skip the Q8_0→BF16 dequant and call
+    /// `gemmQ4KxQ8_0Scalar` directly. The formula
+    /// `d×sc×dot_q − dmin×m×dot_1` per 32-weight sub-block produces the
+    /// same result as the BF16 path (verified by the test
+    /// "Q4_KxQ8_0 scalar GEMM matches BF16 path numerically"), with
+    /// one fewer round-trip per token (no dequant to F32, no
+    /// per-weight FMA on the dequantized stream). For the LlamaMoe
+    /// forward path this is the dominant Q4_K cost; the other K-quants
+    /// (Q5_K, Q6_K, etc.) use the existing BF16 path. The
+    /// `gemmQ4KxQ8_0Scalar` is gated on `m == 1` today (the LlamaMoe
+    /// use case); for batched per-m-block the dispatch will need to
+    /// grow.
     fn runMatmulScratch(
         self: *LlamaMoe,
         weight_type: u32,
@@ -704,9 +718,27 @@ pub const LlamaMoe = struct {
         scr: *TokenScratch,
     ) void {
         _ = self;
-        // The act_bf16 scratch is sized for `hidden` and `inter`;
-        // both are ≤ max(hidden, inter) so one buffer covers all
-        // three projections.
+        if (weight_type == KT_TYPE_Q4_K and m == 1) {
+            // Skip the Q8_0→BF16 round-trip; call the fused dot
+            // directly. The Q8_0 block stride is `(kk / QK8_0)` per row.
+            gemm_q4_k.gemmQ4KxQ8_0Scalar(
+                @as([*]const gemm_q8_0.BlockQ8_0, @ptrCast(@alignCast(act_q8_0))),
+                kk / gemm_q8_0.QK8_0,
+                @as([*]const gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(weight_ptr))),
+                kk / gemm_q4_k.QK_K,
+                out,
+                n,
+                m,
+                n,
+                kk,
+            );
+            return;
+        }
+        // Fall through: Q8_0→BF16 dequant + the standard gemmQuant
+        // dispatch (handles the 15 other GGML formats). The act_bf16
+        // scratch is sized for `hidden` and `inter`; both are ≤
+        // max(hidden, inter) so one buffer covers all three
+        // projections.
         const scr_len = scr.act_bf16.len;
         if (scr_len < kk) @panic("TokenScratch act_bf16 too small");
         dequantQ8_0ToBF16(act_q8_0, scr.act_bf16.ptr, kk);

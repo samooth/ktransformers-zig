@@ -1833,6 +1833,257 @@ test "Q4_K scalar GEMM constant weights" {
 }
 
 // ============================================================================
+// Q4_K×Q8_0 scalar matmul — fused dot (Zig extension, 2026-09-04)
+// ============================================================================
+//
+// Two new tests for the fast path that skip the Q8_0→BF16 round-trip:
+// the BF16 path (gemmQ4_KScalar above) dequantizes Q4_K to F32, then does
+// BF16×F32; the Q4_K×Q8_0 path takes Q8_0 activations directly and
+// accumulates per 32-weight sub-block: y = d·sc·Σa_q·q - dmin·m·Σa_q.
+// Same numerical result; one fewer round-trip per token in the LlamaMoe
+// forward path (wired into runMatmulScratch in llamafile_moe.zig).
+//
+// No upstream reference (llama.cpp's sgemm.cpp doesn't expose a fused
+// Q4_K×Q8_0; the C++ path is on-the-fly dequant + FMA). The math is the
+// Q4_K×Q8_K generic vec_dot with Q8_K's per-block bsums replaced by
+// Σa_q (the Q8_0 side's sum of i8 qs, which has the same structural role
+// as bsums in the dot product).
+
+test "Q4_KxQ8_0 scalar GEMM matches BF16 path numerically" {
+    // The Q4_KxQ8_0 path is the "skip BF16 round-trip" optimization. The
+    // reference (BF16 path) dequantizes Q4_K to F32, then does BF16×F32.
+    // The new path takes Q8_0 activations directly and accumulates per
+    // 32-weight sub-block. Same Q4_K bytes fed to both paths; same F32
+    // source activation quantized to Q8_0 vs stored as BF16. Compare
+    // element-wise — the only delta is Q8_0's activation-quantization
+    // error (~d/2 per weight, with d=amax/127 of the source).
+    const q4k = root.gemm_q4_k;
+    const q8_0 = root.gemm_q8_0;
+    const M: usize = 2;
+    const N: usize = 2;
+    const K: usize = q4k.QK_K; // one super-block per row
+
+    // Build a deterministic F32 input row: smooth values in [-1, 1].
+    var src: [K]f32 = undefined;
+    for (0..K) |i| {
+        src[i] = @sin(@as(f32, @floatFromInt(i)) * 0.05);
+    }
+
+    // Build a Q4_K weight block (deterministic) by quantizing src.
+    var weight_blocks: [1]q4k.BlockQ4_K = undefined;
+    q4k.quantizeRowQ4_K(&src, &weight_blocks, K);
+
+    // Build the Q8_0 activations: quantize src to Q8_0.
+    //
+    // M rows, not one. gemmQ4KxQ8_0Scalar walks `a + i*lda` with
+    // lda = Q8_BLOCKS, so a single-row buffer makes every row past i=0 read
+    // past the end (garbage values that vary run to run).
+    const Q8_BLOCKS = K / q8_0.QK8_0; // = 8
+    var a_q8: [M][Q8_BLOCKS]q8_0.BlockQ8_0 = undefined;
+    for (0..M) |i| q8_0.quantizeRowQ8_0(&src, &a_q8[i], K);
+
+    // Build the BF16 input: f32 -> bf16 (this is what gemmQ4_KScalar consumes).
+    // M rows, same reason as the Q8_0 buffer above: gemmQ4_KScalar walks
+    // `a + i*lda` with lda = K.
+    var a_bf16: [M][K]amx.bf16 = undefined;
+    for (0..M) |i| {
+        for (0..K) |t| a_bf16[i][t] = amx.f32_to_bf16(src[t]);
+    }
+
+    // The Q4_K blocks need to be replicated to N rows (matmul has
+    // B[n][k_blocks] layout).
+    var b_q4: [N][1]q4k.BlockQ4_K = undefined;
+    for (0..N) |j| b_q4[j][0] = weight_blocks[0];
+
+    // Run Q4_KxQ8_0 path
+    var c_q8: [M * N]f32 = undefined;
+    q4k.gemmQ4KxQ8_0Scalar(
+        @as([*]const q8_0.BlockQ8_0, @ptrCast(&a_q8[0][0])), Q8_BLOCKS,
+        @as([*]const q4k.BlockQ4_K, @ptrCast(&b_q4)),
+        1,
+        &c_q8, N,
+        M, N, K,
+    );
+
+    // Run BF16 path
+    var c_bf16: [M * N]f32 = undefined;
+    q4k.gemmQ4_KScalar(
+        @as([*]const amx.bf16, @ptrCast(&a_bf16[0][0])), K,
+        @as([*]const q4k.BlockQ4_K, @ptrCast(&b_q4)),
+        1,
+        &c_bf16, N,
+        M, N, K,
+    );
+
+    // The two paths differ ONLY in how the activation is encoded
+    // (Q8_0 vs BF16). Both produce a Q4_K×activation dot product. The
+    // Q8_0 quantization introduces a per-weight error of up to d/2 (with
+    // d=amax/127 of the source). For our [-1, 1] input, d ≈ 0.016, so
+    // per-weight error ≈ 0.008, and over 256 weights the max accumulated
+    // error is bounded. Use a generous tolerance to absorb the
+    // difference.
+    for (0..M) |i| {
+        for (0..N) |j| {
+            const diff = @abs(c_q8[i * N + j] - c_bf16[i * N + j]);
+            try testing.expect(diff < 8.0);
+        }
+    }
+}
+
+test "Q4_KxQ8_0 fused dot == dequantize-and-dot, on varied blocks" {
+    // The strongest available invariant for gemmQ4KxQ8_0Scalar: it must
+    // equal `dequantizeRowQ4_K` followed by a plain F32 dot product with the
+    // dequantized Q8_0 activations. Unlike the two tests above (which compare
+    // against the BF16 path and therefore also carry the activation encoding
+    // error), this has no approximation in it beyond f32 rounding — so it
+    // pins the Q4_K `qs` nibble interleave exactly.
+    //
+    // That matters: the first implementation indexed qs[sub*32 + t], which
+    // overruns the 128-byte qs array by 128 bytes AND never reads the high
+    // nibbles. The two "matches the BF16 path" tests could not see it — with
+    // qs filled with 0x11 both nibbles are 1, and a smooth sinusoid keeps the
+    // weight spread small enough that the error stayed inside the tolerance.
+    const q4k = root.gemm_q4_k;
+    const q8_0 = root.gemm_q8_0;
+    const K: usize = q4k.QK_K;
+    const M: usize = 3;
+    const N: usize = 3;
+
+    var src: [K]f32 = undefined;
+    var act: [K]f32 = undefined;
+
+    // Several blocks with very different scale structure, so every one of the
+    // 8 sub-blocks gets a different (sc, m) and both nibbles get used.
+    const shapes = [_][3]f32{
+        .{ 1.0, 1.0, 0.3 },
+        .{ 0.02, 3.0, 0.9 },
+        .{ 12.0, 0.01, 0.5 },
+        .{ 1.0, 1.0, 1.0 },
+    };
+
+    var wblocks: [N][1]q4k.BlockQ4_K = undefined;
+    var a_q8: [M][K / q8_0.QK8_0]q8_0.BlockQ8_0 = undefined;
+    var deq: [N][K]f32 = undefined;
+
+    for (shapes, 0..) |shape, si| {
+        const j = si % N;
+        // Weight block: vary the dynamic range so the 6-bit scale/min
+        // unpacking and the nibble interleave are all exercised.
+        for (0..K) |t| {
+            src[t] = @sin(@as(f32, @floatFromInt(t)) * (0.013 * @as(f32, @floatFromInt(si + 1)))) * shape[0];
+        }
+        q4k.quantizeRowQ4_K(&src, @as([*]q4k.BlockQ4_K, @ptrCast(&wblocks[j][0])), K);
+        // Break up the nibble pattern: overwrite a slice with values whose
+        // low and high nibbles differ, so a swapped interleave cannot pass.
+        for (&wblocks[j][0].qs, 0..) |*q, t| {
+            if (t % 3 == 0) q.* = @intCast(0xA0 | @as(u8, @truncate(t % 16)));
+        }
+
+        // Activations: also vary per row.
+        for (0..M) |i| {
+            for (0..K) |t| {
+                act[t] = @cos(@as(f32, @floatFromInt(t)) * (0.021 * @as(f32, @floatFromInt(i + 1)))) * shape[1] + shape[2];
+            }
+            q8_0.quantizeRowQ8_0(&act, &a_q8[i], K);
+        }
+
+        // Ground truth for this weight row.
+        q4k.dequantizeRowQ4_K(@as([*]const q4k.BlockQ4_K, @ptrCast(&wblocks[j][0])), &deq[j], K);
+    }
+
+    var c: [M * N]f32 = undefined;
+    q4k.gemmQ4KxQ8_0Scalar(
+        @as([*]const q8_0.BlockQ8_0, @ptrCast(&a_q8[0][0])),
+        K / q8_0.QK8_0,
+        @as([*]const q4k.BlockQ4_K, @ptrCast(&wblocks[0][0])),
+        1,
+        &c, N,
+        M, N, K,
+    );
+
+    for (0..M) |i| {
+        // Dequantize the activations exactly as the fused path does.
+        var adq: [K]f32 = undefined;
+        for (0..K / q8_0.QK8_0) |b| {
+            const d = q8_0.f16_to_f32(a_q8[i][b].d);
+            for (0..q8_0.QK8_0) |t| adq[b * q8_0.QK8_0 + t] = d * @as(f32, @floatFromInt(a_q8[i][b].qs[t]));
+        }
+        for (0..N) |j| {
+            var want: f32 = 0;
+            for (0..K) |t| want += deq[j][t] * adq[t];
+            const got = c[i * N + j];
+            try testing.expectApproxEqRel(want, got, 2e-5);
+        }
+    }
+}
+
+test "Q4_KxQ8_0 scalar GEMM constant weights matches BF16 path" {
+    // All weights = 1.0 (d=1, sc chosen, q=1, m=0 => y = 1*1 - 0 = 1).
+    // Build the matching Q8_0 input: d=1/127, qs all = 127 (so the
+    // dequant round-trip gives ~1.0 per element). Then C = (d·sc·dot_q -
+    // dmin·m·dot_1) per sub-block; with d=1, sc=1, qs=127 in q4_k =>
+    // y = 1*1*127 - 0 = 127; scaled by Q8_0 d=1/127: 127 * (1/127) = 1.0
+    // per element. Sum over 256: 256.
+    const q4k = root.gemm_q4_k;
+    const q8_0 = root.gemm_q8_0;
+    const M: usize = 4;
+    const N: usize = 4;
+    const K: usize = q4k.QK_K;
+
+    // Build constant Q4_K weight block (y = 1.0): d=1, sc=1, m=0, q=1.
+    var b_q4: [N][1]q4k.BlockQ4_K = undefined;
+    for (0..N) |j| {
+        b_q4[j][0].d = q4k.f32_to_f16(1.0);
+        b_q4[j][0].dmin = q4k.f32_to_f16(0.0);
+        for (0..12) |b| b_q4[j][0].scales[b] = 0;
+        // j<4: sc=1, m=0 (per getScaleMinK4 formula)
+        for (0..4) |b| b_q4[j][0].scales[b] = 1; // sc=1 for j<4
+        // j>=4 packed: sc=(scales[j+4]&0xF)|((scales[j-4]>>6)<<4). Need scales[8..11]&0xF=1
+        // and scales[0..3]>>6=0 (which is true since 1=0b00000001, >>6=0).
+        // So set scales[8..11] low nibble to 1: that gives sc=1|0=1.
+        for (8..12) |b| b_q4[j][0].scales[b] = 0x01; // low nibble=1, high nibble=0
+        // m for j>=4: m=(scales[j+4]>>4)|((scales[j]>>6)<<4). scales[j+4]>>4=0, scales[j]>>6=0. m=0.
+        for (&b_q4[j][0].qs) |*qq| qq.* = 0x11; // both nibbles = 1
+    }
+
+    // Build constant Q8_0 activation row by quantizing an all-1.0 F32
+    // vector. d = 1/127 and all qs = 127, then we manually set d to its
+    // 16-bit float representation so the constant test is fully
+    // deterministic. d_q8 = 1/127 is exactly the inverse of the qs
+    // max so the dequant round-trip is 1.0 per weight.
+    const Q8_BLOCKS = K / q8_0.QK8_0;
+    var a_q8: [M][Q8_BLOCKS]q8_0.BlockQ8_0 = undefined; // M rows, see above
+    const d_q8: f32 = 1.0 / 127.0;
+    for (0..M) |i| {
+        for (0..Q8_BLOCKS) |b| {
+            a_q8[i][b].d = q4k.f32_to_f16(d_q8);
+            for (0..q8_0.QK8_0) |t| a_q8[i][b].qs[t] = 127;
+        }
+    }
+
+    var c_q8: [M * N]f32 = undefined;
+    q4k.gemmQ4KxQ8_0Scalar(
+        @as([*]const q8_0.BlockQ8_0, @ptrCast(&a_q8[0][0])), Q8_BLOCKS,
+        @as([*]const q4k.BlockQ4_K, @ptrCast(&b_q4)),
+        1,
+        &c_q8, N,
+        M, N, K,
+    );
+
+    // Per Q4_K dequant: y = 1.0 per weight. 256 weights × 1.0 = 256.
+    // Per sub-block: 32 × 1.0 = 32. Per super-block: 8 × 32 = 256.
+    // The Q8_0 d = 1/127 is stored in BF16 (f16) — quantization of d
+    // adds a small error (BF16 is ~6% relative at this magnitude,
+    // so d_q8 becomes ~0.00797). Tolerance 16.0 absorbs the per-block
+    // error over 8 sub-blocks.
+    for (0..M) |i| {
+        for (0..N) |j| {
+            try testing.expectApproxEqAbs(@as(f32, 256.0), c_q8[i * N + j], 16.0);
+        }
+    }
+}
+
+// ============================================================================
 // GGML Q6_K (kernel-layer Phase 1; 210-byte blocks, byte-exact vs ggml)
 // ============================================================================
 

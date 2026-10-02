@@ -358,3 +358,199 @@ test "kt_llama_moe C API: parallel (4-thread) == sequential (1-thread) forward" 
         try testing.expectEqual(out_seq[i], out_par[i]);
     }
 }
+
+test "kt_llama_moe C API: Q4_K fused path through the MoE matches dequantized reference" {
+    // Coverage for the Q4_K fast path (gemmQ4KxQ8_0Scalar wired into
+    // runMatmulScratch): every prior LlamaMoe forward test used Q8_0
+    // weights, so the fused arm never executed through the pipeline
+    // (the same test-gap class that hid the 5177bdf KT_TYPE bug).
+    // Q4_K config + 4-thread pool + qlen>1 drives the parallel scratch
+    // path straight into the fused arm; the reference replicates the
+    // MoE math on dequantized F32 weights with the SAME activation
+    // quantization noise (Q8_0 round-trips on act and mid — both the
+    // fused and BF16 paths quantize activations; the fused path only
+    // skips the BF16 intermediate, whose loss is exact for Q8_0: the
+    // dequant value a_q*a_d is what the fused dot multiplies anyway).
+    const allocator = testing.allocator;
+    const amx = kt.amx;
+    const q4k = kt.gemm_q4_k;
+    const q8 = kt.gemm_q8_0;
+
+    const hidden: usize = 256; // Q4_K: K % 256 == 0
+    const inter: usize = 256; // down-proj K too
+    const expert_num: usize = 2;
+    const top_k: usize = 2;
+    const qlen: usize = 8;
+
+    // Seeded random Q4_K weights via the real quantizer.
+    const gate_blks = expert_num * inter * (hidden / 256);
+    const gate_w = try allocator.alloc(u8, gate_blks * @sizeOf(q4k.BlockQ4_K));
+    defer allocator.free(gate_w);
+    const up_w = try allocator.alloc(u8, gate_blks * @sizeOf(q4k.BlockQ4_K));
+    defer allocator.free(up_w);
+    const down_blks = expert_num * hidden * (inter / 256);
+    const down_w = try allocator.alloc(u8, down_blks * @sizeOf(q4k.BlockQ4_K));
+    defer allocator.free(down_w);
+    var prng = std.Random.DefaultPrng.init(0x51D06);
+    const rnd = prng.random();
+    const w_blk_size = @sizeOf(q4k.BlockQ4_K);
+    {
+        const row_f = try allocator.alloc(f32, hidden);
+        defer allocator.free(row_f);
+        for (0..expert_num * inter) |r| {
+            for (row_f) |*v| v.* = @as(f32, @floatFromInt(rnd.int(u8))) / 255.0 - 0.5;
+            q4k.quantizeRowQ4_K(row_f, @as([*]q4k.BlockQ4_K, @ptrCast(@alignCast(gate_w.ptr + r * (hidden / 256) * w_blk_size))), hidden);
+        }
+        for (0..expert_num * inter) |r| {
+            for (row_f) |*v| v.* = @as(f32, @floatFromInt(rnd.int(u8))) / 255.0 - 0.5;
+            q4k.quantizeRowQ4_K(row_f, @as([*]q4k.BlockQ4_K, @ptrCast(@alignCast(up_w.ptr + r * (hidden / 256) * w_blk_size))), hidden);
+        }
+        for (0..expert_num * hidden) |r| {
+            for (row_f[0..inter]) |*v| v.* = @as(f32, @floatFromInt(rnd.int(u8))) / 255.0 - 0.5;
+            q4k.quantizeRowQ4_K(row_f[0..inter], @as([*]q4k.BlockQ4_K, @ptrCast(@alignCast(down_w.ptr + r * (inter / 256) * w_blk_size))), inter);
+        }
+    }
+
+    // Random BF16 input [qlen, hidden].
+    const input = try allocator.alloc(u8, qlen * hidden * 2);
+    defer allocator.free(input);
+    const in_bf: [*]amx.bf16 = @ptrCast(@alignCast(input.ptr));
+    for (0..qlen * hidden) |i| {
+        in_bf[i] = amx.f32_to_bf16(@as(f32, @floatFromInt(rnd.int(u8))) / 255.0 - 0.5);
+    }
+
+    // Mixed routing: first half experts {0,1}, second half {1,0} —
+    // exercises both expert-slice offsets.
+    const eids = try allocator.alloc(i64, qlen * top_k);
+    defer allocator.free(eids);
+    const wts = try allocator.alloc(f32, qlen * top_k);
+    defer allocator.free(wts);
+    for (0..qlen) |t| {
+        const flip: i64 = if (t < 4) 0 else 1;
+        eids[t * top_k] = flip;
+        eids[t * top_k + 1] = 1 - flip;
+        wts[t * top_k] = 0.6;
+        wts[t * top_k + 1] = 0.4;
+    }
+
+    // Run through the C API (4-thread pool -> parallel -> fused arm).
+    const out = try allocator.alloc(f32, qlen * hidden);
+    defer allocator.free(out);
+    {
+        const pool = kt.kt_worker_pool_new(4);
+        defer kt.kt_worker_pool_free(pool);
+        const cfg = kt.kt_llama_moe_config_t{
+            .expert_num = expert_num,
+            .num_experts_per_tok = top_k,
+            .hidden_size = hidden,
+            .intermediate_size = inter,
+            .layer_idx = 0,
+            .pool = @ptrCast(pool),
+            .gate_type = 16, // KT_TYPE_Q4_K
+            .up_type = 16,
+            .down_type = 16,
+            .hidden_type = 2,
+            .m_block = 32,
+            .group_min_len = 32,
+            .group_max_len = 1024,
+            .gpu_experts_mask = null,
+            .gate_proj = gate_w.ptr,
+            .up_proj = up_w.ptr,
+            .down_proj = down_w.ptr,
+        };
+        const moe = kt.kt_llama_moe_new(&cfg);
+        kt.kt_llama_moe_load_weights(moe, @intCast(inter), 0);
+        kt.kt_llama_moe_forward(moe, @intCast(qlen), @intCast(top_k), eids.ptr, wts.ptr, input.ptr, out.ptr);
+        kt.kt_llama_moe_free(moe);
+    }
+
+    // Dequantize weights once for the reference.
+    const gate_dq = try allocator.alloc(f32, expert_num * inter * hidden);
+    defer allocator.free(gate_dq);
+    const up_dq = try allocator.alloc(f32, expert_num * inter * hidden);
+    defer allocator.free(up_dq);
+    const down_dq = try allocator.alloc(f32, expert_num * hidden * inter);
+    defer allocator.free(down_dq);
+    {
+        const gb: [*]const q4k.BlockQ4_K = @ptrCast(@alignCast(gate_w.ptr));
+        const ub: [*]const q4k.BlockQ4_K = @ptrCast(@alignCast(up_w.ptr));
+        const db: [*]const q4k.BlockQ4_K = @ptrCast(@alignCast(down_w.ptr));
+        for (0..expert_num * inter) |r| {
+            q4k.dequantizeRowQ4_K(gb + r * (hidden / 256), gate_dq[r * hidden ..][0..hidden], hidden);
+            q4k.dequantizeRowQ4_K(ub + r * (hidden / 256), up_dq[r * hidden ..][0..hidden], hidden);
+        }
+        for (0..expert_num * hidden) |r| {
+            q4k.dequantizeRowQ4_K(db + r * (inter / 256), down_dq[r * inter ..][0..inter], inter);
+        }
+    }
+
+    // Reference: per token, per expert — act Q8_0 round-trip, gate/up
+    // dots, silu*up, mid Q8_0 round-trip, down dot, weighted sum.
+    // Tolerance: the fused arm and this reference differ only in F32
+    // accumulation ORDER (same values multiplied); Q4_K/Q8_0 quant
+    // noise is identical on both sides by construction.
+    const act_f = try allocator.alloc(f32, hidden);
+    defer allocator.free(act_f);
+    const act_dq = try allocator.alloc(f32, hidden);
+    defer allocator.free(act_dq);
+    const mid_f = try allocator.alloc(f32, inter);
+    defer allocator.free(mid_f);
+    const mid_dq = try allocator.alloc(f32, inter);
+    defer allocator.free(mid_dq);
+    const act_q8 = try allocator.alloc(q8.BlockQ8_0, hidden / 32);
+    defer allocator.free(act_q8);
+    const mid_q8 = try allocator.alloc(q8.BlockQ8_0, inter / 32);
+    defer allocator.free(mid_q8);
+
+    var max_rel: f32 = 0;
+    for (0..qlen) |t| {
+        // Activation Q8_0 round-trip (same as both kernel paths).
+        for (0..hidden) |i| act_f[i] = amx.bf16_to_f32(in_bf[t * hidden + i]);
+        q8.quantizeRowQ8_0(act_f, act_q8.ptr, hidden);
+        q8.dequantizeRowQ8_0(act_q8.ptr, act_dq, hidden);
+
+        const out_ref_buf = try allocator.alloc(f32, hidden);
+        defer allocator.free(out_ref_buf);
+        @memset(out_ref_buf, 0);
+        for (0..top_k) |ki| {
+            const e: usize = @intCast(eids[t * top_k + ki]);
+            const w = wts[t * top_k + ki];
+            // Phase 1: mid[j] = silu(gate·act) * (up·act).
+            for (0..inter) |j| {
+                var g: f32 = 0;
+                var u: f32 = 0;
+                for (0..hidden) |i| {
+                    g += act_dq[i] * gate_dq[(e * inter + j) * hidden + i];
+                    u += act_dq[i] * up_dq[(e * inter + j) * hidden + i];
+                }
+                mid_f[j] = g / (1.0 + @exp(-g)) * u;
+            }
+            // Phase 2: mid Q8_0 round-trip + down dot + weighted add.
+            q8.quantizeRowQ8_0(mid_f, mid_q8.ptr, inter);
+            q8.dequantizeRowQ8_0(mid_q8.ptr, mid_dq, inter);
+            for (0..hidden) |i| {
+                var dd: f32 = 0;
+                for (0..inter) |jj| {
+                    dd += mid_dq[jj] * down_dq[(e * hidden + i) * inter + jj];
+                }
+                out_ref_buf[i] += dd * w;
+            }
+        }
+        // Compare element-wise.
+        for (0..hidden) |i| {
+            const got = out[t * hidden + i];
+            const want = out_ref_buf[i];
+            try testing.expect(std.math.isFinite(got));
+            const denom = @max(@abs(want), 1e-3);
+            const rel = @abs(got - want) / denom;
+            max_rel = @max(max_rel, rel);
+        }
+    }
+    // Same values, different FMA order — expect ~1e-5; 1e-2 is a wide
+    // anti-flake bound that still catches wrong-kernel/wrong-offset
+    // dispatch (those produce O(1) divergence, as the race probe did).
+    if (max_rel >= 1e-2) {
+        std.debug.print("Q4K fused rel={d:.6} out[0]={d:.6} ref[0]={d:.6}\n", .{ max_rel, out[0], @as(f32, 0) });
+    }
+    try testing.expect(max_rel < 1e-2);
+}
