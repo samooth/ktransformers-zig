@@ -218,7 +218,8 @@ loadWeights fix); D3 fixed the `ldc` for tp_count > 1.
 
 Benchmarked against the C++ reference's own AVX2 kernels
 (`kt-kernel/operators/avx2/avx2_bf16_gemm.hpp`) with
-`bench/cpp_vs_zig/run.sh`; as of the SIMD rework the Zig port is **1.0-1.27x
+`bench/cpp_vs_zig/run.sh` — see that directory's `README.md` (how to run,
+`KT_REF`/`KT_PIN`) and `RESULTS.md` (the measurement record); as of the SIMD rework the Zig port is **1.0-1.27x
 the reference** on BF16 GEMM and **0.66x** on SwiGLU (with bit-identical
 output). Four rules carry almost all of it:
 

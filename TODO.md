@@ -1,8 +1,8 @@
 # ktransformers-zig TODO
 
-## Status: Beta (All workstreams closed; 15/15 GGML formats + 226 tests)
+## Status: Beta (15/15 GGML formats + 244 tests; SIMD at/above C++ parity)
 
-Last updated: 2026-09-03
+Last updated: 2026-10-03
 
 ### Coordination protocol (multi-agent)
 **CLAIM before you code.** Before starting a new task, add a claim line
@@ -12,7 +12,7 @@ independently ported the same LLAMA_MOE_TP to Zig in the same session).
 Claims are removed when the task is done; abandoned claims can be reclaimed.
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
-**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax)) = **226 total pass, 0 leaks, exit 0**.
+**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels) = **244 total pass, 0 leaks, exit 0**.
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon (8 installed names), each exporting **112 C API symbols** (triple-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). Runs in CI (`wheels.yml` `abi-gate` job).
 **Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
 **Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
@@ -22,6 +22,45 @@ Claims are removed when the task is done; abandoned claims can be reclaimed.
 **GGML: 15/15 FORMATS COMPLETE** - Q8_0, Q4_K, Q5_K, Q6_K, Q8_K, Q2_K, Q3_K, IQ4_XS, IQ4_NL, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M — all with quantize + dequantize + GEMM + tests. Kmap init histogram-based (22x) + process-cached.
 **MHA engine + GGUF parser (Qwen3 dev)**: vanilla MHA `MhaEngine` + GGUF v3 parser in `src/io/gguf.zig` — committed in `a61271e`.
 
+### Open items (verified against the tree on 2026-10-03)
+
+Consolidated from `REMAINING.md` and the lane-c external audit
+(`TO_IMPROVE.md`). Everything those two files listed as a task has been
+re-checked against the current source; the resolved ones are listed so the
+next reader does not re-investigate them. `REMAINING.md` has been deleted in
+favour of this section — it had gone stale (four of its five tasks were
+already completed and it did not mention the SIMD work at all).
+
+**Actually open:**
+
+- [ ] **`posix_madvise` is stubbed** (`src/runtime/memory.zig:173,179`) —
+  `madviseSequential` / `madviseRandom` take their arguments and do nothing,
+  so weight-loading streams get no readahead hint and no DONTNEED. Low risk,
+  real win on large GGUF loads. (TO_IMPROVE P0.3)
+- [ ] **`LlamaMoe.tp_part_idx` is stored but never used** —
+  `llamafile_moe.zig:256,283,302` accept and store it, but nothing selects a
+  subpool from it, so every TP shard runs on the default pool. Either wire it
+  to `worker_pool.subpoolForCpu` or delete the field so it stops implying
+  routing that does not happen.
+- [ ] **No end-to-end validation against a real model** — every suite runs on
+  synthetic shapes. The GGUF parser is exercised against a real file
+  (`qwen3_gguf_e2e_tests.zig`) but no suite checks logit agreement against a
+  reference implementation. (TO_IMPROVE P2.1)
+
+**Verified resolved (do not re-open):**
+
+- ABI gates in CI — `verify_abi.py` runs in the `wheels.yml` `abi-gate` job.
+- Q4_K x Q8_0 fused matmul — `gemmQ4KxQ8_0Scalar`, wired into
+  `runMatmulScratch`; covered by 3 tests including a dequant-and-dot
+  ground-truth check. The nibble-interleave bug in it is fixed.
+- `kt_llama_moe_forward_many` — commit `1130d0b`.
+- `K_BLOCK` runtime tuning for INT8/INT4/FP8/MXFP4/MXFP8 — commit `fe437aa`.
+- down-projection memory-bound gap — closed by the GEMM loop-order fix (see
+  the SIMD section below): 1.13x-1.88x of the C++ reference at m>=8.
+- `src/main.zig.backup*` snapshots — gone (TO_IMPROVE P0.1).
+- `src/numa/numa_worker.zig` API rot — no remaining `std.fs.cwd` /
+  `std.mem.page_size` uses (TO_IMPROVE P0.2).
+
 ---
 
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
@@ -30,7 +69,9 @@ Benchmarked against the reference's own AVX2 kernels
 (`kt-kernel/operators/avx2/avx2_bf16_gemm.hpp`) with the new harness
 `bench/cpp_vs_zig/run.sh` (compiles the reference headers unmodified behind a
 25-line `ggml.h` shim; same host, same shapes, same inputs, numerical
-cross-check). Before this work the port was **0.06x–0.46x** of the reference;
+cross-check). **See `bench/cpp_vs_zig/README.md` for how to run it and
+`bench/cpp_vs_zig/RESULTS.md` for the durable measurement record** — note that
+host is shared, so absolute ms figures need a quiet box; the ratios are stable. Before this work the port was **0.06x–0.46x** of the reference;
 it is now **1.19x–1.79x** on GEMM and **0.71x** on SwiGLU (bit-identical
 output). Attribution was measured with a controlled variant probe
 (`bench/cpp_vs_zig/zig_probe.zig`) that changes one structural property at a
