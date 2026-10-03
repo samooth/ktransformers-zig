@@ -316,6 +316,126 @@ pub fn quantizeRowIQ4_XS(x: [*]const f32, y: [*]BlockIQ4_XS, k: usize) void {
 // scalar GEMM: BF16 activations × IQ4_XS weights -> F32 output
 // ============================================================================
 
+// ============================================================================
+// AVX2 GEMM
+// ============================================================================
+//
+// Same four rules as everywhere else in this tree: n-outer so the weight block
+// streams from DRAM once, MR=4 so four activation rows share one unpacked
+// weight vector, explicit `@mulAdd` because FP contraction is off in this
+// toolchain, and one `@reduce` per output element.
+//
+// The unpack is the same SPLIT-HALF shape as IQ4_NL — for each 32-weight
+// sub-block, the low nibbles of its 16 bytes are weights 0..15 and the high
+// nibbles are weights 16..31 — but the scale is per-sub-block rather than per
+// block. The 6-bit scale is split across two arrays and must be reassembled
+// before use:
+//
+//   low  4 bits: (scales_l[ib/2] >> 4*(ib%2)) & 0xf
+//   high 2 bits: (scales_h >> 2*ib) & 3,  shifted up by 4
+//   signed by subtracting 32, then multiplied by the f16 super-block scale
+//
+// Getting the two halves from the wrong sub-block still yields a plausible
+// number, so the scale index is asserted directly in the test.
+
+const MR: usize = 4;
+const Vec: type = @Vector(8, f32);
+
+/// 8 bf16 -> 8 f32, unaligned.
+inline fn widen8(p: [*]const amx.bf16) Vec {
+    const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+    return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+}
+
+/// The dequant scale for sub-block `ib`: the 6-bit field reassembled from
+/// `scales_l`/`scales_h`, signed by subtracting 32, times the super-block f16
+/// scale. Runtime `ib` — one call per 32 weights, versus the 128 FMAs it feeds.
+inline fn subBlockScale(blk: *const BlockIQ4_XS, ib: usize) f32 {
+    const l_low = (blk.scales_l[ib / 2] >> @intCast(4 * (ib % 2))) & 0xf;
+    const l_high: u8 = @intCast((blk.scales_h >> @intCast(2 * ib)) & 3);
+    const ls: u32 = @as(u32, l_low) | (@as(u32, l_high) << 4);
+    return f16_to_f32(blk.d) * (@as(f32, @floatFromInt(ls)) - 32.0);
+}
+
+/// 8 nibbles out of 8 consecutive bytes -> 8 f32 via the shared non-linear i8
+/// table. `shift` 0 = low nibbles (weights 0..15), 4 = high (weights 16..31).
+inline fn kvalues8(p: *const u8, comptime shift: u4) Vec {
+    const raw: @Vector(8, u8) = @as(*align(1) const @Vector(8, u8), @ptrCast(p)).*;
+    var out: [8]f32 = undefined;
+    if (shift == 0) {
+        inline for (0..8) |i| out[i] = @floatFromInt(KVALUES_IQ4NL[raw[i] & 0xF]);
+    } else {
+        inline for (0..8) |i| out[i] = @floatFromInt(KVALUES_IQ4NL[raw[i] >> 4]);
+    }
+    return out;
+}
+
+/// AVX2 IQ4_XS GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
+/// `k` must be a multiple of QK_K, as for the scalar version.
+pub fn gemmAvx2(
+    a: [*]const amx.bf16,
+    b: [*]const BlockIQ4_XS,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    const nb = k / QK_K;
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        const brow = b + j * ldb;
+
+        var i: usize = 0;
+        while (i + MR <= m) : (i += MR) {
+            var acc = [_]Vec{@splat(0.0)} ** MR;
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                const abase = blk * QK_K;
+                // 8 sub-blocks of 32. Runtime `ib` so this does not unroll 128
+                // vfmadd per block; the 4 Vec8 inside each sub-block are
+                // comptime so their byte offsets fold into the load displacement.
+                for (0..N_SUB) |ib| {
+                    const dv: Vec = @splat(subBlockScale(blk_ptr, ib));
+                    const qbase = ib * 16;
+                    inline for (0..2) |bh| {
+                        inline for (0..2) |nh| {
+                            const koff = abase + ib * SUB_BLOCK + bh * 8 + nh * 16;
+                            const w = kvalues8(&blk_ptr.qs[qbase + bh * 8], if (nh == 0) 0 else 4) * dv;
+                            inline for (0..MR) |r| {
+                                acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + koff), w, acc[r]);
+                            }
+                        }
+                    }
+                }
+            }
+            inline for (0..MR) |r| c[(i + r) * ldc + j] = @reduce(.Add, acc[r]);
+        }
+
+        // Row tail (m % MR), one row at a time.
+        while (i < m) : (i += 1) {
+            var acc: Vec = @splat(0.0);
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                const abase = blk * QK_K;
+                for (0..N_SUB) |ib| {
+                    const dv: Vec = @splat(subBlockScale(blk_ptr, ib));
+                    const qbase = ib * 16;
+                    inline for (0..2) |bh| {
+                        inline for (0..2) |nh| {
+                            const koff = abase + ib * SUB_BLOCK + bh * 8 + nh * 16;
+                            acc = @mulAdd(Vec, widen8(a + i * lda + koff), kvalues8(&blk_ptr.qs[qbase + bh * 8], if (nh == 0) 0 else 4) * dv, acc);
+                        }
+                    }
+                }
+            }
+            c[i * ldc + j] = @reduce(.Add, acc);
+        }
+    }
+}
+
 pub fn gemmIQ4_XSScalar(
     input: [*]const amx.bf16, // [m, k] BF16, row-major
     weight: [*]const BlockIQ4_XS, // [n, k/QK_K] blocks, row-major

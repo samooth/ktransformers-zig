@@ -114,7 +114,8 @@ comptime {
     _ = &gemm_iq4_xs.quantizeRowIQ4_XS;
     _ = &gemm_iq4_xs.dequantizeRowIQ4_XS;
     _ = &gemm_iq4_xs.dequantizeRowIQ4_XSToBF16;
-    _ = &gemm_iq4_xs.gemmIQ4_XSScalar;
+    _ = &gemm_iq4_xs.gemmIQ4_XSScalar; // oracle
+    _ = &gemm_iq4_xs.gemmAvx2;
     _ = &gemm_iq4_nl.BlockIQ4_NL;
     _ = &gemm_iq4_nl.f32_to_f16;
     _ = &gemm_iq4_nl.f16_to_f32;

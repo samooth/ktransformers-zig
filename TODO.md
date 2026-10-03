@@ -1,6 +1,6 @@
 # ktransformers-zig TODO
 
-## Status: Beta (15/15 GGML formats + 264 tests; SIMD at/above C++ parity)
+## Status: Beta (15/15 GGML formats + 266 tests; SIMD at/above C++ parity)
 
 Last updated: 2026-10-03
 
@@ -17,7 +17,7 @@ and the reasoning, not who or what typed it. Commit messages carry no
 attribution trailers of any kind.
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
-**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels + the six K-quant AVX2 GEMMs) = **264 total pass across 18 suites, 0 leaks, exit 0**.
+**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels + the six K-quant AVX2 GEMMs) = **266 total pass across 18 suites, 0 leaks, exit 0**.
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon (8 installed names), each exporting **112 C API symbols** (triple-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). Runs in CI (`wheels.yml` `abi-gate` job).
 **Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
 **Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
@@ -197,7 +197,7 @@ new functions would never be emitted into the .so.
 Tests: 6 new, in `tests/kernels/simd_kernels_tests.zig`, one per format,
 `fused == dequantizeRow + f32 dot` (no approximation) with deliberately
 non-uniform per-group scales, at m ∈ {1, 4, 5} and 3 super-blocks, plus the
-scalar path on the same assertion. Suite total 264 across 18 suites, `zig build test` exit 0.
+scalar path on the same assertion. Suite total 266 across 18 suites, `zig build test` exit 0.
 Also here: `gemmQ4_KScalar` (the BF16-activation Q4_K entry, i.e. Stream A's
 remaining item) got the same treatment and is now dispatched too.
 
@@ -559,6 +559,70 @@ case is lookup-bound in the same way (4 ms for 8.3 MB = 2.1 GB/s, against
 Q8_0's table-free 7.8 GB/s). `vpshufb` would be the natural fix since the table
 is 16 bytes and `vpshufb` is exactly a 16-entry byte shuffle, but it needs
 inline asm.
+
+**Stream I — IQ4_XS GEMM. DONE (3x at m=1, 12x at m=4/m=8). CLAIMED (iq4xs-avx2)
+since 2026-10-03.** Second of the nine IQ formats.
+
+| m | scalar | avx2 | speedup |
+|---|---|---|---|
+| 1 | 18 ms | 4 ms | 3x |
+| 4 | 74 ms | 6 ms | 12x |
+| 8 | 145 ms | 11 ms | 12x |
+
+at n=2048, k=7168, pinned, ReleaseFast, best of 5.
+
+The unpack is the same SPLIT-HALF shape as IQ4_NL (per 32-weight sub-block: low
+nibbles of its 16 bytes are weights 0..15, high nibbles are 16..31), but the
+scale is **per sub-block rather than per block**. The 6-bit field is split across
+two arrays and has to be reassembled before use:
+
+```
+low  4 bits: (scales_l[ib/2] >> 4*(ib%2)) & 0xf
+high 2 bits: (scales_h >> 2*ib) & 3,  shifted up by 4
+signed by subtracting 32, then multiplied by the f16 super-block scale
+```
+
+`sub-block loop is runtime, the 4 Vec8 inside it comptime` — inlining the eight
+sub-blocks too would unroll 128 FMAs per 256-weight block for no benefit, since
+the per-sub-block scale is one scalar op feeding 128 FMAs.
+
+**The 6-bit scale index is asserted directly, and the test had to be written
+twice for it.** A first attempt hardcoded `scales_h = 0b11_10_01_00_01_10_00_11`
+and a hand-derived `highs` array — which read the literal MSB-first by eye while
+the implementation reads `(x >> 2*ib) & 3`, i.e. LSB-first. It failed on the
+second sub-block with a plausible-looking number. Both fields are now built by
+an explicit loop and every sub-block gets a distinct `(low, high)` pair, so
+reading the wrong sub-block cannot pass. A bit-order mistake that produces a
+plausible magnitude is exactly what a hand-written literal invites.
+
+Also worth recording: the expectation had to be computed from the **stored f16**
+(`f16(0.01)` is 0.0100021362, not 0.01), or a 1e-9 assertion is off by 2e-5
+before the code under test has done anything wrong.
+
+**IQ\* progress: 2 of 9 done (IQ4_NL, IQ4_XS), both 4-bit and both on the same
+split-half unpack. 7 remaining**, and they are materially harder:
+
+| format | group | what makes it harder |
+|---|---|---|
+| IQ2_XXS | 256 | 32 u16 grid-index+sign entries; needs the `kmap`/`kneighbors` grid tables |
+| IQ2_XS | 256 | as above **plus** 16 packed 4-bit scales |
+| IQ2_S | 256 | codebook + per-16-element scales |
+| IQ3_XXS | 256 | grid tables + packed 6-bit scales + a sign plane |
+| IQ3_S | 256 | codebook + per-32 scales + reorder |
+| IQ1_S | 256 | 1-bit grid indices + a delta code + kmap |
+| IQ1_M | 256 | 1-bit grid + `qs`/`qh`/`scales` split across three arrays, QK_K = 256 |
+
+The four 2-/3-bit families need the grid-index lookup machinery (`iq2xs_init` /
+`iq3xs_init` already exist per AGENTS.md) lifted into the inner loop, which is a
+different exercise from a nibble unpack plus a scale. The two 1-bit formats are
+worse: a grid lookup **and** a delta/second-difference code across elements,
+which is inherently sequential rather than a per-element table.
+
+**Suggested order for whoever continues:** IQ2_XXS and IQ2_XS together (shared
+grid machinery, and IQ2_XS is a real DeepSeek format), then IQ3_XXS/IQ3_S
+together, then the two 1-bit formats last. The open `vpshufb` item below would
+also lift IQ4_NL, IQ4_XS and MXFP4 together, so doing it before the remaining
+seven may be worth more than a seventh format.
 
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
 

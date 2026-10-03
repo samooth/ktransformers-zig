@@ -1417,3 +1417,95 @@ test "K-quant AVX2 GEMMs: shape sweep over m tails, n=1 and group counts" {
         }
     }
 }
+
+test "IQ4_XS AVX2 GEMM == the scalar oracle, and the 6-bit scale index is right" {
+    // Two things pinned. The oracle comparison, and the 6-bit sub-block scale
+    // reassembly, which is split across `scales_l` (4 low bits) and `scales_h`
+    // (2 high bits). Reading the halves from the wrong sub-block still yields a
+    // plausible magnitude, so the index is asserted directly.
+    const g = kt.gemm_iq4_xs;
+    var state: u64 = 0x1458_0001;
+
+    // Direct scale check. `scales_l` holds eight 4-bit fields (two per byte,
+    // low field even) and `scales_h` eight 2-bit fields. Both are built here by
+    // an explicit loop rather than hand-written bit literals — a literal like
+    // 0b11_10_01_00 is read MSB-first by eye but LSB-first by `(x >> 2*ib) & 3`,
+    // which is exactly the kind of mismatch this check exists to catch. Every
+    // sub-block gets a distinct pair so reading the wrong sub-block's halves
+    // cannot pass.
+    {
+        var blk: g.BlockIQ4_XS = undefined;
+        blk.d = @bitCast(@as(f16, 0.01));
+        blk.scales_h = 0;
+        for (0..4) |i| blk.scales_l[i] = 0;
+        for (0..8) |ib| {
+            blk.scales_l[ib / 2] |= @as(u8, @intCast(ib + 1)) << @intCast(4 * (ib % 2));
+            blk.scales_h |= @as(u16, @intCast((ib + 1) % 4)) << @intCast(2 * ib);
+        }
+        for (&blk.qs) |*q| q.* = 0x00;
+
+        // Compute the expectation from the STORED f16, not the f32 literal:
+        // f16(0.01) is 0.0100021362..., so using 0.01 would be off by ~2e-5 and
+        // the point of this check is a 1e-9 comparison.
+        const d_stored: f32 = @floatCast(@as(f16, @bitCast(blk.d)));
+        var w: [g.QK_K]f32 = undefined;
+        g.dequantizeRowIQ4_XS(@as([*]const g.BlockIQ4_XS, @ptrCast(&blk)), w[0..], g.QK_K);
+
+        for (0..8) |ib| {
+            const low4: u32 = (blk.scales_l[ib / 2] >> @intCast(4 * (ib % 2))) & 0xf;
+            const high2: u32 = (blk.scales_h >> @intCast(2 * ib)) & 3;
+            const ls = low4 | (high2 << 4);
+            try testing.expectEqual(@as(u32, @intCast(ib + 1)), low4);
+            try testing.expectEqual(@as(u32, @intCast((ib + 1) % 4)), high2);
+            const dl = d_stored * (@as(f32, @floatFromInt(ls)) - 32.0);
+            // All quants are nibble 0, and KVALUES_IQ4NL[0] is -127 (not 0), so
+            // the dequantized weight IS the sub-block scale times -127.
+            const want = dl * @as(f32, kt.gemm_iq4_xs.KVALUES_IQ4NL[0]);
+            try testing.expectApproxEqAbs(want, w[ib * 32], 1e-9);
+        }
+    }
+
+    // Oracle comparison. k spans 1..3 super-blocks of 256, m covers the MR tail.
+    for ([_]usize{ 1, 2, 3 }) |blocks| {
+        const k = blocks * g.QK_K;
+        const nb = blocks;
+        const m: usize = 5;
+        const n: usize = 3;
+        try testing.expect(nb > 0); // a 0-block case would be vacuous
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&state, 64, 2.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ4_XS, n * nb);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = @bitCast(@as(f16, 0.01));
+            for (&blk.scales_l) |*b| {
+                state = state *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @truncate(state >> 24);
+            }
+            state = state *% 6364136223846793005 +% 1442695040888963407;
+            blk.scales_h = @truncate(state >> 24);
+            for (&blk.qs) |*q| {
+                state = state *% 6364136223846793005 +% 1442695040888963407;
+                q.* = @truncate(state >> 24);
+            }
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        g.gemmAvx2(a.ptr, w.ptr, c_avx.ptr, m, n, k, k, nb, n);
+        g.gemmIQ4_XSScalar(a.ptr, w.ptr, c_ref.ptr, m, n, k, k, nb, n);
+
+        for (0..m * n) |i| {
+            try testing.expect(std.math.isFinite(c_avx[i]));
+            const denom = @max(@abs(c_ref[i]), 1e-2);
+            try testing.expect(@abs(c_avx[i] - c_ref[i]) / denom < 1e-3);
+        }
+    }
+}

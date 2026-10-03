@@ -247,7 +247,7 @@ pub fn gemmQuant(
         KT_TYPE_IQ3_S => gemm_iq3_s.gemmIQ3_SScalar(a, @as([*]const gemm_iq3_s.BlockIQ3_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ1_S => gemm_iq1_s.gemmIQ1_SScalar(a, @as([*]const gemm_iq1_s.BlockIQ1_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ1_M => gemm_iq1_m.gemmIQ1_MScalar(a, @as([*]const gemm_iq1_m.BlockIQ1_M, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
-        KT_TYPE_IQ4_XS => gemm_iq4_xs.gemmIQ4_XSScalar(a, @as([*]const gemm_iq4_xs.BlockIQ4_XS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ4_XS => gemm_iq4_xs.gemmAvx2(a, @as([*]const gemm_iq4_xs.BlockIQ4_XS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ4_NL => gemm_iq4_nl.gemmAvx2(a, @as([*]const gemm_iq4_nl.BlockIQ4_NL, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         else => @panic("unsupported weight type in gemmQuant"),
     }
