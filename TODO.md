@@ -256,11 +256,18 @@ overall. The array staging was not the cause of the rematerialization.
   activations +2 for weight temps = 12 of 16. Dispatch on `m` the way a real
   kernel does (NR for decode, MR for prefill). Driver:
   `src/kernels/amx/kquant_simd.zig::gemmBF16xQuant`.
-- [ ] **`gemmQ8_0Scalar` is the last un-vectorized BF16 GEMM** — Q8_0 is not a
-  K-quant (32-weight blocks) so Stream C skipped it, but it is the same shape
-  (`gemm_224_q8_0.zig`: f16 `d` + 32 i8 per block) and the driver in
-  kquant_simd.zig takes it with GROUP=32 and no changes. It is what
-  `gemmQuant(KT_TYPE_Q8_0, ...)` and `kt_matmul_q8_0` still call.
+- [x] **CLOSED by Stream F (`c8b2217`):** `gemmQ8_0Scalar` was the last
+  un-vectorized BF16 GEMM — 4x at m=1, 13x at m=4/m=8, and `gemmQuant` /
+  `kt_matmul_q8_0` now dispatch to `gemmAvx2`. Kept here as the record of why
+  it mattered: Q8_0 is both the GGUF default weight format and the LlamaMoe
+  activation format, so it was the hottest quantized GEMM in the tree.
+- [ ] **Two modules now both export an entry point called `gemmAvx2`**
+  (`gemm_224_q8_0.zig`, `gemm_224_iq4_nl.zig`; the MX and K-quant kernels use
+  format-qualified names like `gemmQ8_K`). They are distinct symbols so nothing
+  is broken, and both call sites name the module explicitly, but the name no
+  longer says which format it belongs to — in a codebase whose recurring lesson
+  is that an implicit contract costs a debug session, prefer
+  `gemmQ8_0Avx2` / `gemmIQ4_NL_AVx2` when these files are next touched.
 - [ ] **Two dead tests in `gemm_224_q{3,6}_k.zig` fail if actually run** —
   see the Stream C note above for both diagnoses. They are invisible because
   in-kernel-file `test` blocks are not executed (Stream C note).
