@@ -1845,7 +1845,60 @@ F16C converts IEEE **f16**. bf16 needs AVX512_BF16, or AVX512VL+VBMI2's
 LLVM emits for free when you widen bf16 to f32. Don't spend time "enabling
 F16C"; `KT_TYPE_F16` exists in the ABI but has no kernel.
 
-### 8. Zig 0.16 build/test API rot hit while doing this work
+### 8. `test` blocks in a NON-ROOT module are never run
+
+`zig build test` collects tests from the **root file's module only**. Every
+test suite here is built with `--dep kt -Mkt=src/root.zig`, so a `test` block
+inside `src/kernels/amx/gemm_224_q6_k.zig` is compiled (the file is analyzed)
+but **never executed** — the run reports `148` tests, all named
+`test_kernels.test.*`, i.e. the copies in `tests/kernels/test_kernels.zig`.
+`src/mla/mla_tests.zig` escapes this only because it IS a suite root.
+
+Verified, and it had teeth: two `test` blocks that sit dead in
+`gemm_224_q{3,6}_k.zig` fail when actually run (a constant-weight test that
+fills only the first of two 128-weight chunks, and a round-trip threshold of
+0.20 against a measured 0.329). Both had been "passing" for months because
+they never ran. `zig build test` exit 0 does **not** mean a test you wrote
+somewhere in `src/` ran.
+
+**Rule:** new tests go in a suite that is registered in `build.zig`
+(`tests/kernels/simd_kernels_tests.zig` is the current home for kernel/SIMD
+tests), never next to the code.
+
+### 9. K-quant GEMM: three findings, all measured (AVX2)
+
+Written while adding `gemmQ{2,3,4,5,6,8}_K` (see
+`src/kernels/amx/kquant_simd.zig` and docs/perf-roadmap.md P0.1 for numbers):
+
+1. **A runtime scale-group index costs more than the unpack.** The obvious
+   loop `for (0..N_GROUP) |g| unpack(g)` produced ~20 scalar instructions
+   PER 16-WEIGHT GROUP (decomposing `g` into chunk/plane/half) plus a 4-way
+   indirect jump for the plane switch — about half the inner-loop uop budget.
+   `inline for` + `comptime g` folds every byte offset into the load
+   displacement: **1.19x-1.52x**. The cost is ~16 specializations per format
+   (~2 KB of code), which is what hand-written quantized kernels do anyway.
+2. **Fold the scale into the weights rather than scaling partial sums.** At
+   16-weight group granularity (`acc += a*(s*q - m)`, one `@reduce` per OUTPUT
+   element) the horizontal reductions cost more than the broadcast-multiply
+   they replace. The same choice makes the vector path numerically
+   comparable with `dequantizeRow* + dot`, which is what makes an exact
+   equivalence test possible.
+3. **`4 & ~bit` is not "bit is clear".** `~` on a byte leaves every other bit
+   set, so `hb = 4 & ~is_set` is ALWAYS 4 — the Q3_K high-bit-plane term was
+   silently constant. Use `@select` (or `(bit ^ 1) << 2`). Found only because
+   the equivalence test fuzzes the planes with random data.
+
+Zig 0.16 spellings these bit twiddlings need (all verified): the shift amount
+of a vector op must be a **vector of the shift-logic type** (`@Vector(N, u3)`
+for `u8`, `@Vector(N, u5)` for `u32`) and must be *typed* even when the count
+is comptime — `v >> 4` is rejected, `v >> @as(@Vector(N, u3), @splat(@as(u3,
+4)))` compiles. `@shuffle` takes the element type first and a `[N]i32` mask
+last (`@shuffle(f32, a, b, mask)`); `std.simd.join(a, b)` concatenates. A
+single pointer taken from `&blk.field[i]` inside an `extern struct` at an
+odd offset has type `*align(1) const T`, which does **not** coerce to a
+`[*]const T` — so the unaligned load helpers take `*const u8`.
+
+### 10. Zig 0.16 build/test API rot hit while doing this work
 
 - `@errorReturnTrace()` returns `?*builtin.StackTrace`
   (`index`, `instruction_addresses`), but `std.debug.dumpStackTrace` wants

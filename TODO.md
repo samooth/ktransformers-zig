@@ -1,6 +1,6 @@
 # ktransformers-zig TODO
 
-## Status: Beta (15/15 GGML formats + 244 tests; SIMD at/above C++ parity)
+## Status: Beta (15/15 GGML formats + 251 tests; SIMD at/above C++ parity)
 
 Last updated: 2026-10-03
 
@@ -12,7 +12,7 @@ independently ported the same LLAMA_MOE_TP to Zig in the same session).
 Claims are removed when the task is done; abandoned claims can be reclaimed.
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
-**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels) = **244 total pass, 0 leaks, exit 0**.
+**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels + the six K-quant AVX2 GEMMs) = **251 total pass, 0 leaks, exit 0**.
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon (8 installed names), each exporting **112 C API symbols** (triple-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). Runs in CI (`wheels.yml` `abi-gate` job).
 **Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
 **Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
@@ -65,18 +65,20 @@ parallel. Two rules so they do not collide:
 **Stream A — Q4_K x Q8_0 fused dot. DONE (2.4x).**
 `gemmQ4KxQ8_0` added alongside the scalar version (which stays as the
 readable statement of the math). 20.37 ms -> 8.38 ms at m=1,n=2048,k=7168
-(**2.4x**); 0.41 -> 0.99 GB/s. `gemmQ4_KScalar` is still scalar — follow-up.
+(**2.4x**); 0.41 -> 0.99 GB/s. `gemmQ4_KScalar` was still scalar — **CLOSED
+by Stream C** (`gemmQ4_K`, 10.5x over scalar; see the Stream C entry).
 
-**Remaining headroom on this kernel (unclaimed):** at 0.99 GB/s it is still
-only ~5% of what a vectorized kernel sustains, i.e. another 4-8x is available.
-The dominant remaining cost is that `dot_1` (the activation sums) does not
-depend on `j` yet is recomputed for every one of the 2048 output columns.
-Hoisting it out of the n loop needs either a small per-row scratch or an
-outer loop over (i, super-block, group) with `j` innermost — which turns
-weight access into a constant-stride walk. Secondary: `getScaleMinK4` and
-`f16_to_f32` are still scalar with a branch, 8+4 calls per super-block, and
-the four `@reduce(.Add)` horizontal reductions per 64 weights dominate the
-rest.
+**Remaining headroom on the Q8_0-activation kernel (unclaimed):** at
+0.99 GB/s it is still only ~5% of what a vectorized kernel sustains, i.e.
+another 4-8x is available. The dominant remaining cost is that `dot_1` (the
+activation sums) does not depend on `j` yet is recomputed for every one of the
+2048 output columns. Hoisting it out of the n loop needs either a small
+per-row scratch or an outer loop over (i, super-block, group) with `j`
+innermost — which turns weight access into a constant-stride walk. That is
+also the same fix as the NR-tiling item under "actually open" below. Secondary:
+`getScaleMinK4` and `f16_to_f32` are still scalar with a branch, 8+4 calls per
+super-block, and the four `@reduce(.Add)` horizontal reductions per 64 weights
+dominate the rest.
 
 **Stream B — FP8 E4M3/E5M2. UNCLAIMED.**
 `src/kernels/amx/gemm_224_fp8.zig`, `gemmFullTileScalar` (line ~317). The C++
@@ -85,14 +87,71 @@ direct port target with a reference to diff against. Acceptance: the existing
 FP8 tests pass, plus `gemmFullTileScalar`'s new vectorized sibling matches it
 to f32 rounding on random blocks.
 
-**Stream C — K-quants Q2_K / Q3_K / Q5_K / Q6_K / Q8_K. UNCLAIMED.**
-`src/kernels/amx/gemm_224_{q2_k,q3_k,q5_k,q6_k,q8_k}.zig`. These share a
-structure (6-bit packed scales + per-32 sub-blocks), so one stream can take
-all five or split them. Note the fp8_dequant / gptq_int4_dequant headers in
-the C++ reference for how the scale unpacking is expected to vectorize.
-Acceptance: each format's existing `block layout byte-exact`,
-`quantize/dequant round trip`, `all-zero`, and `scalar GEMM` tests keep
-passing, plus a new GEMM-vs-dequantized-reference test per format.
+**Stream C — K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K. DONE (6.3x–15.7x).**
+`src/kernels/amx/gemm_224_{q2_k,q3_k,q4_k,q5_k,q6_k,q8_k}.zig` + the new shared
+driver `src/kernels/amx/kquant_simd.zig`. Each format gained a `gemmQ*_K`
+AVX2 sibling of `gemmQ*_KScalar` (which stays as the readable statement of the
+math the tests pin against). The driver is ONE generic implementation
+(`gemmBF16xQuant`) parameterized per format by a comptime `Cfg` that supplies
+`prepare` (per-super-block scale table) and `unpackVec` (16 lanes of one scale
+group); all six formats share it, so they cannot drift apart again.
+Measured at a LlamaMoe shape (m=1, n=2048, k=7168, pinned, min of 6 runs —
+`bench/kquant_bench.zig`; scalar vs AVX2 in the SAME binary/run, which is the
+only reliable comparison on this shared host):
+
+| format | scalar | AVX2 | speedup | % of BF16 ceiling BW |
+|---|---|---|---|---|
+| Q8_K | 18.24 ms (0.92 GB/s) | **1.27 ms (13.19 GB/s)** | **14.4x** | 66% |
+| Q6_K | 27.42 ms (0.44) | **2.27 ms (5.31)** | **12.1x** | 27% |
+| Q5_K | 26.60 ms (0.38) | **2.20 ms (4.60)** | **12.1x** | 23% |
+| Q4_K | 20.95 ms (0.39) | **2.02 ms (4.08)** | **10.4x** | 20% |
+| Q3_K | 15.26 ms (0.41) | **2.15 ms (2.94)** | **7.1x** | 15% |
+| Q2_K | 14.61 ms (0.33) | **2.33 ms (2.07)** | **6.3x** | 10% |
+
+(ceiling = the vectorized BF16 kernel on the same shape: 1.47 ms / 20.0 GB/s.)
+Numerical agreement of the two paths at that K: **rel-L2 1.7e-7 – 2.3e-7**
+(vector vs scalar, normalized by the output's L2 norm — against an f64
+ground truth both are < 1e-6).
+
+At m=8 the same formats are 10.7x–15.7x. Q8_K clears the roadmap's "≥60% of
+the BF16 ceiling bandwidth" target; the sub-byte formats do not and, on this
+host, cannot — see the analysis in `docs/perf-roadmap.md` P0.1 (they are
+uop-bound at ~1.0 uop/weight because the activations arrive as bf16, while the
+BF16 "ceiling" is DRAM-bound at 20 GB/s; the arithmetic ceiling for a 4-bit
+format with bf16 activations is ~8 GB/s, so 4.08 is ~50% of what the
+instruction set can do).
+Design notes that carry the performance, all measured: (a) fold the
+scale/min into the weights so there is ONE `@reduce` per output element
+instead of one per scale group (at 16-weight granularity a horizontal reduce
+costs more than the broadcast-multiply it replaces); (b) make the scale-group
+index COMPTIME — a runtime `g` costs ~20 scalar ops of index arithmetic per
+16-weight group plus a 4-way indirect jump, worth 1.19x (Q6_K) to 1.52x
+(Q3_K); (c) `prepare` the per-super-block scale table once instead of
+recomputing the f16 conversion per group. Dispatch is wired into
+`gemmQuant` (LlamaMoe) and `kt_matmul_q{4,5,6,8}_k` (C API) — without that the
+new functions would never be emitted into the .so.
+Tests: 6 new, in `tests/kernels/simd_kernels_tests.zig`, one per format,
+`fused == dequantizeRow + f32 dot` (no approximation) with deliberately
+non-uniform per-group scales, at m ∈ {1, 4, 5} and 3 super-blocks, plus the
+scalar path on the same assertion. Suite total 251, `zig build test` exit 0.
+Also here: `gemmQ4_KScalar` (the BF16-activation Q4_K entry, i.e. Stream A's
+remaining item) got the same treatment and is now dispatched too.
+
+**BUG FOUND while doing Stream C (pre-existing, still open):** `test` blocks
+inside `src/kernels/amx/gemm_224_*.zig` are **never executed** — the kernel
+modules sit behind the `kt` module boundary, so `zig build test` collects tests
+only from the root file's own module (`tests/kernels/test_kernels.zig` holds
+the authoritative copies of all 15 formats' tests). Two of those dead copies
+fail when run: `gemm_224_q6_k.zig` "Q6_K scalar GEMM constant weights" builds
+weights for only the first of the two 128-weight chunks (ql[0..64] and
+qh[0..32] set, ql[64..128] and qh[32..64] left zero) so it expects 256.0 and
+gets -4032 — the live copy in test_kernels.zig:2201 was already rewritten to
+the dequantize-and-compare form and passes; and
+`gemm_224_q3_k.zig` "Q3_K quantize/dequantize round trip accuracy" asserts
+rel < 0.20 and measures **0.329** (Q3_K is ~3.5 bits/weight, so either the
+threshold or the quantizer deserves a second look). Both need test_kernels.zig
+or a live-suite home, which this stream did not touch.
+
 
 **Stream D — SwiGLU activation, 0.57x. UNCLAIMED, with a diagnosis.**
 The activation is the one place the port is still clearly behind. Measured
@@ -124,6 +183,23 @@ overall. The array staging was not the cause of the rematerialization.
 
 **Actually open:**
 
+- [ ] **NR-tiling is the next lever for the K-quant GEMMs** — at m=1 the
+  activation widening (6 uops per 16 weights, ~40% of the inner loop) is
+  repeated for every one of the n output columns. Blocking n by 4 (one
+  widened activation feeding 4 column accumulators, the mirror image of the
+  MR=4 tiling that already gives m=8 its 2x) should buy ~1.5x. Register
+  budget: 4 columns × 16 lanes of f32 accumulator = 8 ymm, +2 for the
+  activations +2 for weight temps = 12 of 16. Dispatch on `m` the way a real
+  kernel does (NR for decode, MR for prefill). Driver:
+  `src/kernels/amx/kquant_simd.zig::gemmBF16xQuant`.
+- [ ] **`gemmQ8_0Scalar` is the last un-vectorized BF16 GEMM** — Q8_0 is not a
+  K-quant (32-weight blocks) so Stream C skipped it, but it is the same shape
+  (`gemm_224_q8_0.zig`: f16 `d` + 32 i8 per block) and the driver in
+  kquant_simd.zig takes it with GROUP=32 and no changes. It is what
+  `gemmQuant(KT_TYPE_Q8_0, ...)` and `kt_matmul_q8_0` still call.
+- [ ] **Two dead tests in `gemm_224_q{3,6}_k.zig` fail if actually run** —
+  see the Stream C note above for both diagnoses. They are invisible because
+  in-kernel-file `test` blocks are not executed (Stream C note).
 - [ ] **`posix_madvise` is stubbed** (`src/runtime/memory.zig:173,179`) —
   `madviseSequential` / `madviseRandom` take their arguments and do nothing,
   so weight-loading streams get no readahead hint and no DONTNEED. Low risk,

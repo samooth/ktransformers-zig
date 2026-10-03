@@ -221,9 +221,10 @@ loadWeights fix); D3 fixed the `ldc` for tp_count > 1.
 Benchmarked against the C++ reference's own AVX2 kernels
 (`kt-kernel/operators/avx2/avx2_bf16_gemm.hpp`) with
 `bench/cpp_vs_zig/run.sh` — see that directory's `README.md` (how to run,
-`KT_REF`/`KT_PIN`) and `RESULTS.md` (the measurement record); as of the SIMD rework the Zig port is **1.0-1.27x
-the reference** on BF16 GEMM and **0.66x** on SwiGLU (with bit-identical
-output). Four rules carry almost all of it:
+`KT_REF`/`KT_PIN`) and `RESULTS.md` (the measurement record); as of the SIMD
+rework the Zig port is **1.13x-1.88x the reference** on BF16 GEMM and
+**0.67x** on SwiGLU (with bit-identical output). Four rules carry almost all of
+it:
 
 1. **`@exp` does not vectorize.** compiler-rt has only scalar `expf` and Zig
    does not target libmvec, so `@exp` on `@Vector(8, f32)` becomes 8 scalar
@@ -262,17 +263,20 @@ module), which is how two broken copies hid in `gemm_224_q{3,6}_k.zig`.
 
 **The six GGML K-quants have the same treatment** (`kquant_simd.zig`: one
 comptime-parameterized AVX2 driver, `gemmQ*_K` beside each `gemmQ*_KScalar`,
-6.2x–16.1x measured, wired into `gemmQuant` + `kt_matmul_q{4,5,6,8}_k`). The
+6.3x-15.7x measured, wired into `gemmQuant` + `kt_matmul_q{4,5,6,8}_k`). The
 scalar versions are kept deliberately: they are the readable statement of each
 format's math and the reference the new tests compare against. Note their
 `test` blocks are dead (module boundary) — the live K-quant GEMM tests are in
 `tests/kernels/simd_kernels_tests.zig`.
 
 **Next performance work is in `docs/perf-roadmap.md`.** Short version: BF16
-GEMM is won (1.24-3.23x), but every *quantized* family is still scalar on
-non-AMX hosts — measured at 4-14% of the bandwidth a vectorized kernel
-sustains — and the C++ reference has 10 AVX2 kernels we do not. That, plus the
-0.59x SwiGLU activation, is where the remaining gap lives.
+GEMM is won (1.13x-1.88x of the C++ reference) and the six K-quants are now
+vectorized too (6.3x-15.7x over their own scalar versions), but the remaining
+*quantized* families — Q8_0 and the nine IQ* formats — are still scalar on
+non-AMX hosts, and the C++ reference has 10 AVX2 kernels we do not run at all
+(FP8, MXFP4, MXFP8, GPTQ-INT4, raw-INT4; it has no K-quant kernel, so the
+K-quant work has no cross-implementation reference to diff against). Those,
+plus the 0.68x SwiGLU activation, is where the remaining gap lives.
 
 ## sentrux (architecture sensor — MCP + CLI)
 

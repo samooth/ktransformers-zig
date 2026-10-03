@@ -354,7 +354,7 @@ milliseconds move by up to 3x with load; ratios are stable.
 ./bench/cpp_vs_zig/run.sh              # A/B vs the reference
 KT_PIN=9 ./bench/cpp_vs_zig/run.sh     # pin both harnesses to one core
 zig build -Doptimize=ReleaseFast bench # internal gemm + MoE forward
-zig build test                         # 245 tests
+zig build test                         # 251 tests
 python3 tools/verify_abi.py            # 112 symbols + arity
 ```
 
