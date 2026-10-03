@@ -1930,6 +1930,63 @@ test "Q4_KxQ8_0 scalar GEMM matches BF16 path numerically" {
     }
 }
 
+test "Q4_KxQ8_0 AVX2 kernel == scalar kernel == dequantize-and-dot" {
+    // The AVX2 path replaces 128 scalar multiply-adds per 64 weights with
+    // 4 i8->f32 conversions, 2 u8->f32 conversions and 4 FMAs, and reuses one
+    // 32-byte qs load for both nibble halves of a group. Pin all three
+    // implementations against each other so a refactor of any one of them is
+    // caught.
+    const q4k = root.gemm_q4_k;
+    const q8_0 = root.gemm_q8_0;
+    const K: usize = q4k.QK_K;
+    const M: usize = 3;
+    const N: usize = 2;
+    const QB = K / q8_0.QK8_0;
+
+    var src: [K]f32 = undefined;
+    for (0..K) |t| {
+        src[t] = @sin(@as(f32, @floatFromInt(t)) * 0.017) * 3.0 - 0.5;
+    }
+    var blk: [1]q4k.BlockQ4_K = undefined;
+    q4k.quantizeRowQ4_K(&src, &blk, K);
+    // Differentiate the nibbles so a swapped interleave cannot pass.
+    for (&blk[0].qs, 0..) |*q, t| {
+        if (t % 3 == 0) q.* = @intCast(0xA0 | @as(u8, @truncate(t % 16)));
+    }
+
+    var a: [M][QB]q8_0.BlockQ8_0 = undefined;
+    for (0..M) |i| {
+        for (0..K) |t| src[t] = @cos(@as(f32, @floatFromInt(t)) * 0.023) * 1.7;
+        q8_0.quantizeRowQ8_0(&src, &a[i], K);
+    }
+    var w: [N][1]q4k.BlockQ4_K = undefined;
+    for (0..N) |j| w[j][0] = blk[0];
+
+    var c_vec: [M * N]f32 = undefined;
+    var c_sca: [M * N]f32 = undefined;
+    q4k.gemmQ4KxQ8_0(@as([*]const q8_0.BlockQ8_0, @ptrCast(&a[0][0])), QB,
+        @as([*]const q4k.BlockQ4_K, @ptrCast(&w[0][0])), 1, &c_vec, N, M, N, K);
+    q4k.gemmQ4KxQ8_0Scalar(@as([*]const q8_0.BlockQ8_0, @ptrCast(&a[0][0])), QB,
+        @as([*]const q4k.BlockQ4_K, @ptrCast(&w[0][0])), 1, &c_sca, N, M, N, K);
+
+    var deq: [K]f32 = undefined;
+    q4k.dequantizeRowQ4_K(@as([*]const q4k.BlockQ4_K, @ptrCast(&w[0][0])), &deq, K);
+
+    for (0..M) |i| {
+        var adq: [K]f32 = undefined;
+        for (0..QB) |b| {
+            const d = q8_0.f16_to_f32(a[i][b].d);
+            for (0..q8_0.QK8_0) |t| adq[b * q8_0.QK8_0 + t] = d * @as(f32, @floatFromInt(a[i][b].qs[t]));
+        }
+        for (0..N) |j| {
+            var want: f32 = 0;
+            for (0..K) |t| want += deq[t] * adq[t];
+            try testing.expectApproxEqRel(want, c_vec[i * N + j], 2e-5);
+            try testing.expectApproxEqRel(c_sca[i * N + j], c_vec[i * N + j], 2e-5);
+        }
+    }
+}
+
 test "Q4_KxQ8_0 fused dot == dequantize-and-dot, on varied blocks" {
     // The strongest available invariant for gemmQ4KxQ8_0Scalar: it must
     // equal `dequantizeRowQ4_K` followed by a plain F32 dot product with the

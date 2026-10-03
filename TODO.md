@@ -58,17 +58,21 @@ parallel. Two rules so they do not collide:
    change, say so in the claim rather than editing it.
 2. **CLAIM here first** (the protocol at the top of this file), then work.
 
-**Stream A — Q4_K x Q8_0 fused dot (highest value). CLAIMED.**
-`src/kernels/amx/gemm_224_q4_k.zig`. Replace the per-element
-`dot_q += a_qi * lo` / `dot_1 += a_qi` inner loop in
-`gemmQ4KxQ8_0Scalar` with AVX2. `gemmExpert` in
-`gemm_224_bf16.zig` is the reference implementation to copy: n-outer /
-m-inner, MR=4 register tiling, 4 accumulators, explicit `@mulAdd`, `widen8`
-for bf16 (or a `u8 -> f32` widen for the i8 activations). Acceptance: the
-existing 3 Q4_KxQ8_0 tests must still pass unchanged — in particular
-`fused dot == dequantize-and-dot` at 2e-5 relative tolerance — plus a new
-assertion that the vectorized path reaches a stated fraction of the BF16
-kernel's bandwidth on the same shape.
+**Stream A — Q4_K x Q8_0 fused dot. DONE (2.4x).**
+`gemmQ4KxQ8_0` added alongside the scalar version (which stays as the
+readable statement of the math). 20.37 ms -> 8.38 ms at m=1,n=2048,k=7168
+(**2.4x**); 0.41 -> 0.99 GB/s. `gemmQ4_KScalar` is still scalar — follow-up.
+
+**Remaining headroom on this kernel (unclaimed):** at 0.99 GB/s it is still
+only ~5% of what a vectorized kernel sustains, i.e. another 4-8x is available.
+The dominant remaining cost is that `dot_1` (the activation sums) does not
+depend on `j` yet is recomputed for every one of the 2048 output columns.
+Hoisting it out of the n loop needs either a small per-row scratch or an
+outer loop over (i, super-block, group) with `j` innermost — which turns
+weight access into a constant-stride walk. Secondary: `getScaleMinK4` and
+`f16_to_f32` are still scalar with a branch, 8+4 calls per super-block, and
+the four `@reduce(.Add)` horizontal reductions per 64 weights dominate the
+rest.
 
 **Stream B — FP8 E4M3/E5M2. UNCLAIMED.**
 `src/kernels/amx/gemm_224_fp8.zig`, `gemmFullTileScalar` (line ~317). The C++

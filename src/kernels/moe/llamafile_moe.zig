@@ -695,7 +695,7 @@ pub const LlamaMoe = struct {
     ///
     /// Q4_K fast path (Zig extension, 2026-09-04): when the weight
     /// type is Q4_K, skip the Q8_0→BF16 dequant and call
-    /// `gemmQ4KxQ8_0Scalar` directly. The formula
+    /// `gemmQ4KxQ8_0` directly. The formula
     /// `d×sc×dot_q − dmin×m×dot_1` per 32-weight sub-block produces the
     /// same result as the BF16 path (verified by the test
     /// "Q4_KxQ8_0 scalar GEMM matches BF16 path numerically"), with
@@ -703,7 +703,7 @@ pub const LlamaMoe = struct {
     /// per-weight FMA on the dequantized stream). For the LlamaMoe
     /// forward path this is the dominant Q4_K cost; the other K-quants
     /// (Q5_K, Q6_K, etc.) use the existing BF16 path. The
-    /// `gemmQ4KxQ8_0Scalar` is gated on `m == 1` today (the LlamaMoe
+    /// `gemmQ4KxQ8_0` is gated on `m == 1` today (the LlamaMoe
     /// use case); for batched per-m-block the dispatch will need to
     /// grow.
     fn runMatmulScratch(
@@ -721,7 +721,7 @@ pub const LlamaMoe = struct {
         if (weight_type == KT_TYPE_Q4_K and m == 1) {
             // Skip the Q8_0→BF16 round-trip; call the fused dot
             // directly. The Q8_0 block stride is `(kk / QK8_0)` per row.
-            gemm_q4_k.gemmQ4KxQ8_0Scalar(
+            gemm_q4_k.gemmQ4KxQ8_0(
                 @as([*]const gemm_q8_0.BlockQ8_0, @ptrCast(@alignCast(act_q8_0))),
                 kk / gemm_q8_0.QK8_0,
                 @as([*]const gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(weight_ptr))),
