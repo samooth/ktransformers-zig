@@ -104,8 +104,100 @@ pub fn dequantizeRowQ8_0ToBF16(src: [*]const BlockQ8_0, dst: [*]amx.bf16, k: usi
 }
 
 // ============================================================================
-// GEMM (scalar reference; BF16 activations x Q8_0 weights -> F32)
+// GEMM (BF16 activations x Q8_0 weights -> F32)
 // ============================================================================
+//
+// Q8_0 is the default weight format of the GGUF path and the activation format
+// of every LlamaMoe forward, so this is the hottest quantized GEMM in the tree —
+// and it was still an m/n/k triple loop in the WORST of the three orders:
+// m-outer meant the whole n x k weight matrix was re-streamed from DRAM once per
+// token row. The K-quant and MX kernels already got this right; Q8_0 had not.
+//
+// Same four rules as `kquant_simd.gemmBF16xQuant` and the MX kernels:
+//   n-outer / m-inner   the weight matrix streams from DRAM once, in order
+//   MR = 4              four activation rows share one widened weight vector,
+//                       so the i8->f32 conversion and the scale multiply
+//                       amortize over 4 FMAs
+//   explicit @mulAdd    FP contraction is off in this toolchain, so an
+//                       `a*w + acc` would be a separate multiply and add
+//   deferred hsum       one @reduce per output element, not per 32-weight block;
+//                       the scale is folded into the weight vector, so nothing
+//                       forces a per-block horizontal sum
+//
+// Folding `d` into the weight vector is EXACT: `d` is f16 and the quants are
+// small integers, so `qs * d` is representable in f32 and both paths compute
+// the same product the scalar version does.
+
+const MR: usize = 4;
+const Vec: type = @Vector(8, f32);
+
+/// 8 bf16 -> 8 f32, unaligned.
+inline fn widen8(p: [*]const amx.bf16) Vec {
+    const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+    return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+}
+
+/// 8 signed quants -> 8 f32. `@floatFromInt` on a vector lowers to
+/// `vpmovsxbd` + `vcvtdq2ps`; the sign extension is required because Q8_0
+/// quants are signed.
+inline fn q8x8(p: *const i8) Vec {
+    const raw: @Vector(8, i8) = @as(*align(1) const @Vector(8, i8), @ptrCast(p)).*;
+    return @floatFromInt(raw);
+}
+
+/// AVX2 Q8_0 GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
+///
+/// Like the scalar version this assumes `k % QK8_0 == 0` and processes whole
+/// blocks only: a Q8_0 row is a whole number of blocks, so there is no
+/// ragged-k tail to handle here (unlike the MX formats, where it can be one).
+pub fn gemmAvx2(
+    a: [*]const amx.bf16,
+    lda: usize,
+    b: [*]const BlockQ8_0,
+    ldb: usize,
+    c: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    const kb = k / QK8_0;
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        const brow = b + j * ldb;
+
+        var i: usize = 0;
+        while (i + MR <= m) : (i += MR) {
+            var acc = [_]Vec{@splat(0.0)} ** MR;
+            for (0..kb) |blk| {
+                const dv: Vec = @splat(f16_to_f32(brow[blk].d));
+                const qp = &brow[blk].qs;
+                const abase = blk * QK8_0;
+                inline for (0..QK8_0 / 8) |v| {
+                    const w = q8x8(&qp[v * 8]) * dv;
+                    inline for (0..MR) |r| {
+                        acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + abase + v * 8), w, acc[r]);
+                    }
+                }
+            }
+            inline for (0..MR) |r| c[(i + r) * ldc + j] = @reduce(.Add, acc[r]);
+        }
+
+        // Row tail (m % MR), one row at a time.
+        while (i < m) : (i += 1) {
+            var acc: Vec = @splat(0.0);
+            for (0..kb) |blk| {
+                const dv: Vec = @splat(f16_to_f32(brow[blk].d));
+                const qp = &brow[blk].qs;
+                const abase = blk * QK8_0;
+                inline for (0..QK8_0 / 8) |v| {
+                    acc = @mulAdd(Vec, widen8(a + i * lda + abase + v * 8), q8x8(&qp[v * 8]) * dv, acc);
+                }
+            }
+            c[i * ldc + j] = @reduce(.Add, acc);
+        }
+    }
+}
 
 /// Scalar GEMM: a [m, k] BF16 activations, b [n, k/32] Q8_0 weights
 /// (row-major, ldb in BLOCKS), c [m, n] F32.

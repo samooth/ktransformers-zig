@@ -408,6 +408,58 @@ the hot loop, in the cold ragged-k tail (`tailDot`), which only runs when
    gap class Stream B hit. The GEMMs are now fast, but nothing above them is
    pinned.
 
+**Stream F — Q8_0 GEMM. DONE (4x at m=1, 13x at m=4/m=8). CLAIMED (q8-0-avx2)
+since 2026-10-03.**
+
+`src/kernels/amx/gemm_224_q8_0.zig`, plus the three call sites: `kt_matmul_q8_0`
+(main.zig), the `gemmQuant` `KT_TYPE_Q8_0` arm in `llamafile_moe.zig` (i.e.
+every Q8_0-weight forward), and the root.zig comptime ref.
+
+Q8_0 is the GGUF default weight format AND the LlamaMoe activation format, so
+this was the hottest quantized GEMM in the tree — and it was the last one still
+on an m/n/k triple loop, in the worst of the three orders: m-outer meant the
+whole n x k weight matrix was re-streamed from DRAM once per token row. Same
+four rules as the K-quant and MX kernels (n-outer/m-inner, MR=4, explicit
+`@mulAdd`, one `@reduce` per output element). Folding `d` into the weight vector
+is exact: `d` is f16 and the quants are small integers, so `qs * d` is
+representable in f32.
+
+| m | scalar | avx2 | speedup |
+|---|---|---|---|
+| 1 | 11 ms | 2 ms | 4x |
+| 4 | 45 ms | 3 ms | 13x |
+| 8 | 90 ms | 6 ms | 13x |
+
+at n=2048, k=7168, pinned, ReleaseFast, best of 5, vs the scalar triple loop in
+the same binary.
+
+**Q8_0 is now the evidence for the MX m=1 hypothesis below.** At m=1 it reaches
+7.8 GB/s with NO lookup table (the i8->f32 step is pure `vpmovsxbd` +
+`vcvtdq2ps`), while MXFP8 reaches 3.0 GB/s and MXFP4 2.6 GB/s from the same
+shape with a table lookup per vector. So the ~2.6x gap is the table, not the
+memory system — which is what makes an asm `vgatherdps` worth trying.
+
+Disassembly of `gemm_224_q8_0.gemmAvx2` (a real out-of-line function here, 424
+insns): 28 `vfmadd`, 141 `ymm` ops, only 5 horizontal reduces for the whole
+kernel, and exactly 16 `vpmovsxbd` + 16 `vcvtdq2ps` — the documented
+sign-extending i8->f32 path (sign extension is mandatory; Q8_0 quants are
+signed and include -128). The 35 scalar FP instructions are the per-block f16
+scale conversion (one per 32 weights) and the `@reduce` epilogue, not the
+per-element path.
+
+Two tests: the oracle comparison across 7 shapes (m % MR, n = 1, k up to 7168),
+and a separate check that every element of [0,m) x [0,n) is written — the scalar
+version zeroes `c` and then accumulates, the vector version assigns directly, so
+that is only equivalent if there are no uninitialised holes. That test sweeps m =
+1..9 with `c` pre-poisoned with NaN.
+
+Worth recording: the equivalence tolerance is 1e-3, not 1e-4, and that is a
+measurement rather than laziness. The test's `rnd` returns activations up to ~512
+and the dots reach ~10^5, so a partially-cancelling sum shows the f32
+summation-order difference amplified to 1.6e-4 (an absolute 0.06 on a value of
+381, over 256 terms). Every real defect shows up as O(1) instead — the Q4_K
+routing bug was rel=4.2, the MXFP4 encoder bug a clean factor of 2.
+
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
 
 Benchmarked against the reference's own AVX2 kernels

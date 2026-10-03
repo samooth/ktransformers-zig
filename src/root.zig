@@ -57,7 +57,8 @@ comptime {
     _ = &gemm_q8_0.quantizeRowQ8_0;
     _ = &gemm_q8_0.dequantizeRowQ8_0;
     _ = &gemm_q8_0.dequantizeRowQ8_0ToBF16;
-    _ = &gemm_q8_0.gemmQ8_0Scalar;
+    _ = &gemm_q8_0.gemmQ8_0Scalar; // oracle: kept as the readable statement
+    _ = &gemm_q8_0.gemmAvx2;
     _ = &gemm_q4_k.BlockQ4_K;
     _ = &gemm_q4_k.f32_to_f16;
     _ = &gemm_q4_k.f16_to_f32;

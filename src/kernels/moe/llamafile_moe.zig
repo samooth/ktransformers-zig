@@ -227,7 +227,7 @@ pub fn gemmQuant(
     const ldb = k / blockSize(fmt);
     const ldc = n;
     switch (fmt) {
-        KT_TYPE_Q8_0 => gemm_q8_0.gemmQ8_0Scalar(a, lda, @as([*]const gemm_q8_0.BlockQ8_0, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q8_0 => gemm_q8_0.gemmAvx2(a, lda, @as([*]const gemm_q8_0.BlockQ8_0, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
         // The six K-quants use the AVX2 fused path (fused dequant + dot, scale
         // folded into the weights). The `*Scalar` siblings are still the
         // reference definition of each format's math and are what

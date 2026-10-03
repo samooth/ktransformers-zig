@@ -2630,7 +2630,7 @@ pub export fn kt_matmul_q8_0(
     ldb: usize,
     ldc: usize,
 ) void {
-    gemm_q8_0.gemmQ8_0Scalar(a, lda, b, ldb, c, ldc, m, n, k);
+    gemm_q8_0.gemmAvx2(a, lda, b, ldb, c, ldc, m, n, k);
 }
 
 pub export fn kt_matmul_q4_k(

@@ -964,3 +964,95 @@ test "MXFP4 nibble order: low nibble is the even weight" {
         try testing.expectEqual(hi, w[i * 2 + 1]); // odd index <- high nibble
     }
 }
+
+test "Q8_0 AVX2 GEMM == the scalar oracle across shapes" {
+    // Q8_0 is the GGUF default weight format and the LlamaMoe activation
+    // format, so this is the hottest quantized GEMM in the tree. Shapes cover
+    // m % MR (1, 5), n = 1, and several block counts. k is always a multiple
+    // of QK8_0 = 32 because a Q8_0 row cannot express a ragged tail.
+    const q8 = kt.gemm_q8_0;
+    var seed: u64 = 0x0800_1234;
+    const shapes = [_][3]usize{
+        .{ 1, 1, 32 },
+        .{ 4, 8, 32 },
+        .{ 5, 7, 64 },
+        .{ 8, 32, 256 },
+        .{ 1, 33, 512 },
+        .{ 5, 3, 1024 },
+        .{ 3, 5, 7168 },
+    };
+    for (shapes) |sh| {
+        const m = sh[0];
+        const n = sh[1];
+        const k = sh[2];
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 256, 4.0));
+
+        const kb = k / q8.QK8_0;
+        const bw = try testing.allocator.alloc(q8.BlockQ8_0, n * kb);
+        defer testing.allocator.free(bw);
+        for (bw) |*blk| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            blk.d = q8.f32_to_f16(0.01 + @as(f32, @floatFromInt((seed >> 32) % 64)) / 64.0);
+            for (&blk.qs) |*q| {
+                seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                // Full signed range including the -128 that has no positive
+                // counterpart, so a sign-extension slip cannot hide.
+                q.* = @bitCast(@as(u8, @truncate(seed >> 24)));
+            }
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        // Poison both, including the padding a plain `= 0` memset would leave.
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        q8.gemmAvx2(a.ptr, k, bw.ptr, kb, c_avx.ptr, n, m, n, k);
+        q8.gemmQ8_0Scalar(a.ptr, k, bw.ptr, kb, c_ref.ptr, n, m, n, k);
+
+        // Both paths accumulate the same f32 products in a different order (8 partial
+        // lanes + one reduce, versus sequential), so they differ by summation
+        // error. `rnd` here returns values up to ~512 and the dots run to
+        // thousands, so a sum that partly cancels shows up amplified:
+        // measured worst is 1.6e-4 relative (an absolute 0.06 on a value of
+        // 381, over 256 f32 terms). A wrong scale, a missed sign extension or
+        // a bad offset gives O(1) instead - the Q4_K routing test saw rel=4.2
+        // that way, and the MXFP4 encoder bug was a clean factor of 2 - so
+        // 1e-3 is a loose bound that still fails loudly for every real defect.
+        for (0..m * n) |i| {
+            try testing.expect(std.math.isFinite(c_avx[i]));
+            const denom = @max(@abs(c_ref[i]), 1e-2);
+            try testing.expect(@abs(c_avx[i] - c_ref[i]) / denom < 1e-3);
+        }
+    }
+}
+
+test "Q8_0 AVX2 GEMM covers every output element (no uninitialised holes)" {
+    // The scalar version zeroes `c` and then accumulates into it; the vector
+    // version assigns directly. That is only equivalent if every element of
+    // [0,m) x [0,n) really is written, so m values either side of MR are
+    // checked for NaN with the output pre-poisoned.
+    const q8 = kt.gemm_q8_0;
+    for ([_]usize{ 1, 2, 3, 4, 5, 7, 8, 9 }) |m| {
+        const n: usize = 3;
+        const k: usize = 64;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(0.5);
+        const bw = try testing.allocator.alloc(q8.BlockQ8_0, n * (k / q8.QK8_0));
+        defer testing.allocator.free(bw);
+        for (bw) |*blk| {
+            blk.d = q8.f32_to_f16(1.0);
+            for (&blk.qs) |*q| q.* = 3; // non-zero, so a written element differs from NaN
+        }
+        const c = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c);
+        @memset(c, std.math.nan(f32));
+        q8.gemmAvx2(a.ptr, k, bw.ptr, k / q8.QK8_0, c.ptr, n, m, n, k);
+        for (c) |v| try testing.expect(std.math.isFinite(v));
+    }
+}
