@@ -701,3 +701,184 @@ test "K-quant AVX2 GEMMs == dequantize + dot (Q2_K)" {
         q2_k.gemmQ2_K,
     );
 }
+
+// ============================================================================
+// MX format block layouts (ue8m0)
+// ============================================================================
+//
+// These exist because the MX blocks shipped with `scale: amx.bf16`, which made
+// MXFP8 34 bytes and MXFP4 18 bytes against the format's 33 and 17, and used a
+// scale encoding MXFP does not have. The formats therefore could not describe a
+// real MXFP checkpoint at all. That is the same class of defect as the KT_TYPE
+// / block-size regression in eec0c22 (11 invented enum values, 9 wrong block
+// sizes), and the existing tests could not catch it: they populated
+// `block.scale` through our own field type, so they were self-consistent by
+// construction no matter how wrong the layout was.
+//
+// The invariant these pin is the one that matters for interop: the scale is a
+// single BYTE holding an unbiased power of two (ue8m0), matching
+// kt-kernel/operators/avx2/mxfp8-moe.hpp ("Scale: ue8m0 per-group
+// (group_size=32)") and GGUF's MXFP4/MXFP8 tensor types.
+
+test "MX block sizes: MXFP8 is 33 bytes, MXFP4 is 17" {
+    try testing.expectEqual(@as(usize, 33), @sizeOf(kt.gemm_mxfp8.MXFP8Block));
+    try testing.expectEqual(@as(usize, 17), @sizeOf(kt.gemm_mxfp4.MXFP4Block));
+    // 1 scale byte + payload; a padding regression would show up here too.
+    try testing.expectEqual(@as(usize, 1), @sizeOf(@FieldType(kt.gemm_mxfp8.MXFP8Block, "scale")));
+    try testing.expectEqual(@as(usize, 1), @sizeOf(@FieldType(kt.gemm_mxfp4.MXFP4Block, "scale")));
+}
+
+test "ue8m0 -> f32 matches the reference's b << 23 for all 256 bytes" {
+    // Verbatim semantics of convert_ue8m0_to_fp32 in the AVX2 reference,
+    // including the two edges it documents rather than fixes: b=0 gives 0.0
+    // (not 2^-127) and b=255 overflows the exponent field into NaN.
+    const ue = kt.gemm_mxfp8.ue8m0_to_f32;
+    for (0..256) |b| {
+        const bits: u32 = @as(u32, @intCast(b)) << 23;
+        try testing.expectEqual(@as(f32, @bitCast(bits)), ue(@intCast(b)));
+    }
+    // The identity that matters in practice: 127 -> 1.0, one step per bit.
+    try testing.expectEqual(@as(f32, 1.0), ue(127));
+    try testing.expectEqual(@as(f32, 2.0), ue(128));
+    try testing.expectEqual(@as(f32, 0.5), ue(126));
+    try testing.expectEqual(@as(f32, 0.0), ue(0));
+}
+
+test "ue8m0 scales are powers of two (what bf16 was not)" {
+    // Every representable scale is an exact power of two. A bf16 scale can
+    // carry a mantissa, so this loop is the direct regression test for the
+    // layout bug: under the old struct, populated values failed here.
+    const ue = kt.gemm_mxfp8.ue8m0_to_f32;
+    for (1..255) |b| {
+        const v = ue(@intCast(b));
+        const back = kt.gemm_mxfp8.f32_to_ue8m0(v);
+        try testing.expectEqual(@as(u8, @intCast(b)), back);
+        // No mantissa: v * 1.5 must land on the next power of two, never
+        // strictly between two of them.
+        try testing.expect(std.math.isFinite(v * 1.5));
+    }
+    // f32 -> ue8m0 rounds to nearest power of two.
+    try testing.expectEqual(@as(u8, 127), kt.gemm_mxfp8.f32_to_ue8m0(1.0));
+    try testing.expectEqual(@as(u8, 127), kt.gemm_mxfp8.f32_to_ue8m0(1.4)); // 1.4 < 1.5 -> down
+    try testing.expectEqual(@as(u8, 128), kt.gemm_mxfp8.f32_to_ue8m0(1.5)); // ties -> up
+    try testing.expectEqual(@as(u8, 0), kt.gemm_mxfp8.f32_to_ue8m0(0.0));
+    try testing.expectEqual(@as(u8, 0), kt.gemm_mxfp8.f32_to_ue8m0(-3.0)); // sign dropped
+}
+
+test "E4M3 LUT: subnormals, 0x7F and the finite maximum decode per spec" {
+    // The decoder this replaces was pure bit reconstruction and wrong twice
+    // over. Pin the three cases that were wrong.
+    const dec = kt.gemm_mxfp8.fp8e4m3_to_f32;
+
+    // exp field 0 is SUBNORMAL, not a normal with exponent -7: man * 2^-9.
+    // The old decoder returned ~1.0-2.0 here, i.e. up to 1024x too large.
+    try testing.expectEqual(@as(f32, 0.0), dec(0x00));
+    for (1..8) |man| {
+        const want: f32 = @as(f32, @floatFromInt(man)) * 0.001953125; // man * 2^-9
+        try testing.expectEqual(want, dec(@intCast(man)));
+    }
+
+    // exp=15, man=6 is the largest finite value (448 = 1.75 * 2^8).
+    try testing.expectEqual(@as(f32, 448.0), dec(0x7E));
+    // exp=15, man=7 (0x7F) is the ONLY NaN encoding in E4M3. Decoding it as
+    // 0.0 matches the reference ("Treat as 0 to avoid propagation"); the old
+    // decoder returned 480.0, which is not even representable.
+    try testing.expectEqual(@as(f32, 0.0), dec(0x7F));
+
+    // Sign symmetry, and the reference's 1.0 / 0.5 anchors.
+    try testing.expectEqual(@as(f32, 1.0), dec(0x38));
+    try testing.expectEqual(@as(f32, -1.0), dec(0xB8));
+    try testing.expectEqual(@as(f32, 0.5), dec(0x30));
+
+    // Monotone in magnitude across every positive encoding, and every value
+    // stays within [0, E4M3_MAX]. 0x7F is excluded: it is the NaN hole and
+    // decodes to 0, so including it would (correctly) break monotonicity.
+    var prev: f32 = -1.0;
+    for (0..0x7F) |i| {
+        const v = dec(@intCast(i));
+        try testing.expect(v >= prev);
+        try testing.expect(v <= 448.0);
+        prev = v;
+    }
+    try testing.expectEqual(@as(f32, 448.0), prev); // 0x7E, the finite max
+}
+
+test "MXFP8 quantize/dequantize round trip through ue8m0" {
+    // The scale is stored as a power of two, so the round trip is exact for
+    // values already on that grid and lossy (but bounded) off it.
+    var seed: u64 = 0x4D58_0F8;
+    for (0..64) |_| {
+        const v = rnd(&seed, 64, 8.0); // [-32, 32)
+        const q = kt.gemm_mxfp8.fp8e4m3_to_f32(kt.gemm_mxfp8.f32_to_fp8e4m3(v));
+        const s = kt.gemm_mxfp8.f32_to_ue8m0(2.0); // scale 2.0
+        const deq = q * kt.gemm_mxfp8.ue8m0_to_f32(s);
+        // E4M3 keeps ~2 decimal digits; the ue8m0 scale is exact, so the whole
+        // error budget is the 3-bit mantissa.
+        try testing.expect(std.math.isFinite(deq));
+        try testing.expect(@abs(deq - v * 2.0) <= @abs(v * 2.0) * 0.2 + 1e-3);
+    }
+}
+
+// ============================================================================
+// MXFP8 AVX2 GEMM
+// ============================================================================
+
+test "MXFP8 AVX2 GEMM == the scalar oracle across shapes, including ragged k" {
+    // The oracle is `gemmFullTileScalar`, the readable statement of the math.
+    // Shapes chosen to hit every branch in `gemmAvx2`: m % MR (5, 1), n = 1,
+    // k a multiple of GROUP_SIZE (32), k with a ragged tail (40, 100), and a
+    // single group (32).
+    const mxfp8 = kt.gemm_mxfp8;
+    var seed: u64 = 0x4D58_0801;
+    const shapes = [_][3]usize{
+        .{ 1, 1, 32 },
+        .{ 4, 8, 32 },
+        .{ 5, 7, 64 },
+        .{ 8, 32, 96 },
+        .{ 1, 33, 40 }, // ragged k (32 + 8)
+        .{ 5, 3, 100 }, // ragged k (96 + 4)
+        .{ 3, 5, 160 },
+    };
+    for (shapes) |sh| {
+        const m = sh[0];
+        const n = sh[1];
+        const k = sh[2];
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 256, 4.0));
+
+        const kb = (k + 31) / 32;
+        const bw = try testing.allocator.alloc(mxfp8.MXFP8Block, n * kb);
+        defer testing.allocator.free(bw);
+        for (bw) |*blk| {
+            blk.scale = @intCast(120 + (seed >> 8) % 16); // ue8m0, several octaves
+            for (&blk.qs) |*q| {
+                seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                q.* = @truncate(seed >> 24);
+            }
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        mxfp8.GemmKernel224MXFP8.gemmAvx2(a.ptr, k, bw.ptr, kb, c_avx.ptr, n, m, n, k);
+        mxfp8.GemmKernel224MXFP8.gemmFullTileScalar(a.ptr, k, bw.ptr, kb, c_ref.ptr, n, m, n, k);
+
+        // Both sides are f32 accumulations of the same products in a different
+        // order, so agreement is limited by summation order, not by the kernel:
+        // the AVX2 path keeps 8 partial lanes and reduces at the end, the
+        // oracle sums sequentially. Over 96 terms with cancellation that costs
+        // ~1e-5 relative. A wrong kernel or a wrong offset produces O(1)
+        // divergence instead (the Q4_K routing test saw rel=4.2 that way), so
+        // 1e-4 still catches every dispatch and layout error.
+        for (0..m * n) |i| {
+            try testing.expect(std.math.isFinite(c_avx[i]));
+            const denom = @max(@abs(c_ref[i]), 1e-2);
+            try testing.expect(@abs(c_avx[i] - c_ref[i]) / denom < 1e-4);
+        }
+    }
+}

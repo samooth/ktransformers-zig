@@ -294,6 +294,87 @@ overall. The array staging was not the cause of the rematerialization.
 
 ---
 
+**Stream E — MXFP4/MXFP8. PARTIAL (layout + codec fixed, MXFP8 GEMM vectorized
+2x/7x; MXFP4 GEMM still scalar). CLAIMED (p0.3-mx) since 2026-10-03.**
+
+`src/kernels/amx/gemm_224_{mxfp4,mxfp8}.zig`. The plan in the roadmap was
+"vectorize the MXFP GEMMs". Vectorizing them would have optimized a format that
+could not read a real MXFP checkpoint at all, so the order had to change.
+
+**Both block layouts were wrong.** `scale` was `amx.bf16`, making MXFP8 34 bytes
+and MXFP4 18 against the format's 33 and 17, and using a scale encoding MXFP
+does not have. The reference is explicit
+(`operators/avx2/mxfp8-moe.hpp`: "Scale: ue8m0 per-group (group_size=32)",
+"ue8m0 byte b -> 2^(b-127)"), as is GGUF. `ue8m0` appeared NOWHERE in this tree
+— the scale encoding was never implemented, only mis-laid-out. Now one byte,
+`ue8m0_to_f32` is a pure shift (`@as(u32, b) << 23`, verbatim from the reference
+including its documented b=0 and b=255 edges), and `@sizeOf` is pinned by a
+`comptime` guard plus a test so the layout cannot drift again.
+
+The pre-existing tests could not have caught this: they populated `block.scale`
+through our own field type, so they were self-consistent by construction no
+matter how wrong the layout was. Same class as the KT_TYPE/block-size
+regression in eec0c22, which is why the size is now asserted rather than
+assumed.
+
+**The E4M3 codec was wrong in six places** (in `gemm_224_mxfp8.zig`, which keeps
+its own private copy of the decoder and encoder):
+- decoder: subnormals (exp field 0) decoded as normals, up to 1024x too large
+- decoder: 0x7F, the only NaN encoding in E4M3, decoded to 480 — above
+  E4M3_MAX, so not even representable
+- encoder: the 3-bit mantissa round-overflow was MASKED (`& 0x7`) instead of
+  carried into the exponent, so `3.875` encoded as **2.0 instead of 4.0** — a 2x
+  error on 1/16 of the entire normal range
+- encoder: saturation returned 0x7F/0xFF, which are the NaN encodings, so any
+  weight above 448 became NaN
+- encoder: all seven subnormal encodings were flushed to zero
+- encoder: round-half-up instead of round-to-nearest-even
+
+Verified: **254/256 exact round trip**, the 2 exceptions being 0x7F/0xFF, which
+correctly decode to 0 by the reference's "treat as 0 to avoid propagation".
+
+**MXFP8 GEMM vectorized** (`gemmAvx2`, replacing an m/n/k triple loop that
+re-streamed the whole weight matrix from DRAM once per token row). Built like
+`kquant_simd.gemmBF16xQuant`: n-outer/m-inner, MR=4, explicit `@mulAdd`, one
+`@reduce` per output row. Folding the ue8m0 scale into the weight vector is
+EXACT, because scaling by a power of two only changes the exponent. The
+reference's deferred-hsum rationale is adopted — MXFP keeps the scale separate
+from the payload instead of baking it into the dequant, so the horizontal
+reduce hoists out of the k loop ("~10x fewer hsums than per-group hsum").
+
+Measured at n=2048, k=7168, pinned, ReleaseFast, best of 5, against the scalar
+triple loop in the same binary:
+
+| m | scalar | avx2 | speedup |
+|---|---|---|---|
+| 1 | 10 ms | 5 ms | 2x |
+| 4 | 46 ms | 6 ms | 7x |
+| 8 | 88 ms | 12 ms | 7x |
+
+All four SIMD rules verified in the disassembly, not the comments: 16 `vfmadd`
+(exactly MR=4 x 4 vectors-per-group), 0 scalar FP mul/add, 4 standalone
+`vmulps` (the scale folds, one per vector), and only 4 horizontal reduces in the
+whole kernel — deferred-hsum confirmed rather than per-group.
+
+**REMAINING:**
+1. **MXFP4 GEMM is still the scalar triple loop**, and MXFP4 is the format that
+   matters for real DeepSeek-V3 checkpoints, so it is the higher-value half.
+   Layout and codec are already fixed, so it is now purely the `gemmAvx2` port:
+   16 bytes -> 32 nibbles per group, `FP4_TABLE` lookup, same four rules.
+2. **m=1 is only 2x and the LUT loads are why** — 8 scalar table loads per 8
+   weights, ~3 G weights/s measured. The reference uses
+   `_mm256_i32gather_ps` (one instruction); worth trying an asm gather before
+   calling this the ceiling.
+3. **De-duplicate the E4M3 codec.** Two copies now exist:
+   `gemm_224_fp8.zig` (Stream B's file) and `gemm_224_mxfp8.zig` (fixed).
+   `mxfp8` should import from `fp8` and keep only the MX-specific parts.
+   Deliberately deferred while Stream B is in flight. **Note for whoever owns
+   Stream B: that file's copy of `f32_to_fp8e4m3` still has all four encoder
+   bugs listed above** — the mantissa carry (2x error), NaN saturation, flushed
+   subnormals, and round-half-up.
+4. `kt_matmul_mxfp8` / `kt_matmul_mxfp4` C-API coverage is untested — the same
+   gap class Stream B hit.
+
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
 
 Benchmarked against the reference's own AVX2 kernels

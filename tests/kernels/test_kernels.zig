@@ -1275,7 +1275,7 @@ test "MXFP8 GEMM 16x16x32 with constant B" {
         }
     }
     for (0..N) |j| {
-        b[j].scale = amx.f32_to_bf16(1.0);
+        b[j].scale = 127; // ue8m0: 2^(127-127) = 1.0
         for (0..32) |q| b[j].qs[q] = 0x38; // FP8 E4M3 1.0
     }
     for (0..c.len) |i| c[i] = 0.0;
@@ -1292,7 +1292,7 @@ test "MXFP8 GEMM 16x16x32 with constant B" {
     }
 
     // Block scale must be applied: same B with scale 2.0 -> c[0, j] = 64.
-    for (0..N) |j| b[j].scale = amx.f32_to_bf16(2.0);
+    for (0..N) |j| b[j].scale = 128; // ue8m0: 2^(128-127) = 2.0
     for (0..c.len) |i| c[i] = 0.0;
     mxfp8.GemmKernel224MXFP8.gemmFullTile(&a, K, &b, 1, &c, N, M, N, K);
     try testing.expect(@abs(c[0] - 64.0) < 2.0);
@@ -1318,7 +1318,7 @@ test "MXFP4 GEMM 16x16x32 with constant B" {
     }
     // Every nibble = 2 (FP4 E2M1 1.0): low=2, high=2 -> byte 0x22.
     for (0..N) |j| {
-        b[j].scale = amx.f32_to_bf16(1.0);
+        b[j].scale = 127; // ue8m0: 2^(127-127) = 1.0
         for (0..16) |q| b[j].qs[q] = 0x22;
     }
     for (0..c.len) |i| c[i] = 0.0;

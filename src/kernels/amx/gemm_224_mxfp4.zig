@@ -5,6 +5,11 @@
 const std = @import("std");
 const amx = @import("../arch/amx.zig");
 const buffers = @import("buffers.zig");
+// ue8m0 is a shared MX-format primitive; mxfp8 owns it (same-layer data
+// sharing, the pattern the sentrux contract allows). One definition, so the
+// two MX formats cannot drift apart on the scale encoding.
+const ue8m0_to_f32 = @import("gemm_224_mxfp8.zig").ue8m0_to_f32;
+const f32_to_ue8m0 = @import("gemm_224_mxfp8.zig").f32_to_ue8m0;
 
 // ============================================================================
 // MXFP4 Type (E2M1)
@@ -15,10 +20,22 @@ const buffers = @import("buffers.zig");
 pub const fp4_e2m1 = u4;  // 4-bit value
 
 /// MXFP4 block: 32 FP4 weights + 1 scale (BF16) = 18 bytes
+/// MXFP4 group: 32 FP4 E2M1 values (16 packed bytes) sharing one scale.
+///
+/// The scale is **ue8m0** (one byte, unbiased power of two), not a bf16 — see
+/// `gemm_224_mxfp8.zig` for the full rationale. As bf16 this block was 18
+/// bytes against the format's 17 and carried a scale encoding MXFP does not
+/// have, so it could not describe a real MXFP4 checkpoint. The size is pinned
+/// by a `comptime` guard and by a test, per the eec0c22 lesson.
 pub const MXFP4Block = extern struct {
-    scale: amx.bf16,
-    qs: [16]u8,  // 32 nibbles packed
+    scale: u8, // ue8m0
+    qs: [16]u8, // 32 nibbles packed
 };
+
+comptime {
+    // 1 scale byte + 16 payload bytes (32 nibbles).
+    if (@sizeOf(MXFP4Block) != 17) @compileError("MXFP4Block must be 17 bytes (ue8m0 + 16 packed nibbles)");
+}
 
 /// FP4 E2M1 lookup table (index 0-15)
 const FP4_TABLE = [_]f32{
@@ -50,7 +67,7 @@ pub fn f32_to_fp4e2m1(x: f32) u4 {
 
 /// Unpack 32 FP4 values from MXFP4Block
 pub fn unpackMXFP4(block: *const MXFP4Block, dst: [*]f32) void {
-    const scale = amx.bf16_to_f32(block.scale);
+    const scale = ue8m0_to_f32(block.scale);
     for (0..16) |i| {
         const byte = block.qs[i];
         const low = @as(u4, @intCast(byte & 0x0F));
@@ -269,7 +286,7 @@ pub const GemmKernel224MXFP4 = struct {
                         @intCast(packed_byte & 0x0F)
                     else
                         @intCast((packed_byte >> 4) & 0x0F);
-                    break :blk fp4e2m1_to_f32(nib) * amx.bf16_to_f32(block.scale);
+                    break :blk fp4e2m1_to_f32(nib) * ue8m0_to_f32(block.scale);
                 } else 0.0;
                 scratch[i * TILE_K + kk] = amx.f32_to_bf16(val);
             }
@@ -340,7 +357,7 @@ pub const MXFP4BufferB = struct {
                 const inv_scale = 1.0 / scale;
 
                 const block = &self.ptr[n_idx * blocks_per_row + blk];
-                block.scale = amx.f32_to_bf16(scale);
+                block.scale = f32_to_ue8m0(scale);
 
                 for (0..16) |q| {
                     const k0 = k_start + q * 2;
@@ -395,7 +412,7 @@ test "MXFP4 scalar GEMM exact values" {
     }
     // Every nibble = 2 (FP4 1.0): low nibble 2, high nibble 2 -> byte 0x22.
     for (0..N) |j| {
-        b[j].scale = amx.f32_to_bf16(1.0);
+        b[j].scale = 127; // ue8m0 for 2^(127-127) = 1.0
         for (0..16) |q| b[j].qs[q] = 0x22;
     }
     for (0..c.len) |i| c[i] = 0.0;
@@ -416,7 +433,7 @@ test "MXFP4 nibble order matches C++ reference" {
     // all other bytes to 0x00 (both nibbles 0). Then A[0,0]=1, A[0,1]=0
     // picks out element 0; A[0,0]=0, A[0,1]=1 picks out element 1.
     var b: MXFP4Block align(64) = undefined;
-    b.scale = amx.f32_to_bf16(1.0);
+    b.scale = 127; // ue8m0 for 2^(127-127) = 1.0
     @memset(&b.qs, 0);
     b.qs[0] = 0x12; // element 0 = low nibble (2 -> 1.0), element 1 = high (1 -> 0.5)
 
