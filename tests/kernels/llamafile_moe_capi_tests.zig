@@ -359,18 +359,35 @@ test "kt_llama_moe C API: parallel (4-thread) == sequential (1-thread) forward" 
     }
 }
 
-test "kt_llama_moe C API: Q4_K fused path through the MoE matches dequantized reference" {
-    // Coverage for the Q4_K fast path (gemmQ4KxQ8_0Scalar wired into
-    // runMatmulScratch): every prior LlamaMoe forward test used Q8_0
-    // weights, so the fused arm never executed through the pipeline
-    // (the same test-gap class that hid the 5177bdf KT_TYPE bug).
-    // Q4_K config + 4-thread pool + qlen>1 drives the parallel scratch
-    // path straight into the fused arm; the reference replicates the
-    // MoE math on dequantized F32 weights with the SAME activation
-    // quantization noise (Q8_0 round-trips on act and mid — both the
-    // fused and BF16 paths quantize activations; the fused path only
-    // skips the BF16 intermediate, whose loss is exact for Q8_0: the
-    // dequant value a_q*a_d is what the fused dot multiplies anyway).
+test "kt_llama_moe C API: Q4_K through the MoE matches the dequantized reference" {
+    // Coverage for the Q4_K path through the full pipeline: every prior
+    // LlamaMoe forward test used Q8_0 weights, so the K-quant arm never
+    // executed end-to-end (the same test-gap class that hid the 5177bdf
+    // KT_TYPE bug). Q4_K config + 4-thread pool + qlen>1 drives the
+    // parallel scratch path straight into it.
+    //
+    // Q4_K used to take a fused `gemmQ4KxQ8_0` arm that skipped the
+    // activation's BF16 intermediate. That arm is gone: the generic AVX2
+    // K-quant driver (`gemm_q4_k.gemmQ4_K`, commit f6b1f0b) is 3.3x
+    // faster on this shape and every other weight format already goes
+    // through the BF16 intermediate. Q4_K is no longer the odd one out.
+    //
+    // The reference below therefore models the BF16 activation round-trip
+    // explicitly. It used to assume that round-trip was lossless — the
+    // comment claimed "the dequant value a_q*a_d is what the fused dot
+    // multiplies anyway". That is FALSE: `dequantQ8_0ToBF16` computes
+    // `f32_to_bf16(a_q * a_d)`, and while a_q (8-bit) is exact in bf16,
+    // the f16 scale d has an 11-bit significand and bf16 keeps 8, so the
+    // product loses ~3 low bits (~0.2% relative) per activation. Measured
+    // on the m=1 n=256 k=256 GEMM this test exercises:
+    //
+    //   fused  vs F32 reference                 6.2e-6   (what it asserted)
+    //   bf16   vs F32 reference                 7.8e-2   (fails the bound)
+    //   bf16   vs F32 ref with bf16 rounding    9.5e-6   (apples to apples)
+    //
+    // So the driver was never wrong; the reference just omitted the
+    // rounding the live path performs. Both round-trips (act and mid) are
+    // modelled below, which restores the ~1e-5 agreement.
     const allocator = testing.allocator;
     const amx = kt.amx;
     const q4k = kt.gemm_q4_k;
@@ -486,9 +503,11 @@ test "kt_llama_moe C API: Q4_K fused path through the MoE matches dequantized re
 
     // Reference: per token, per expert — act Q8_0 round-trip, gate/up
     // dots, silu*up, mid Q8_0 round-trip, down dot, weighted sum.
-    // Tolerance: the fused arm and this reference differ only in F32
-    // accumulation ORDER (same values multiplied); Q4_K/Q8_0 quant
-    // noise is identical on both sides by construction.
+    // Tolerance: after the BF16 activation round-trips below are modelled,
+    // this reference and the kernel multiply the SAME values and differ
+    // only in F32 accumulation order, so ~1e-5 is expected; 1e-2 is a wide
+    // anti-flake bound that still catches wrong-kernel/wrong-offset
+    // dispatch (those produce O(1) divergence, as the race probe did).
     const act_f = try allocator.alloc(f32, hidden);
     defer allocator.free(act_f);
     const act_dq = try allocator.alloc(f32, hidden);
@@ -504,10 +523,12 @@ test "kt_llama_moe C API: Q4_K fused path through the MoE matches dequantized re
 
     var max_rel: f32 = 0;
     for (0..qlen) |t| {
-        // Activation Q8_0 round-trip (same as both kernel paths).
+        // Activation Q8_0 round-trip, then the BF16 round-trip that
+        // `dequantQ8_0ToBF16` performs before the GEMM (see the header).
         for (0..hidden) |i| act_f[i] = amx.bf16_to_f32(in_bf[t * hidden + i]);
         q8.quantizeRowQ8_0(act_f, act_q8.ptr, hidden);
         q8.dequantizeRowQ8_0(act_q8.ptr, act_dq, hidden);
+        for (0..hidden) |i| act_dq[i] = amx.bf16_to_f32(amx.f32_to_bf16(act_dq[i]));
 
         const out_ref_buf = try allocator.alloc(f32, hidden);
         defer allocator.free(out_ref_buf);
@@ -525,9 +546,10 @@ test "kt_llama_moe C API: Q4_K fused path through the MoE matches dequantized re
                 }
                 mid_f[j] = g / (1.0 + @exp(-g)) * u;
             }
-            // Phase 2: mid Q8_0 round-trip + down dot + weighted add.
+            // Phase 2: mid Q8_0 round-trip + BF16 round-trip + down dot + weighted add.
             q8.quantizeRowQ8_0(mid_f, mid_q8.ptr, inter);
             q8.dequantizeRowQ8_0(mid_q8.ptr, mid_dq, inter);
+            for (0..inter) |j| mid_dq[j] = amx.bf16_to_f32(amx.f32_to_bf16(mid_dq[j]));
             for (0..hidden) |i| {
                 var dd: f32 = 0;
                 for (0..inter) |jj| {
@@ -546,11 +568,8 @@ test "kt_llama_moe C API: Q4_K fused path through the MoE matches dequantized re
             max_rel = @max(max_rel, rel);
         }
     }
-    // Same values, different FMA order — expect ~1e-5; 1e-2 is a wide
-    // anti-flake bound that still catches wrong-kernel/wrong-offset
-    // dispatch (those produce O(1) divergence, as the race probe did).
     if (max_rel >= 1e-2) {
-        std.debug.print("Q4K fused rel={d:.6} out[0]={d:.6} ref[0]={d:.6}\n", .{ max_rel, out[0], @as(f32, 0) });
+        std.debug.print("Q4_K rel={d:.6} out[0]={d:.6}\n", .{ max_rel, out[0] });
     }
     try testing.expect(max_rel < 1e-2);
 }

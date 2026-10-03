@@ -62,7 +62,48 @@ parallel. Two rules so they do not collide:
    change, say so in the claim rather than editing it.
 2. **CLAIM here first** (the protocol at the top of this file), then work.
 
-**Stream A — Q4_K x Q8_0 fused dot. DONE (2.4x).**
+**Stream A follow-up — Q4_K m=1 routing. CLAIMED by claude since 2026-10-03.**
+
+The K-quant AVX2 driver (commit `f6b1f0b`) superseded the Stream A fused
+`gemmQ4KxQ8_0` kernel, but `runMatmulScratch` still routes Q4_K at `m == 1` to
+the slower one. Measured on three cores, same weights, m=1 n=2048 k=7168:
+
+| path | time | bandwidth |
+|---|---|---|
+| fused Q8_0 (skips the dequant) | 5727 / 5775 / 5858 us | 1 GB/s |
+| dequant (4 us) + generic bf16 driver | 1778 / 1787 / 1758 us | **4 GB/s** |
+
+The dequant that the fused path avoids costs 4 us — 0.2% of the total — so the
+generic driver is **3.3x faster while doing strictly more work**.
+
+**Numerics consequence (deliberate, not a free win).** The fused arm skipped
+the BF16 activation intermediate, so it was ~0.2% per activation MORE accurate
+than the generic path. It was also the only format in `LlamaMoe` with that
+advantage — Q8_0, the other five K-quants and the nine IQ formats all
+dequantize activations to BF16, so Q4_K was the outlier and is now consistent
+with its siblings. `dequantQ8_0ToBF16` computes `f32_to_bf16(a_q * a_d)`:
+`a_q` (8-bit) is exact in bf16 but the f16 scale `d` has an 11-bit significand
+against bf16's 8, so ~3 low bits are lost. There is no C++ reference for this
+path (ktransformers has no K-quant MoE kernel at all — it is Zig-native), so
+consistency with the rest of the library is the criterion, not reference parity.
+
+**A test asserted the wrong thing and hid this.** `llamafile_moe_capi_tests`
+claimed the BF16 round-trip was "exact for Q8_0" and compared the BF16 path
+against an F32 reference with a 1e-2 bound; it only ever passed because the
+fused arm was what ran. Fixed to model both BF16 activation round-trips, which
+restores the ~1e-5 agreement the test always meant to assert:
+
+| comparison | rel error |
+|---|---|
+| fused vs F32 reference | 6.2e-6 (what it asserted) |
+| bf16 driver vs F32 reference | 7.8e-2 (fails the bound) |
+| bf16 driver vs F32 ref with bf16 rounding modelled | 9.5e-6 |
+
+The driver was never wrong. The fused kernels stay (correct, tested, and still
+the readable statement of the Q8_0 formulation) but are off the inference path;
+deleting them plus their 4 tests is a separate call.
+
+**Stream A — Q4_K x Q8_0 fused dot. DONE (2.4x, superseded).**
 `gemmQ4KxQ8_0` added alongside the scalar version (which stays as the
 readable statement of the math). 20.37 ms -> 8.38 ms at m=1,n=2048,k=7168
 (**2.4x**); 0.41 -> 0.99 GB/s. `gemmQ4_KScalar` was still scalar — **CLOSED
@@ -80,7 +121,7 @@ also the same fix as the NR-tiling item under "actually open" below. Secondary:
 super-block, and the four `@reduce(.Add)` horizontal reductions per 64 weights
 dominate the rest.
 
-**Stream B — FP8 E4M3/E5M2. UNCLAIMED.**
+**Stream B — FP8 E4M3/E5M2. CLAIMED by claude since 2026-10-03.**
 `src/kernels/amx/gemm_224_fp8.zig`, `gemmFullTileScalar` (line ~317). The C++
 reference has `operators/avx2/fp8-moe.hpp` + `fp8_dequant.hpp`, so this is a
 direct port target with a reference to diff against. Acceptance: the existing

@@ -724,26 +724,18 @@ pub const LlamaMoe = struct {
         scr: *TokenScratch,
     ) void {
         _ = self;
-        if (weight_type == KT_TYPE_Q4_K and m == 1) {
-            // Skip the Q8_0→BF16 round-trip; call the fused dot
-            // directly. The Q8_0 block stride is `(kk / QK8_0)` per row.
-            gemm_q4_k.gemmQ4KxQ8_0(
-                @as([*]const gemm_q8_0.BlockQ8_0, @ptrCast(@alignCast(act_q8_0))),
-                kk / gemm_q8_0.QK8_0,
-                @as([*]const gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(weight_ptr))),
-                kk / gemm_q4_k.QK_K,
-                out,
-                n,
-                m,
-                n,
-                kk,
-            );
-            return;
-        }
-        // Fall through: Q8_0→BF16 dequant + the standard gemmQuant
-        // dispatch (handles the 15 other GGML formats). The act_bf16
-        // scratch is sized for `hidden` and `inter`; both are ≤
-        // max(hidden, inter) so one buffer covers all three
+        // NOTE: there used to be a Q4_K + m==1 fast path here that called the
+        // fused `gemmQ4KxQ8_0` and skipped the Q8_0->BF16 round-trip. The
+        // generic AVX2 K-quant driver (`gemm_q4_k.gemmQ4_K`, commit f6b1f0b)
+        // superseded it: measured 3.3x faster on this shape (1778 us vs 5727
+        // us, pinned, three cores) even though the dequant it needs costs only
+        // 4 us of that. The special case is removed rather than kept as a
+        // faster-looking shortcut. `gemmQ4KxQ8_0` / `gemmQ4KxQ8_0Scalar`
+        // remain, correct and tested, as the readable statement of the fused
+        // Q8_0 formulation and a reference for its tests.
+// Q8_0→BF16 dequant, then the standard gemmQuant dispatch (all 16
+        // formats). The act_bf16 scratch is sized for `hidden` and `inter`;
+        // both are ≤ max(hidden, inter) so one buffer covers all three
         // projections.
         const scr_len = scr.act_bf16.len;
         if (scr_len < kk) @panic("TokenScratch act_bf16 too small");
