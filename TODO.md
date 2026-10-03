@@ -90,12 +90,33 @@ Acceptance: each format's existing `block layout byte-exact`,
 `quantize/dequant round trip`, `all-zero`, and `scalar GEMM` tests keep
 passing, plus a new GEMM-vs-dequantized-reference test per format.
 
-**Sequential, not parallelisable** (needs arch/amx.zig or cross-cutting):
-the SwiGLU register-pressure fix — `applySwiGLU` re-broadcasts 7 polynomial
-constants per iteration and spills, where the C++ hoists them into registers;
-and promoting the bf16->f32 widening helper out of `gemm_224_bf16.zig` into
-the arch layer so the streams above share one copy instead of each
-re-deriving it.
+**Stream D — SwiGLU activation, 0.57x. UNCLAIMED, with a diagnosis.**
+The activation is the one place the port is still clearly behind. Measured
+instruction counts for the 8-element body: **Zig 48, C++ 40.** The difference
+is not algorithmic — both do `vpmovzxwd` + `vpslld` and an FMA polynomial — it
+is register allocation:
+
+- Zig emits **6 `vbroadcastss` per iteration** that C++ does not have: the
+  polynomial constants are rematerialized from memory inside the loop because
+  `expVec` has ~13 simultaneously-live constants (7 polynomial coefficients
+  + INV_LN2, LN2_HI, LN2_LO, 0.5, 1.0, and the two clamp bounds) against 16
+  ymm. C++ hoists its constants into registers before the loop.
+- Zig emits 8 FMAs to C++'s 6 — a deliberate accuracy choice (degree-6 vs
+  degree-5, 1.0e-8 vs ~1e-6 relative truncation error). Not a bug.
+- 2 `vmovaps` + 1 `vextracti128` of register shuffling.
+
+So the fix is to cut peak live constants, not to change the math. Ideas, in
+order of expected value: restructure `expVec` into two phases (split, floor,
+pow2 — then the polynomial) so the first group's constants are dead before the
+second's are born; hoist the clamp bounds out by clamping once per call instead
+of per vector; or drop to a degree-5 polynomial and give up the accuracy
+margin. The first two keep <=1 ULP.
+
+**Tried and reverted** (do not repeat): replacing the `[VEC_LEN]f32` array
+staging in `applySwiGLU` with direct `*align(1)` vector loads and a vectorized
+RNE narrowing store. Measured back-to-back against the same binary six times:
+median **1.02x** (range 0.80-1.28x), and the .so grew by 29 instructions
+overall. The array staging was not the cause of the rematerialization.
 
 **Actually open:**
 
