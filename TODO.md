@@ -31,6 +31,68 @@ next reader does not re-investigate them. `REMAINING.md` has been deleted in
 favour of this section — it had gone stale (four of its five tasks were
 already completed and it did not mention the SIMD work at all).
 
+### Parallel work streams (2026-10-03) — CLAIM before starting
+
+The AVX2 SIMD audit found that after the GEMM/activation rework, **BF16 is the
+only kernel with a real AVX2 vector path**. Everything else has an AMX tile
+path (dead on any non-AMX host, `AmxFeatures.available == false`) plus a
+scalar fallback. Measured cost at a LlamaMoe-shaped projection
+(`m=1, n=2048, k=7168`):
+
+| | time | weight bytes | bandwidth |
+|---|---|---|---|
+| Q4_K x Q8_0 (scalar) | 20.37 ms | 8.26 MB | **0.41 GB/s** |
+| BF16 (vectorized), same n/k | 3.70 ms | 29.36 MB | **7.94 GB/s** |
+
+The scalar quantized path is **5.5x slower while moving 3.6x fewer bytes** — so
+it is dequant/arithmetic-bound, not bandwidth-bound, and uses ~2% of the
+19.3 GB/s a vectorized kernel sustains on this host. This is missing SIMD, not
+instruction selection.
+
+These streams are deliberately scoped to **disjoint files** so they can run in
+parallel. Two rules so they do not collide:
+
+1. **Do not edit `build.zig`, `test_kernels.zig`, `src/root.zig`, or
+   `src/kernels/arch/amx.zig`.** Test-file registration is pre-wired below;
+   kernel files are one-per-stream. If you genuinely need an arch-layer
+   change, say so in the claim rather than editing it.
+2. **CLAIM here first** (the protocol at the top of this file), then work.
+
+**Stream A — Q4_K x Q8_0 fused dot (highest value). CLAIMED.**
+`src/kernels/amx/gemm_224_q4_k.zig`. Replace the per-element
+`dot_q += a_qi * lo` / `dot_1 += a_qi` inner loop in
+`gemmQ4KxQ8_0Scalar` with AVX2. `gemmExpert` in
+`gemm_224_bf16.zig` is the reference implementation to copy: n-outer /
+m-inner, MR=4 register tiling, 4 accumulators, explicit `@mulAdd`, `widen8`
+for bf16 (or a `u8 -> f32` widen for the i8 activations). Acceptance: the
+existing 3 Q4_KxQ8_0 tests must still pass unchanged — in particular
+`fused dot == dequantize-and-dot` at 2e-5 relative tolerance — plus a new
+assertion that the vectorized path reaches a stated fraction of the BF16
+kernel's bandwidth on the same shape.
+
+**Stream B — FP8 E4M3/E5M2. UNCLAIMED.**
+`src/kernels/amx/gemm_224_fp8.zig`, `gemmFullTileScalar` (line ~317). The C++
+reference has `operators/avx2/fp8-moe.hpp` + `fp8_dequant.hpp`, so this is a
+direct port target with a reference to diff against. Acceptance: the existing
+FP8 tests pass, plus `gemmFullTileScalar`'s new vectorized sibling matches it
+to f32 rounding on random blocks.
+
+**Stream C — K-quants Q2_K / Q3_K / Q5_K / Q6_K / Q8_K. UNCLAIMED.**
+`src/kernels/amx/gemm_224_{q2_k,q3_k,q5_k,q6_k,q8_k}.zig`. These share a
+structure (6-bit packed scales + per-32 sub-blocks), so one stream can take
+all five or split them. Note the fp8_dequant / gptq_int4_dequant headers in
+the C++ reference for how the scale unpacking is expected to vectorize.
+Acceptance: each format's existing `block layout byte-exact`,
+`quantize/dequant round trip`, `all-zero`, and `scalar GEMM` tests keep
+passing, plus a new GEMM-vs-dequantized-reference test per format.
+
+**Sequential, not parallelisable** (needs arch/amx.zig or cross-cutting):
+the SwiGLU register-pressure fix — `applySwiGLU` re-broadcasts 7 polynomial
+constants per iteration and spills, where the C++ hoists them into registers;
+and promoting the bf16->f32 widening helper out of `gemm_224_bf16.zig` into
+the arch layer so the streams above share one copy instead of each
+re-deriving it.
+
 **Actually open:**
 
 - [ ] **`posix_madvise` is stubbed** (`src/runtime/memory.zig:173,179`) —
