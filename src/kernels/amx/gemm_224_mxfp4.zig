@@ -146,7 +146,7 @@ pub const GemmKernel224MXFP4 = struct {
         m: usize, n: usize, k: usize
     ) void {
         if (!amx.detectAmxSupport()) {
-            gemmFullTileScalar(a, lda, b, ldb, c, ldc, m, n, k);
+            gemmAvx2(a, lda, b, ldb, c, ldc, m, n, k);
             return;
         }
 
@@ -172,8 +172,123 @@ pub const GemmKernel224MXFP4 = struct {
         }
     }
 
-    /// Scalar fallback for non-AMX hosts.
-    fn gemmFullTileScalar(
+    // ========================================================================
+    // AVX2 path (non-AMX hosts)
+    // ========================================================================
+    //
+    // Same shape as the MXFP8 sibling and as `kquant_simd.gemmBF16xQuant`:
+    // n-outer/m-inner so the weight block streams from DRAM once, MR=4 so four
+    // activation rows share one unpacked weight vector, explicit `@mulAdd`
+    // because FP contraction is off in this toolchain, and ONE `@reduce` per
+    // output row (deferred hsum — MXFP keeps the scale separate from the
+    // payload, so the horizontal sum hoists out of the k loop).
+    //
+    // Folding the ue8m0 scale into the weight vector is EXACT: a power of two
+    // only changes the exponent, so it cannot round.
+    //
+    // This is the format real DeepSeek-V3 checkpoints use, and it moves half
+    // the bytes MXFP8 does — 4 bits per weight — which is why the nibble
+    // unpack matters more here than the table lookup does.
+
+    const MR: usize = 4;
+    const Vec: type = @Vector(8, f32);
+
+    /// 8 bf16 -> 8 f32, unaligned.
+    inline fn widen8(p: [*]const amx.bf16) Vec {
+        const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+        return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+    }
+
+    /// 4 bytes -> 8 FP4 E2M1 values, LOW nibble first.
+    ///
+    /// The nibble order is not arbitrary: `unpackMXFP4` emits `qs[i] & 0x0F` at
+    /// `dst[2i]` and `qs[i] >> 4` at `dst[2i+1]`, so the low nibble is the
+    /// even index. Getting this backwards silently pairs every weight with its
+    /// neighbour, which still produces plausible-looking numbers, so it is
+    /// pinned by the equivalence test against the scalar oracle rather than by
+    /// a comment.
+    inline fn fp4x8(p: *const u8) Vec {
+        const bytes: @Vector(4, u8) = @as(*align(1) const @Vector(4, u8), @ptrCast(p)).*;
+        var out: [8]f32 = undefined;
+        inline for (0..4) |i| {
+            out[i * 2] = fp4e2m1_to_f32(@truncate(bytes[i]));
+            out[i * 2 + 1] = fp4e2m1_to_f32(@truncate(bytes[i] >> 4));
+        }
+        return out;
+    }
+
+    /// Scalar dot over the ragged tail of a k that is not a multiple of
+    /// GROUP_SIZE. Only the last group can be partial.
+    inline fn tailDot(a_row: [*]const amx.bf16, blk: *const MXFP4Block, kbase: usize, rem: usize) f32 {
+        var acc: f32 = 0;
+        for (0..rem) |t| {
+            const byte = blk.qs[t / 2];
+            const nib: u4 = if (t % 2 == 0) @truncate(byte) else @truncate(byte >> 4);
+            acc += amx.bf16_to_f32(a_row[kbase + t]) * fp4e2m1_to_f32(nib) * ue8m0_to_f32(blk.scale);
+        }
+        return acc;
+    }
+
+    /// AVX2 MXFP4 GEMM. `c` is OVERWRITTEN, matching `gemmFullTileScalar`.
+    pub fn gemmAvx2(
+        a: [*]const amx.bf16, lda: usize,
+        b: [*]const MXFP4Block, ldb: usize,
+        c: [*]f32, ldc: usize,
+        m: usize, n: usize, k: usize
+    ) void {
+        const full = k / GROUP_SIZE; // complete 32-weight groups
+        const rem = k - full * GROUP_SIZE; // ragged tail, < 32
+
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            const brow = b + j * ldb;
+
+            var i: usize = 0;
+            while (i + MR <= m) : (i += MR) {
+                var acc = [_]Vec{@splat(0.0)} ** MR;
+                for (0..full) |blk| {
+                    const blk_ptr = &brow[blk];
+                    const sv: Vec = @splat(ue8m0_to_f32(blk_ptr.scale));
+                    const kb = blk * GROUP_SIZE;
+                    // 32 weights = 16 bytes = 4 x Vec8, and each fp4x8
+                    // consumes 4 bytes to produce 8 weights, so the count is
+                    // GROUP_SIZE / 8, not / 16.
+                    inline for (0..GROUP_SIZE / 8) |v| {
+                        const w = fp4x8(&blk_ptr.qs[v * 4]) * sv;
+                        inline for (0..MR) |r| {
+                            acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + kb + v * 8), w, acc[r]);
+                        }
+                    }
+                }
+                inline for (0..MR) |r| {
+                    var sum = @reduce(.Add, acc[r]); // ONE hsum per output element
+                    if (rem != 0) sum += tailDot(a + (i + r) * lda, &brow[full], full * GROUP_SIZE, rem);
+                    c[(i + r) * ldc + j] = sum;
+                }
+            }
+
+            // Row tail (m % MR), one row at a time.
+            while (i < m) : (i += 1) {
+                var acc: Vec = @splat(0.0);
+                for (0..full) |blk| {
+                    const blk_ptr = &brow[blk];
+                    const sv: Vec = @splat(ue8m0_to_f32(blk_ptr.scale));
+                    const kb = blk * GROUP_SIZE;
+                    inline for (0..GROUP_SIZE / 8) |v| {
+                        acc = @mulAdd(Vec, widen8(a + i * lda + kb + v * 8), fp4x8(&blk_ptr.qs[v * 4]) * sv, acc);
+                    }
+                }
+                var sum = @reduce(.Add, acc);
+                if (rem != 0) sum += tailDot(a + i * lda, &brow[full], full * GROUP_SIZE, rem);
+                c[i * ldc + j] = sum;
+            }
+        }
+    }
+
+    /// Scalar reference for non-AMX hosts: the readable statement of the math,
+    /// and the oracle the AVX2 path is tested against. Public for the same
+    /// reason `gemmQ*_KScalar` is.
+    pub fn gemmFullTileScalar(
         a: [*]const amx.bf16, lda: usize,
         b: [*]const MXFP4Block, ldb: usize,
         c: [*]f32, ldc: usize,

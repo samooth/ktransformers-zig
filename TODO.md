@@ -294,8 +294,8 @@ overall. The array staging was not the cause of the rematerialization.
 
 ---
 
-**Stream E — MXFP4/MXFP8. PARTIAL (layout + codec fixed, MXFP8 GEMM vectorized
-2x/7x; MXFP4 GEMM still scalar). CLAIMED (p0.3-mx) since 2026-10-03.**
+**Stream E — MXFP4/MXFP8. DONE (layout + codec fixed; both GEMMs vectorized).
+CLAIMED (p0.3-mx) since 2026-10-03, completed 2026-10-03.**
 
 `src/kernels/amx/gemm_224_{mxfp4,mxfp8}.zig`. The plan in the roadmap was
 "vectorize the MXFP GEMMs". Vectorizing them would have optimized a format that
@@ -356,24 +356,57 @@ All four SIMD rules verified in the disassembly, not the comments: 16 `vfmadd`
 `vmulps` (the scale folds, one per vector), and only 4 horizontal reduces in the
 whole kernel — deferred-hsum confirmed rather than per-group.
 
-**REMAINING:**
-1. **MXFP4 GEMM is still the scalar triple loop**, and MXFP4 is the format that
-   matters for real DeepSeek-V3 checkpoints, so it is the higher-value half.
-   Layout and codec are already fixed, so it is now purely the `gemmAvx2` port:
-   16 bytes -> 32 nibbles per group, `FP4_TABLE` lookup, same four rules.
-2. **m=1 is only 2x and the LUT loads are why** — 8 scalar table loads per 8
-   weights, ~3 G weights/s measured. The reference uses
-   `_mm256_i32gather_ps` (one instruction); worth trying an asm gather before
-   calling this the ceiling.
-3. **De-duplicate the E4M3 codec.** Two copies now exist:
+**MXFP4 GEMM vectorized too** (`gemmAvx2` in `gemm_224_mxfp4.zig`), same shape:
+n-outer/m-inner, MR=4, explicit `@mulAdd`, one `@reduce` per output row, ue8m0
+scale folded into the weight vector. `fp4x8` turns 4 bytes into 8 E2M1 values,
+**low nibble first** — the order `unpackMXFP4` uses. That ordering is pinned by a
+dedicated test, not just by the oracle comparison, because a swapped pair still
+produces plausible-looking numbers instead of garbage.
+
+| format | m | scalar | avx2 | speedup |
+|---|---|---|---|---|
+| MXFP8 (33 B/blk) | 1 | 10 ms | 5 ms | 2x |
+| MXFP8 | 4 | 46 ms | 6 ms | 7x |
+| MXFP8 | 8 | 88 ms | 12 ms | 7x |
+| MXFP4 (17 B/blk) | 1 | 11 ms | 3 ms | 3x |
+| MXFP4 | 4 | 45 ms | 4 ms | **11x** |
+| MXFP4 | 8 | 90 ms | 8 ms | **10x** |
+
+at n=2048, k=7168, pinned, ReleaseFast, best of 5, against the scalar triple
+loop in the same binary. MXFP4 gains the most, which is expected: at 4 bits per
+weight the weight stream is half the size, so the loop order and the FMA tiling
+matter more than the unpack.
+
+Two bugs caught while porting, both by the tests rather than by reading:
+- the unroll count was `GROUP_SIZE / 16` instead of `/ 8`, so each 32-weight
+  group was only half-consumed (16 of 32 weights). The equivalence test failed
+  across every shape, and so did the pre-existing `MXFP4 GEMM 16x16x32` test.
+- the nibble-order test itself overflowed `u8`: `(i + 9) << 4` exceeds a nibble
+  for i >= 7. Worth remembering that `<< 4` on a `u8` panics rather than
+  wrapping when the high bits would be lost.
+
+Both MX kernels verify identically in the disassembly: 16 `vfmadd` (MR=4 x 4
+vectors-per-group), 4 standalone `vmulps` (the scale folds, one per vector), and
+only 4 horizontal reduces in the whole kernel — deferred-hsum confirmed rather
+than per-group. The 28 scalar FP instructions present in each sit entirely after
+the hot loop, in the cold ragged-k tail (`tailDot`), which only runs when
+`k % 32 != 0`.
+
+**REMAINING (not perf, correctness/interop):**
+1. **De-duplicate the E4M3 codec.** Two copies now exist:
    `gemm_224_fp8.zig` (Stream B's file) and `gemm_224_mxfp8.zig` (fixed).
    `mxfp8` should import from `fp8` and keep only the MX-specific parts.
    Deliberately deferred while Stream B is in flight. **Note for whoever owns
    Stream B: that file's copy of `f32_to_fp8e4m3` still has all four encoder
    bugs listed above** — the mantissa carry (2x error), NaN saturation, flushed
    subnormals, and round-half-up.
-4. `kt_matmul_mxfp8` / `kt_matmul_mxfp4` C-API coverage is untested — the same
-   gap class Stream B hit.
+2. **m=1 is the weak case (2-3x) and the LUT loads are why** — 8 scalar table
+   loads per 8 weights, ~2.6-3 G weights/s measured. The reference uses
+   `_mm256_i32gather_ps` (one instruction); worth trying an asm gather before
+   calling this the ceiling. This is the next perf item.
+3. `kt_matmul_mxfp8` / `kt_matmul_mxfp4` C-API coverage is untested — the same
+   gap class Stream B hit. The GEMMs are now fast, but nothing above them is
+   pinned.
 
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
 

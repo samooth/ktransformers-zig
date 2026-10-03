@@ -882,3 +882,85 @@ test "MXFP8 AVX2 GEMM == the scalar oracle across shapes, including ragged k" {
         }
     }
 }
+
+test "MXFP4 AVX2 GEMM == the scalar oracle, and the nibble order is low-first" {
+    // Two things are pinned here. The oracle comparison, and — because a
+    // reversed nibble order still produces plausible-looking numbers rather
+    // than garbage — the ordering itself: `fp4x8` emits the low nibble at the
+    // even index, matching `unpackMXFP4`. Swapping the two in `fp4x8` fails
+    // this test, which is the only cheap way to notice.
+    const mxfp4 = kt.gemm_mxfp4;
+    var seed: u64 = 0x4D58_0402;
+    const shapes = [_][3]usize{
+        .{ 1, 1, 32 },
+        .{ 4, 8, 32 },
+        .{ 5, 7, 64 },
+        .{ 8, 32, 128 },
+        .{ 1, 33, 40 }, // ragged k (32 + 8)
+        .{ 5, 3, 100 }, // ragged k (96 + 4)
+        .{ 3, 5, 224 },
+    };
+    for (shapes) |sh| {
+        const m = sh[0];
+        const n = sh[1];
+        const k = sh[2];
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 256, 4.0));
+
+        const kb = (k + 31) / 32;
+        const bw = try testing.allocator.alloc(mxfp4.MXFP4Block, n * kb);
+        defer testing.allocator.free(bw);
+        for (bw) |*blk| {
+            blk.scale = @intCast(118 + (seed >> 8) % 20); // ue8m0, several octaves
+            for (&blk.qs) |*byte| {
+                seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                // Nibbles drawn from the WHOLE E2M1 range, not just 0x0..0xF in
+                // order, so a swapped pair cannot average out.
+                byte.* = @truncate((seed >> 20) ^ (seed >> 4));
+            }
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        mxfp4.GemmKernel224MXFP4.gemmAvx2(a.ptr, k, bw.ptr, kb, c_avx.ptr, n, m, n, k);
+        mxfp4.GemmKernel224MXFP4.gemmFullTileScalar(a.ptr, k, bw.ptr, kb, c_ref.ptr, n, m, n, k);
+
+        // f32 summation-order difference over up to 224 terms with
+        // cancellation; a wrong nibble order gives O(1) divergence.
+        for (0..m * n) |i| {
+            try testing.expect(std.math.isFinite(c_avx[i]));
+            const denom = @max(@abs(c_ref[i]), 1e-2);
+            try testing.expect(@abs(c_avx[i] - c_ref[i]) / denom < 1e-4);
+        }
+    }
+}
+
+test "MXFP4 nibble order: low nibble is the even weight" {
+    // Direct, independent of the GEMM: one block whose bytes carry distinct
+    // nibble pairs, checked against the spec-level expectation rather than
+    // against another kernel. Low nibble = i, high nibble = (i + 5) & 0xF, so
+    // the two differ for every i (a swap is visible) and both stay inside the
+    // 4-bit range for all 16 bytes (i + 5 & 0xF wraps rather than overflowing).
+    const mxfp4 = kt.gemm_mxfp4;
+    var blk: mxfp4.MXFP4Block = undefined;
+    blk.scale = 127; // 1.0
+    for (&blk.qs) |*b| b.* = 0;
+    for (&blk.qs, 0..) |*b, i| {
+        b.* = @as(u8, @intCast(i)) | (@as(u8, @intCast((i + 5) & 0xF)) << 4);
+    }
+    var w: [32]f32 = undefined;
+    mxfp4.unpackMXFP4(&blk, &w);
+    for (0..16) |i| {
+        const lo = mxfp4.fp4e2m1_to_f32(@truncate(@as(u32, @intCast(i))));
+        const hi = mxfp4.fp4e2m1_to_f32(@truncate(@as(u32, @intCast((i + 5) & 0xF))));
+        try testing.expect(hi != lo); // precondition: the pair is asymmetric
+        try testing.expectEqual(lo, w[i * 2]); // even index <- low nibble
+        try testing.expectEqual(hi, w[i * 2 + 1]); // odd index <- high nibble
+    }
+}
