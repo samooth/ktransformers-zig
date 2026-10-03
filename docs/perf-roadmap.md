@@ -257,6 +257,27 @@ experiment.
 
 ---
 
+### P0.4 — INT4 families · `gemm_224_int4.zig` (+ raw-INT4 / GPTQ-INT4)
+
+**Why:** the reference has three AVX2 INT4 kernels (`rawint4-moe` with 18
+intrinsics, `gptq_int4-moe`, `gptq_int4_avxvnni-moe`) — the most INT4 coverage
+of any family. Zig has one `gemm_224_int4.zig` (GPTQ-style groups of 32 with
+scales+zero-points) and no raw-INT4 kernel.
+
+**What to do.** GPTQ-INT4 is the friendliest: 4-bit values, a scale and a
+zero-point per 32-element group, so it is a `vpshufb` unpack plus an
+`vfmadd` chain with a per-group scale and subtract. Raw-INT4 is the simplest
+(nibble unpack, one global scale). The `_avxvnni` variants need VNNI — out of
+scope on this host, keep the scalar path as the fallback.
+
+**Also:** there is no raw-INT4 kernel in Zig at all. Either add one or record
+deliberately that INT4 covers GPTQ only.
+
+**Acceptance.** Existing INT4 tests (`16x16x32 identity`, partial-group case)
+pass; new GEMM-vs-dequantized-reference test.
+
+---
+
 ### P0.5 — Q8_0 GEMM · `gemm_224_q8_0.zig` — **DONE** (4x at m=1, 13x at m=4/m=8)
 
 Not on the original worklist, and it should have been: **Q8_0 is the GGUF
@@ -295,43 +316,54 @@ plus a separate sweep proving every element of [0,m) x [0,n) is written — the
 scalar version zeroes `c` then accumulates while the vector version assigns
 directly, so they are only equivalent with no uninitialised holes.
 
-### P0.4 — INT4 families · `gemm_224_int4.zig` (+ raw-INT4 / GPTQ-INT4)
+### P1.1 — Finish Q4_K×Q8_0 — **MOOT, superseded (see below)**
 
-**Why:** the reference has three AVX2 INT4 kernels (`rawint4-moe` with 18
-intrinsics, `gptq_int4-moe`, `gptq_int4_avxvnni-moe`) — the most INT4 coverage
-of any family. Zig has one `gemm_224_int4.zig` (GPTQ-style groups of 32 with
-scales+zero-points) and no raw-INT4 kernel.
+**This item is obsolete.** It proposed ~2.4x more on the fused `Q4_K x Q8_0`
+kernel, all three costs being properties of *that* kernel's structure. The
+fused kernel has since been removed from the inference path entirely, because
+the generic AVX2 K-quant driver (P0.1) turned out to be **3.3x faster than the
+fused kernel** on the decode shape — not 1.24x, which is the number this item
+assumed.
 
-**What to do.** GPTQ-INT4 is the friendliest: 4-bit values, a scale and a
-zero-point per 32-element group, so it is a `vpshufb` unpack plus an
-`vfmadd` chain with a per-group scale and subtract. Raw-INT4 is the simplest
-(nibble unpack, one global scale). The `_avxvnni` variants need VNNI — out of
-scope on this host, keep the scalar path as the fallback.
+Measured at m=1, n=2048, k=7168, pinned, three cores, same weights:
 
-**Also:** there is no raw-INT4 kernel in Zig at all. Either add one or record
-deliberately that INT4 covers GPTQ only.
+| path | time | bandwidth |
+|---|---|---|
+| fused Q8_0 (skips the activation dequant) | 5727 / 5775 / 5858 us | 1 GB/s |
+| dequant (4 us) + generic bf16 driver | 1778 / 1787 / 1758 us | **4 GB/s** |
 
-**Acceptance.** Existing INT4 tests (`16x16x32 identity`, partial-group case)
-pass; new GEMM-vs-dequantized-reference test.
+The dequant that the fused path avoids costs 4 us — 0.2% of the fused path's own
+runtime — so the generic driver wins by 3.3x while doing strictly more work.
+Optimizing the fused kernel further would have optimized the wrong kernel.
 
----
+Two consequences worth keeping:
 
-### P1.1 — Finish Q4_K×Q8_0 (another ~2.4x available)
+1. **The numerics changed, deliberately.** The fused arm skipped the BF16
+   activation intermediate and was ~0.2% per activation more accurate. It was
+   also the only format in `LlamaMoe` with that advantage — Q8_0, the other five
+   K-quants and the nine IQ formats all dequantize activations to BF16 — so Q4_K
+   is now consistent with its siblings instead of being the outlier.
+2. **A test asserted a falsehood and hid it.** `llamafile_moe_capi_tests`
+   claimed the BF16 round-trip was "exact for Q8_0" and compared the BF16 path
+   against an F32 reference under a 1e-2 bound. It passed only because the
+   fused arm was what ran. `dequantQ8_0ToBF16` is `f32_to_bf16(a_q * a_d)`, and
+   while `a_q` (8-bit) is exact in bf16 the f16 scale `d` has an 11-bit
+   significand against bf16's 8, so ~3 low bits are lost. The reference now
+   models both BF16 activation round-trips, restoring the ~1e-5 agreement the
+   test always meant to assert:
 
-Currently 14% of ceiling. Three known costs, in order of size:
+   | comparison | rel error |
+   |---|---|
+   | fused vs F32 reference | 6.2e-6 (what it asserted) |
+   | bf16 driver vs F32 reference | 7.8e-2 (fails the bound) |
+   | bf16 driver vs F32 ref, bf16 rounding modelled | 9.5e-6 |
 
-1. **`dot_1` is recomputed for every output column.** It is the sum of the
-   activations and does not depend on `j` at all — at n=2048 that is 2048x
-   redundant work. Fix by restructuring to outer loop over
-   (i, super-block, group) with `j` innermost, which turns weight access into a
-   constant-stride walk that the prefetcher handles. Alternative: a small
-   per-row scratch of `m * (k/64) * 2` floats.
-2. **The four `@reduce(.Add)` horizontal reductions per 64 weights dominate.**
-   Accumulate at `@Vector(32, f32)` across a whole super-block and reduce once,
-   or restructure so the nibble halves share an accumulator before reduction.
-3. **`getScaleMinK4` and `f16_to_f32` are scalar with a branch** — 8 + 4 calls
-   per super-block. Hoist the scale unpack: all 8 (sc, m) pairs can be
-   extracted once per super-block into scalars.
+`gemmQ4KxQ8_0` / `gemmQ4KxQ8_0Scalar` still exist, correct and tested, as the
+readable statement of the fused formulation and a reference for their tests.
+Deleting them plus their 4 tests is an open call.
+
+**What would still be worth doing** is the activation dequant itself, which now
+sits in front of all 16 formats (see P1.2).
 
 ---
 
