@@ -1243,3 +1243,177 @@ test "IQ4_NL AVX2 GEMM == the scalar oracle, and the split-half order is right" 
         }
     }
 }
+
+test "K-quant AVX2 GEMMs: shape sweep over m tails, n=1 and group counts" {
+    // The six per-format equivalence tests all use ONE shape (m=5, n=3, three
+    // super-blocks). That covers the m tail (5 % MR = 1) but nothing else: no
+    // n=1, no m below MR, and only one group count. Since all six formats share
+    // `kquant_simd.gemmBF16xQuant`, a tail bug in the driver would show up in
+    // every format at once, so a shape sweep is worth more here than another
+    // format would be.
+    //
+    // Shapes chosen to hit: m < MR (1,2,3), m == MR (4), m just over MR (5),
+    // m a multiple of MR (8), n = 1, and 1 / 2 / 7 groups. K = QK * groups so a
+    // group count of 0 is impossible — a vacuous case is how the IQ bug hid.
+    const Shape = struct { m: usize, n: usize, groups: usize };
+    const shapes = [_]Shape{
+        .{ .m = 1, .n = 1, .groups = 1 },
+        .{ .m = 2, .n = 3, .groups = 1 },
+        .{ .m = 3, .n = 1, .groups = 2 },
+        .{ .m = 4, .n = 5, .groups = 1 },
+        .{ .m = 5, .n = 1, .groups = 3 },
+        .{ .m = 8, .n = 4, .groups = 2 },
+        .{ .m = 1, .n = 7, .groups = 7 },
+        .{ .m = 3, .n = 2, .groups = 5 },
+    };
+
+    const Case = struct {
+        name: []const u8,
+        blk_bytes: usize,
+        qk: usize,
+        gemm_vec: *const fn ([*]const amx.bf16, usize, [*]const u8, usize, [*]f32, usize, usize, usize, usize) void,
+        gemm_scalar: *const fn ([*]const amx.bf16, usize, [*]const u8, usize, [*]f32, usize, usize, usize, usize) void,
+    };
+    const cases = [_]Case{
+        .{
+            .name = "Q2_K",
+            .blk_bytes = @sizeOf(q2_k.BlockQ2_K),
+            .qk = q2_k.QK_K,
+            .gemm_vec = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q2_k.gemmQ2_K(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+            .gemm_scalar = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q2_k.gemmQ2_KScalar(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+        },
+        .{
+            .name = "Q3_K",
+            .blk_bytes = @sizeOf(q3_k.BlockQ3_K),
+            .qk = q3_k.QK_K,
+            .gemm_vec = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q3_k.gemmQ3_K(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+            .gemm_scalar = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q3_k.gemmQ3_KScalar(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+        },
+        .{
+            .name = "Q4_K",
+            .blk_bytes = @sizeOf(q4_k.BlockQ4_K),
+            .qk = q4_k.QK_K,
+            .gemm_vec = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q4_k.gemmQ4_K(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+            .gemm_scalar = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q4_k.gemmQ4_KScalar(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+        },
+        .{
+            .name = "Q5_K",
+            .blk_bytes = @sizeOf(q5_k.BlockQ5_K),
+            .qk = q5_k.QK_K,
+            .gemm_vec = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q5_k.gemmQ5_K(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+            .gemm_scalar = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q5_k.gemmQ5_KScalar(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+        },
+        .{
+            .name = "Q6_K",
+            .blk_bytes = @sizeOf(q6_k.BlockQ6_K),
+            .qk = q6_k.QK_K,
+            .gemm_vec = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q6_k.gemmQ6_K(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+            .gemm_scalar = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q6_k.gemmQ6_KScalar(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+        },
+        .{
+            .name = "Q8_K",
+            .blk_bytes = @sizeOf(q8_k.BlockQ8_K),
+            .qk = q8_k.QK_K,
+            .gemm_vec = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q8_k.gemmQ8_K(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+            .gemm_scalar = struct {
+                fn f(a: [*]const amx.bf16, lda: usize, b: [*]const u8, ldb: usize, c: [*]f32, ldc: usize, m: usize, n: usize, k: usize) void {
+                    q8_k.gemmQ8_KScalar(a, lda, @ptrCast(@alignCast(b)), ldb, c, ldc, m, n, k);
+                }
+            }.f,
+        },
+    };
+
+    inline for (cases) |cs| {
+        var state: u64 = 0xA5A5_1234 ^ @as(u64, cs.qk);
+        for (shapes) |sh| {
+            const k = cs.qk * sh.groups;
+            const nb = sh.groups;
+            // Precondition, asserted rather than assumed: a zero group count
+            // would make the whole case vacuous, which is how the IQ block
+            // offset bug survived a fully "covered" suite.
+            try testing.expect(nb > 0);
+
+            const a = try testing.allocator.alloc(amx.bf16, sh.m * k);
+            defer testing.allocator.free(a);
+            for (0..sh.m * k) |i| a[i] = amx.f32_to_bf16(rnd(&state, 64, 2.0));
+
+            const wbytes = try testing.allocator.alloc(u8, sh.n * nb * cs.blk_bytes);
+            defer testing.allocator.free(wbytes);
+            for (0..sh.n * nb * cs.blk_bytes) |i| {
+                state = state *% 6364136223846793005 +% 1442695040888963407;
+                wbytes[i] = @truncate(state >> 24);
+            }
+
+            const c_vec = try testing.allocator.alloc(f32, sh.m * sh.n);
+            defer testing.allocator.free(c_vec);
+            const c_sca = try testing.allocator.alloc(f32, sh.m * sh.n);
+            defer testing.allocator.free(c_sca);
+            @memset(c_vec, std.math.nan(f32));
+            @memset(c_sca, std.math.nan(f32));
+
+            cs.gemm_vec(a.ptr, k, wbytes.ptr, nb, c_vec.ptr, sh.n, sh.m, sh.n, k);
+            cs.gemm_scalar(a.ptr, k, wbytes.ptr, nb, c_sca.ptr, sh.n, sh.m, sh.n, k);
+
+            for (0..sh.m * sh.n) |i| {
+                const g = c_vec[i];
+                const s = c_sca[i];
+                // Random bytes can decode to a NaN scale in some formats, so
+                // agreement on WHICH outputs are non-finite is the assertion,
+                // not that all are finite.
+                if (std.math.isNan(s)) {
+                    try testing.expect(std.math.isNan(g));
+                } else if (std.math.isInf(s)) {
+                    try testing.expectEqual(std.math.isInf(g), std.math.isInf(s));
+                } else {
+                    try testing.expect(std.math.isFinite(g));
+                    const denom = @max(@abs(s), 1e-2);
+                    try testing.expect(@abs(g - s) / denom < 1e-3);
+                }
+            }
+        }
+    }
+}
