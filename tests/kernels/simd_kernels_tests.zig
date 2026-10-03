@@ -492,3 +492,212 @@ test "swiglu vector path still matches the scalar path" {
         try testing.expectApproxEqAbs(amx.swiglu_oai(gate[l], up[l], 1.5, 0.5), go[l], 1e-5);
     }
 }
+
+// ============================================================================
+// K-quant GEMMs (AVX2 path): the invariant is `fused == dequantizeRow + dot`
+// ============================================================================
+//
+// One test body, six format instantiations. The invariant contains NO
+// approximation: `dequantizeRowQ*_K` + an f32 dot product is the definition of
+// the kernel, so any disagreement is a bug in the vector path (a swapped
+// nibble, a wrong scale index, a lane permutation). It is also the only
+// invariant that can see those bugs: the older constant-weight tests cannot,
+// because a constant weight row is invariant under a permuted lane mapping.
+//
+// Why this lives here and not in the kernel files: `test` blocks inside
+// src/kernels/amx/gemm_224_q*_k.zig are NOT executed by `zig build test` —
+// they sit behind the `kt` module boundary, so Zig collects tests only from
+// the root file's own module. tests/kernels/test_kernels.zig therefore holds
+// its own copies of the per-format K-quant tests (148 of them). Keep the
+// vectorized-GEMM coverage here, next to the other SIMD kernels.
+
+const q2_k = kt.gemm_q2_k;
+const q3_k = kt.gemm_q3_k;
+const q4_k = kt.gemm_q4_k;
+const q5_k = kt.gemm_q5_k;
+const q6_k = kt.gemm_q6_k;
+const q8_k = kt.gemm_q8_k;
+
+const KQ = struct {
+    /// deterministic splitmix64, matching bench/kquant_bench.zig's data
+    fn rand(state: *u64) u32 {
+        var z = state.* +% 0x9E3779B97F4A7C15;
+        state.* = z;
+        z = (z ^ (z >> 30)) *% 0xBF58476D1CE4E5B9;
+        z = (z ^ (z >> 27)) *% 0x94D049BB133111EB;
+        return @truncate(z ^ (z >> 31));
+    }
+
+    /// Fuzz the per-super-block scale/min fields with a NON-UNIFORM pattern.
+    /// A uniform scale would make the whole block look right even if the
+    /// kernel indexed the scale array wrongly (and the reverse: real
+    /// quantizers produce near-uniform scales within a super-block, which is
+    /// exactly why the old tests could not see it).
+    fn vary8K(blk: *q8_k.BlockQ8_K, state: *u64) void {
+        blk.d = @as(f32, @floatFromInt(@as(i32, @intCast(rand(state) % 9)) + 1)) * 0.015625;
+    }
+    fn vary6K(blk: *q6_k.BlockQ6_K, state: *u64) void {
+        for (&blk.scales) |*s| s.* = @intCast(@as(i32, @intCast(rand(state) % 121)) - 60);
+        blk.d = q6_k.f32_to_f16(@as(f32, @floatFromInt(@as(i32, @intCast(rand(state) % 7)) + 1)) * 0.015625);
+    }
+    fn vary5K(blk: *q5_k.BlockQ5_K, state: *u64) void {
+        for (&blk.scales) |*s| s.* = @truncate(rand(state));
+        for (&blk.qh) |*h| h.* = @truncate(rand(state));
+        blk.d = q5_k.f32_to_f16(@as(f32, @floatFromInt(@as(i32, @intCast(rand(state) % 7)) + 1)) * 0.015625);
+        blk.dmin = q5_k.f32_to_f16(@as(f32, @floatFromInt(@as(i32, @intCast(rand(state) % 5)) + 1)) * 0.03125);
+    }
+    fn vary4K(blk: *q4_k.BlockQ4_K, state: *u64) void {
+        for (&blk.scales) |*s| s.* = @truncate(rand(state));
+        blk.d = q4_k.f32_to_f16(@as(f32, @floatFromInt(@as(i32, @intCast(rand(state) % 7)) + 1)) * 0.015625);
+        blk.dmin = q4_k.f32_to_f16(@as(f32, @floatFromInt(@as(i32, @intCast(rand(state) % 5)) + 1)) * 0.03125);
+    }
+    fn vary3K(blk: *q3_k.BlockQ3_K, state: *u64) void {
+        for (&blk.scales) |*s| s.* = @truncate(rand(state));
+        for (&blk.hmask) |*h| h.* = @truncate(rand(state));
+        blk.d = q3_k.f32_to_f16(@as(f32, @floatFromInt(@as(i32, @intCast(rand(state) % 7)) + 1)) * 0.015625);
+    }
+    fn vary2K(blk: *q2_k.BlockQ2_K, state: *u64) void {
+        for (&blk.scales) |*s| s.* = @truncate(rand(state));
+        blk.d = q2_k.f32_to_f16(@as(f32, @floatFromInt(@as(i32, @intCast(rand(state) % 7)) + 1)) * 0.015625);
+        blk.dmin = q2_k.f32_to_f16(@as(f32, @floatFromInt(@as(i32, @intCast(rand(state) % 5)) + 1)) * 0.03125);
+    }
+
+    /// The one test body. `M` covers 1 (the LlamaMoe decode path, which never
+    /// fills the MR=4 tile), 4 (exactly one tile) and 5 (tile + row tail);
+    /// `KB = 3` super-blocks cover k accumulation across block boundaries.
+    fn check(
+        comptime block: type,
+        comptime QK: usize,
+        comptime dequant: fn ([*]const block, []f32, usize) void,
+        comptime quantize: fn (src: []const f32, dst: [*]block, k: usize) void,
+        comptime vary: fn (*block, *u64) void,
+        comptime gemm_scalar: fn ([*]const amx.bf16, usize, [*]const block, usize, [*]f32, usize, usize, usize, usize) void,
+        comptime gemm_vec: fn ([*]const amx.bf16, usize, [*]const block, usize, [*]f32, usize, usize, usize, usize) void,
+    ) !void {
+        const N: usize = 3;
+        const KB: usize = 3;
+        const K: usize = QK * KB;
+        var state: u64 = 0x243F6A8885A308D3;
+
+        const alloc = testing.allocator;
+        const a = try alloc.alloc(amx.bf16, 5 * K);
+        defer alloc.free(a);
+        const b = try alloc.alloc(block, N * KB);
+        defer alloc.free(b);
+        const got = try alloc.alloc(f32, 5 * N);
+        defer alloc.free(got);
+        const scal = try alloc.alloc(f32, 5 * N);
+        defer alloc.free(scal);
+        const w = try alloc.alloc(f32, K);
+        defer alloc.free(w);
+
+        // Activations: mixed sign and magnitude, bf16-rounded.
+        for (a) |*v| {
+            v.* = amx.f32_to_bf16(@as(f32, @floatFromInt(@as(i32, @intCast(rand(&state) % 17)) - 8)) * 0.125);
+        }
+        // Weights: quantized from varied data so every plane/scale field is
+        // populated, then the scale fields are fuzzed (see `vary`).
+        var src: [QK]f32 = undefined;
+        for (0..N) |j| {
+            for (0..KB) |sb| {
+                for (&src) |*v| {
+                    v.* = @as(f32, @floatFromInt(@as(i32, @intCast(rand(&state) % 23)) - 11)) * 0.0625;
+                }
+                quantize(&src, @ptrCast(&b[j * KB + sb]), QK);
+                vary(&b[j * KB + sb], &state);
+            }
+        }
+
+        for ([_]usize{ 1, 4, 5 }) |m| {
+            gemm_vec(a.ptr, K, b.ptr, KB, got.ptr, N, m, N, K);
+            gemm_scalar(a.ptr, K, b.ptr, KB, scal.ptr, N, m, N, K);
+            for (0..m) |i| {
+                for (0..N) |j| {
+                    dequant(@ptrCast(&b[j * KB]), w, K);
+                    var expect: f32 = 0;
+                    var mag: f32 = 0; // sum |a*w| — cancellation-safe scale
+                    for (0..K) |t| {
+                        const p = amx.bf16_to_f32(a[i * K + t]) * w[t];
+                        expect += p;
+                        mag += @abs(p);
+                    }
+                    const tol = 1e-5 * mag + 1e-6;
+                    try testing.expect(@abs(got[i * N + j] - expect) <= tol);
+                    try testing.expect(@abs(scal[i * N + j] - expect) <= tol);
+                }
+            }
+        }
+    }
+};
+
+test "K-quant AVX2 GEMMs == dequantize + dot (Q8_K)" {
+    try KQ.check(
+        q8_k.BlockQ8_K,
+        q8_k.QK_K,
+        q8_k.dequantizeRowQ8_K,
+        q8_k.quantizeRowQ8_K,
+        KQ.vary8K,
+        q8_k.gemmQ8_KScalar,
+        q8_k.gemmQ8_K,
+    );
+}
+
+test "K-quant AVX2 GEMMs == dequantize + dot (Q6_K)" {
+    try KQ.check(
+        q6_k.BlockQ6_K,
+        q6_k.QK_K,
+        q6_k.dequantizeRowQ6_K,
+        q6_k.quantizeRowQ6_K,
+        KQ.vary6K,
+        q6_k.gemmQ6_KScalar,
+        q6_k.gemmQ6_K,
+    );
+}
+
+test "K-quant AVX2 GEMMs == dequantize + dot (Q5_K)" {
+    try KQ.check(
+        q5_k.BlockQ5_K,
+        q5_k.QK_K,
+        q5_k.dequantizeRowQ5_K,
+        q5_k.quantizeRowQ5_K,
+        KQ.vary5K,
+        q5_k.gemmQ5_KScalar,
+        q5_k.gemmQ5_K,
+    );
+}
+
+test "K-quant AVX2 GEMMs == dequantize + dot (Q4_K)" {
+    try KQ.check(
+        q4_k.BlockQ4_K,
+        q4_k.QK_K,
+        q4_k.dequantizeRowQ4_K,
+        q4_k.quantizeRowQ4_K,
+        KQ.vary4K,
+        q4_k.gemmQ4_KScalar,
+        q4_k.gemmQ4_K,
+    );
+}
+
+test "K-quant AVX2 GEMMs == dequantize + dot (Q3_K)" {
+    try KQ.check(
+        q3_k.BlockQ3_K,
+        q3_k.QK_K,
+        q3_k.dequantizeRowQ3_K,
+        q3_k.quantizeRowQ3_K,
+        KQ.vary3K,
+        q3_k.gemmQ3_KScalar,
+        q3_k.gemmQ3_K,
+    );
+}
+
+test "K-quant AVX2 GEMMs == dequantize + dot (Q2_K)" {
+    try KQ.check(
+        q2_k.BlockQ2_K,
+        q2_k.QK_K,
+        q2_k.dequantizeRowQ2_K,
+        q2_k.quantizeRowQ2_K,
+        KQ.vary2K,
+        q2_k.gemmQ2_KScalar,
+        q2_k.gemmQ2_K,
+    );
+}
