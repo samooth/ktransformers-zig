@@ -66,8 +66,9 @@ src/
 │   ├── arch/amx.zig            # AMX inline asm + detectAmxSupport runtime guard (A2)
 │   │                           # + VecF32 helpers (swigluVec, reduceAddFp32)
 │   ├── arch/neon.zig           # ARM NEON comptime gate (aarch64 cross-build)
-│   ├── amx/{buffers,gemm_224_{bf16,int8,int4,fp8,q8_0,q4_k,q5_k,q6_k,q8_k,mxfp4,mxfp8,
-│          q2_k,q3_k,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_xs,iq4_nl,iq1_s,iq1_m}}.zig
+│   ├── amx/{buffers,kquant_simd,gemm_224_{bf16,int8,int4,fp8,q8_0,q4_k,q5_k,q6_k,q8_k,
+│          mxfp4,mxfp8,q2_k,q3_k,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_xs,iq4_nl,
+│          iq1_s,iq1_m}}.zig
 │   │                          # + iq2xs_init/iq3xs_init (kmap/kneighbors, histogram+cached)
 │   └── moe/{moe,llamafile_moe}.zig
 │                               # TpMoe: routing (legacy + DeepSeek-V3 group-top2, D4),
@@ -151,8 +152,9 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
   fully revived (NumaTopology.detect + allocNuma + getThreadAffinity
   work byte-exact; getThreadAffinity bug fixed in route — kernel
   returns bytes-copied, not errno).
-- Tests: **226 across the suites, 0 leaks** (137 in the kernels suite
-  incl. all 15 GGML formats + the 16-arm gemmQuant dispatch sweep; 11
+- Tests: **251 across the suites, 0 leaks** (148 in the kernels suite
+  incl. all 15 GGML formats + the 16-arm gemmQuant dispatch sweep; 23
+  SIMD/suite-6f incl. the 6 K-quant AVX2 GEMM equivalence tests; 11
   MLA + 4+3 MLA C-API + 2 FP8 + 9 GGML C API + 7 aarch64 + NEON +
   allocator + Qwen3 + Qwen3 C-API + GGUF e2e + to/from_float + 3
   LlamaMoe C-API incl. the KT_TYPE ABI audit + K_BLOCK runtime + 6 math-helpers (swiglu 3 variants/rms_norm/rope/softmax, numerics-pinned)). Bench:
@@ -253,7 +255,18 @@ the feature set comes from the native target. `zig build -Dtarget=x86_64-linux-g
 "Building variant: avx2".
 
 Tests for all of the above live in `tests/kernels/simd_kernels_tests.zig`
-(kept separate from `test_kernels.zig`).
+(kept separate from `test_kernels.zig`) — which is also the ONLY place a new
+kernel test can go: a `test` block inside a file belonging to the `kt` module
+is never executed by `zig build test` (Zig collects tests from the root file's
+module), which is how two broken copies hid in `gemm_224_q{3,6}_k.zig`.
+
+**The six GGML K-quants have the same treatment** (`kquant_simd.zig`: one
+comptime-parameterized AVX2 driver, `gemmQ*_K` beside each `gemmQ*_KScalar`,
+6.2x–16.1x measured, wired into `gemmQuant` + `kt_matmul_q{4,5,6,8}_k`). The
+scalar versions are kept deliberately: they are the readable statement of each
+format's math and the reference the new tests compare against. Note their
+`test` blocks are dead (module boundary) — the live K-quant GEMM tests are in
+`tests/kernels/simd_kernels_tests.zig`.
 
 **Next performance work is in `docs/perf-roadmap.md`.** Short version: BF16
 GEMM is won (1.24-3.23x), but every *quantized* family is still scalar on
@@ -339,6 +352,8 @@ rules.toml edit, that's what happened.
 - `docs/perf-roadmap.md` — **read before any kernel work.** Per-operator list of
   what is still scalar, measured headroom, the four rules that make kernels
   fast here, acceptance criteria, and the parallel-work rules
+- `docs/perf-task-prompts.md` — the same items pre-packaged as copy-paste
+  prompts, for handing a stream to another dev
 - `docs/porting-guide.md` — C++ → Zig porting patterns
 
 
