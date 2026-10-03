@@ -1,6 +1,6 @@
 # ktransformers-zig TODO
 
-## Status: Beta (15/15 GGML formats + 263 tests; SIMD at/above C++ parity)
+## Status: Beta (15/15 GGML formats + 264 tests; SIMD at/above C++ parity)
 
 Last updated: 2026-10-03
 
@@ -17,7 +17,7 @@ and the reasoning, not who or what typed it. Commit messages carry no
 attribution trailers of any kind.
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
-**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels + the six K-quant AVX2 GEMMs) = **263 total pass across 18 suites, 0 leaks, exit 0**.
+**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels + the six K-quant AVX2 GEMMs) = **264 total pass across 18 suites, 0 leaks, exit 0**.
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon (8 installed names), each exporting **112 C API symbols** (triple-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). Runs in CI (`wheels.yml` `abi-gate` job).
 **Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
 **Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
@@ -197,7 +197,7 @@ new functions would never be emitted into the .so.
 Tests: 6 new, in `tests/kernels/simd_kernels_tests.zig`, one per format,
 `fused == dequantizeRow + f32 dot` (no approximation) with deliberately
 non-uniform per-group scales, at m ∈ {1, 4, 5} and 3 super-blocks, plus the
-scalar path on the same assertion. Suite total 263 across 18 suites, `zig build test` exit 0.
+scalar path on the same assertion. Suite total 264 across 18 suites, `zig build test` exit 0.
 Also here: `gemmQ4_KScalar` (the BF16-activation Q4_K entry, i.e. Stream A's
 remaining item) got the same treatment and is now dispatched too.
 
@@ -514,6 +514,44 @@ Two smaller things found while writing the tests:
 unblocked. Structure looks favourable: 32-weight groups with a per-group scale,
 structurally the same as Q8_0/MXFP4, so a `kquant_simd`-style shared driver with
 a per-format comptime `Cfg` is the likely shape.
+
+**Stream H — IQ4_NL GEMM. DONE (3x at m=1, 10x at m=4). CLAIMED (iq4nl-avx2)
+since 2026-10-03.** First of the nine IQ formats to get the four-rule treatment.
+
+| m | scalar | avx2 | speedup |
+|---|---|---|---|
+| 1 | 18 ms | 4 ms | 3x |
+| 4 | 73 ms | 7 ms | 10x |
+| 8 | 144 ms | 14 ms | 9x |
+
+at n=2048, k=7168, pinned, ReleaseFast, best of 5. The win exceeds the SIMD
+alone because `gemmIQ4_NLScalar` dequantizes every block into a 32-float
+`scratch` and only then does 32 scalar MACs; the vector path never materializes
+dequantized weights at all. The `gemmQuant` `KT_TYPE_IQ4_NL` arm now dispatches
+to `gemmAvx2`.
+
+**IQ4_NL is SPLIT-HALF, the opposite of MXFP4.** `dequantizeRowIQ4_NL` puts the
+low nibbles of all 16 bytes at weights 0..15 and the high nibbles at 16..31:
+
+```
+y[j]      = d * kvalues[qs[j] & 0xf]      j = 0..15
+y[j + 16] = d * kvalues[qs[j] >> 4]       j = 0..15
+```
+
+MXFP4 instead has byte i supplying weights 2i and 2i+1. Reusing the MXFP4 unpack
+here would permute every weight while leaving the magnitudes plausible, so the
+order is asserted **directly** in the test (checking `dequantizeRowIQ4_NL`
+against the `KVALUES` table at known indices) as well as through the oracle
+comparison. This is the second time in this session that a copy-adapted unpack
+was the hazard — the first was MXFP4's low-nibble-first order.
+
+Disassembly of `gemm_224_iq4_nl.gemmAvx2` (594 insns): 20 `vfmadd`, 91 `ymm`,
+only 5 horizontal reduces. **Zero `vpshufb`** — the 16-entry `KVALUES` lookup is
+8 scalar table reads per vector, the same pattern as the MX kernels, so the m=1
+case is lookup-bound in the same way (4 ms for 8.3 MB = 2.1 GB/s, against
+Q8_0's table-free 7.8 GB/s). `vpshufb` would be the natural fix since the table
+is 16 bytes and `vpshufb` is exactly a 16-entry byte shuffle, but it needs
+inline asm.
 
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
 

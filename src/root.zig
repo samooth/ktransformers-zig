@@ -120,7 +120,8 @@ comptime {
     _ = &gemm_iq4_nl.f16_to_f32;
     _ = &gemm_iq4_nl.dequantizeRowIQ4_NL;
     _ = &gemm_iq4_nl.dequantizeRowIQ4_NLToBF16;
-    _ = &gemm_iq4_nl.gemmIQ4_NLScalar;
+    _ = &gemm_iq4_nl.gemmIQ4_NLScalar; // oracle
+    _ = &gemm_iq4_nl.gemmAvx2;
     _ = &gemm_iq2_xxs.BlockIQ2_XXS;
     _ = &gemm_iq2_xxs.IQ2XXS_GRID;
     _ = &gemm_iq2_xxs.KSIGNS_IQ2XS;

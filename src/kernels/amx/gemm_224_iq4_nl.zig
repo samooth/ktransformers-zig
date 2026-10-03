@@ -106,6 +106,113 @@ pub fn dequantizeRowIQ4_NLToBF16(x: [*]const BlockIQ4_NL, y: [*]amx.bf16, k: usi
 // scalar GEMM: BF16 activations × IQ4_NL weights -> F32 output
 // ============================================================================
 
+// ============================================================================
+// AVX2 GEMM
+// ============================================================================
+//
+// Same four rules as `kquant_simd.gemmBF16xQuant`, Q8_0 and the MX kernels:
+// n-outer so the weight block streams from DRAM once, MR=4 so four activation
+// rows share one unpacked weight vector, explicit `@mulAdd` because FP
+// contraction is off in this toolchain, and one `@reduce` per output element.
+//
+// The win here is larger than the SIMD alone suggests, because
+// `gemmIQ4_NLScalar` dequantizes every block into a 32-float `scratch` array
+// and only then does 32 scalar MACs. The vector path never materializes the
+// dequantized weights at all.
+//
+// LAYOUT WARNING — IQ4_NL is SPLIT-HALF, not interleaved. `dequantizeRow` puts
+// the LOW nibbles of all 16 bytes at weights 0..15 and the HIGH nibbles at
+// weights 16..31:
+//
+//   y[j]      = d * kvalues[qs[j] & 0xf]      j = 0..15
+//   y[j + 16] = d * kvalues[qs[j] >> 4]       j = 0..15
+//
+// This is the opposite of MXFP4, where byte i supplies weights 2i and 2i+1.
+// Copying the MXFP4 unpack here would silently permute every weight.
+
+const MR: usize = 4;
+const Vec: type = @Vector(8, f32);
+
+/// 8 bf16 -> 8 f32, unaligned.
+inline fn widen8(p: [*]const amx.bf16) Vec {
+    const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+    return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+}
+
+/// 8 nibbles out of 8 consecutive bytes -> 8 f32 via the shared non-linear
+/// i8 table. `shift` is 0 for the low nibbles (weights 0..15) and 4 for the
+/// high ones (weights 16..31).
+inline fn kvalues8(p: *const u8, comptime shift: u4) Vec {
+    // One 8-byte load, then the nibble extracts read out of the register.
+    // `*align(1)` because the caller's `&q[bh * 8]` sits at an odd offset.
+    const raw: @Vector(8, u8) = @as(*align(1) const @Vector(8, u8), @ptrCast(p)).*;
+    var out: [8]f32 = undefined;
+    if (shift == 0) {
+        inline for (0..8) |i| out[i] = @floatFromInt(gemm_iq4_xs.KVALUES_IQ4NL[raw[i] & 0xF]);
+    } else {
+        inline for (0..8) |i| out[i] = @floatFromInt(gemm_iq4_xs.KVALUES_IQ4NL[raw[i] >> 4]);
+    }
+    return out;
+}
+
+/// AVX2 IQ4_NL GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
+/// `k` must be a multiple of QK4_NL, as for the scalar version.
+pub fn gemmAvx2(
+    a: [*]const amx.bf16,
+    b: [*]const BlockIQ4_NL,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    const nb = k / QK4_NL;
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        const brow = b + j * ldb;
+
+        var i: usize = 0;
+        while (i + MR <= m) : (i += MR) {
+            var acc = [_]Vec{@splat(0.0)} ** MR;
+            for (0..nb) |blk| {
+                const dv: Vec = @splat(f16_to_f32(brow[blk].d));
+                const q = &brow[blk].qs;
+                const ab = blk * QK4_NL;
+                // 2 byte-halves x 2 nibble-halves = 4 Vec8 = 32 weights.
+                inline for (0..2) |bh| {
+                    inline for (0..2) |nh| {
+                        const voff = bh * 8 + nh * 16;
+                        const w = kvalues8(&q[bh * 8], if (nh == 0) 0 else 4) * dv;
+                        inline for (0..MR) |r| {
+                            acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + ab + voff), w, acc[r]);
+                        }
+                    }
+                }
+            }
+            inline for (0..MR) |r| c[(i + r) * ldc + j] = @reduce(.Add, acc[r]);
+        }
+
+        // Row tail (m % MR), one row at a time.
+        while (i < m) : (i += 1) {
+            var acc: Vec = @splat(0.0);
+            for (0..nb) |blk| {
+                const dv: Vec = @splat(f16_to_f32(brow[blk].d));
+                const q = &brow[blk].qs;
+                const ab = blk * QK4_NL;
+                inline for (0..2) |bh| {
+                    inline for (0..2) |nh| {
+                        const voff = bh * 8 + nh * 16;
+                        acc = @mulAdd(Vec, widen8(a + i * lda + ab + voff), kvalues8(&q[bh * 8], if (nh == 0) 0 else 4) * dv, acc);
+                    }
+                }
+            }
+            c[i * ldc + j] = @reduce(.Add, acc);
+        }
+    }
+}
+
 pub fn gemmIQ4_NLScalar(
     input: [*]const amx.bf16, // [m, k] BF16 row-major
     weight: [*]const BlockIQ4_NL, // [n, k/QK4_NL] row-major (1 block = 32 weights)

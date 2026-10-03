@@ -1176,3 +1176,70 @@ test "IQ1_M scalar GEMM honours the block offset at k > one group" {
         }
     }
 }
+
+test "IQ4_NL AVX2 GEMM == the scalar oracle, and the split-half order is right" {
+    // Two things pinned. The oracle comparison, and the SPLIT-HALF nibble
+    // order: `dequantizeRowIQ4_NL` puts the low nibbles of all 16 bytes at
+    // weights 0..15 and the high nibbles at 16..31, the opposite of MXFP4's
+    // interleaving. A permuted unpack still yields plausible magnitudes, so the
+    // order is asserted directly rather than left to the oracle.
+    const g = kt.gemm_iq4_nl;
+    var seed: u64 = 0x1C4E_5EED;
+
+    // Direct order check, independent of the GEMM.
+    {
+        var blk: g.BlockIQ4_NL = undefined;
+        blk.d = @bitCast(@as(f16, 1.0));
+        // byte j: low nibble = j+1, high nibble = j+1 (both valid 1..15 range
+        // shifted); use distinct pairs so a swap is visible.
+        for (&blk.qs, 0..) |*b, j| {
+            b.* = @as(u8, @intCast(j)) | (@as(u8, @intCast(15 - j)) << 4);
+        }
+        var w: [g.QK4_NL]f32 = undefined;
+        g.dequantizeRowIQ4_NL(@as([*]const g.BlockIQ4_NL, @ptrCast(&blk)), w[0..], g.QK4_NL);
+        const kv = kt.gemm_iq4_xs.KVALUES_IQ4NL;
+        for (0..16) |j| {
+            // weights 0..15 <- LOW nibbles
+            try testing.expectEqual(@as(f32, @floatFromInt(kv[j])), w[j]);
+            // weights 16..31 <- HIGH nibbles
+            try testing.expectEqual(@as(f32, @floatFromInt(kv[15 - j])), w[j + 16]);
+        }
+    }
+
+    // Oracle comparison. k spans 1..8 groups so the block offset matters.
+    for ([_]usize{ 1, 2, 4, 8 }) |groups| {
+        const k = groups * g.QK4_NL;
+        const nb = groups;
+        const m: usize = 5; // m % MR != 0, so the row tail runs
+        const n: usize = 7;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 256, 4.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ4_NL, n * nb);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = @bitCast(@as(f16, 0.02));
+            for (&blk.qs) |*q| {
+                seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                q.* = @truncate(seed >> 24);
+            }
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        g.gemmAvx2(a.ptr, w.ptr, c_avx.ptr, m, n, k, k, nb, n);
+        g.gemmIQ4_NLScalar(a.ptr, w.ptr, c_ref.ptr, m, n, k, k, nb, n);
+
+        for (0..m * n) |i| {
+            try testing.expect(std.math.isFinite(c_avx[i]));
+            const denom = @max(@abs(c_ref[i]), 1e-2);
+            try testing.expect(@abs(c_avx[i] - c_ref[i]) / denom < 1e-3);
+        }
+    }
+}
