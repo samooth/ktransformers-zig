@@ -355,6 +355,87 @@ pub fn gemmQ5_KScalar(
 }
 
 // ============================================================================
+// AVX2 GEMM (BF16 activations x Q5_K weights -> F32)
+// ============================================================================
+//
+// Same math as `gemmQ5_KScalar` above (kept as the readable statement of the
+// math the tests pin against `dequantizeRowQ5_K`), with the inner loop
+// vectorized. Driver + shared primitives: kquant_simd.zig. Measured numbers:
+// bench/kquant_bench.zig.
+//
+// The layout, from `dequantizeRowQ5_K`: the 128-byte `qs` is read as four
+// 32-byte ranges, one per 64-weight chunk `c`, and within a chunk the LOW
+// nibbles are the FIRST 32 weights (scale index 2c) and the HIGH nibbles the
+// NEXT 32 (scale index 2c+1) — consecutive runs, not an interleave. That
+// makes a 32-weight scale group span two vectors: `v = 0` reads bytes
+// [32c, 32c+16) and `v = 1` reads [32c+16, 32c+32), with the nibble choice
+// fixed by the group's parity, not by `v`.
+//
+// The `qh` high-bit plane is indexed 0..32 for EVERY chunk (the reference
+// never advances the pointer — chunks are separated by shifting the bit
+// mask), and within a chunk the low-nibble group uses bit 2c while the
+// high-nibble group uses bit 2c+1 — i.e. the bit index is `2*c + (g & 1)`.
+
+const ksimd = @import("kquant_simd.zig");
+
+const SimdCfg = struct {
+    pub const Block = BlockQ5_K;
+    pub const QK: usize = QK_K;
+    /// One (scale, min) pair per 32 weights.
+    pub const GROUP: usize = SUB_BLOCK;
+    pub const Scales = struct { s: [N_SUB]f32, m: [N_SUB]f32 };
+
+    pub inline fn prepare(blk: *const BlockQ5_K) Scales {
+        const d = f16_to_f32(blk.d);
+        const dmin = f16_to_f32(blk.dmin);
+        var t: Scales = undefined;
+        var sc: u8 = undefined;
+        var mn: u8 = undefined;
+        for (0..N_SUB) |i| {
+            getScaleMinK4(i, &blk.scales, &sc, &mn);
+            t.s[i] = d * @as(f32, @floatFromInt(sc));
+            t.m[i] = dmin * @as(f32, @floatFromInt(mn));
+        }
+        return t;
+    }
+
+    /// `y = (d*sc) * (nibble | 16*hi_bit) - (dmin*m)` for 16 consecutive
+    /// weights. The `(q_int, m1)` pair is combined with one FMA, matching the
+    /// scalar dequantizer to f32 rounding.
+    pub inline fn unpackVec(blk: *const BlockQ5_K, sc: *const Scales, comptime g: usize, comptime v: usize) ksimd.Vec {
+        const c = g >> 1; // 0..3 — which 32-byte qs range / which qh mask pair
+        const high = (g & 1) == 1; // high nibbles == the second 32 weights
+        const qs = ksimd.loadU8(&blk.qs[c * 32 + v * ksimd.VW]);
+        const nib: ksimd.VecU8 = if (high) qs >> ksimd.shr8(4) else qs & ksimd.mask4();
+
+        // `qh` is shared by all four chunks, so the chunk index AND the
+        // nibble half select which BIT of each byte carries the high bit.
+        const qh = ksimd.loadU8(&blk.qh[v * ksimd.VW]);
+        const bit: u3 = @intCast(c * 2 + @as(usize, g & 1));
+        const hi_bit = (qh >> @as(@Vector(ksimd.VW, u3), @splat(bit))) &
+            @as(ksimd.VecU8, @splat(@as(u8, 1)));
+        const q = nib | (hi_bit << ksimd.shl8(4));
+        return @mulAdd(ksimd.Vec, ksimd.u8ToF32(q), ksimd.splatF(sc.s[g]), ksimd.splatF(-sc.m[g]));
+    }
+};
+
+/// AVX2 Q5_K GEMM. Drop-in replacement for `gemmQ5_KScalar` (same signature,
+/// same result to f32 rounding).
+pub fn gemmQ5_K(
+    a: [*]const amx.bf16,
+    lda: usize,
+    b: [*]const BlockQ5_K,
+    ldb: usize,
+    c: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    ksimd.gemmBF16xQuant(SimdCfg, a, lda, b, ldb, c, ldc, m, n, k);
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

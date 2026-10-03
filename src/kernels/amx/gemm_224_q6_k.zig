@@ -286,6 +286,102 @@ pub fn gemmQ6_KScalar(
 }
 
 // ============================================================================
+// AVX2 GEMM (BF16 activations x Q6_K weights -> F32)
+// ============================================================================
+//
+// Same math as `gemmQ6_KScalar` above (kept as the readable statement of the
+// math the tests pin against `dequantizeRowQ6_K`), with the 256-element inner
+// loop vectorized. Q6_K is the second most common GGUF format after Q4_K, so
+// this is the largest single user-visible win in the K-quant family: see
+// bench/kquant_bench.zig for the measured numbers (docs/perf-roadmap.md P0.1).
+//
+// The driver and the shared vector primitives live in kquant_simd.zig; this
+// file supplies the bit layout. The mapping below was derived from
+// `dequantizeRowQ6_K` and is the part that has to be right:
+//
+//   The dequantizer walks 2 chunks of 128 weights. Inside a chunk, index `l`
+//   in 0..32 produces FOUR 32-value runs, in weight order: `l`, `l+32`,
+//   `l+64`, `l+96`, using (ql nibble, qh 2-bit field, scale) triples
+//   (low, shift 0), (low, shift 2), (high, shift 4), (high, shift 6) and
+//   scales[sc_off + l/16 + 0, +2, +4, +6]. Writing the weight index inside the
+//   chunk as `w = l + 32*q`, the 16-weight group index is `gc = w/16 = l/16 +
+//   2q`, i.e. `is = gc & 1` and `q = gc >> 1` — which is exactly the pair
+//   (`plane`, scale offset) the dequantizer uses, and the scale index collapses
+//   to `sc_off + gc`. So group `g` of the super-block (0..15) reads 16 bytes of
+//   `ql` and 16 bytes of `qh` — 32 lanes' worth — with NO lane shuffling:
+//       l        = (gc & 1)*16 + lane       // which 16-byte run
+//       plane    = gc >> 1                 // 0..3: qh 2-bit field, and the
+//                                           // nibble is high iff plane >= 2
+//       ql byte  = chunk*64 + l + 32*(plane & 1)
+//       qh byte  = chunk*32 + l
+//   NOTE the 32-byte ql stride is selected by `plane`, not by the run index —
+//   getting that wrong was the one bug the equivalence test caught (see
+//   LESSONS_ZIG.md §9).
+
+const ksimd = @import("kquant_simd.zig");
+
+const SimdCfg = struct {
+    pub const Block = BlockQ6_K;
+    pub const QK: usize = QK_K;
+    /// One i8 scale per 16 weights.
+    pub const GROUP: usize = SUB;
+    /// `d * scales[i]` for all 16 sub-blocks, hoisted out of the inner loop
+    /// (see kquant_simd.zig note 4).
+    pub const Scales = [N_SUB]f32;
+
+    pub inline fn prepare(blk: *const BlockQ6_K) Scales {
+        const d = f16_to_f32(blk.d);
+        var t: Scales = undefined;
+        for (0..N_SUB) |i| t[i] = d * @as(f32, @floatFromInt(blk.scales[i]));
+        return t;
+    }
+
+    /// `y = (d * scales[g]) * (q - 32)` for 16 consecutive weights — the same
+    /// association order as the scalar dequantizer (`(d*sc) * (q-32)`), so the
+    /// unpacked values are bit-identical to `dequantizeRowQ6_K`'s.
+    pub inline fn unpackVec(blk: *const BlockQ6_K, sc: *const Scales, comptime g: usize, comptime v: usize) ksimd.Vec {
+        std.debug.assert(v == 0); // GROUP == VW: exactly one vector per group
+        const chunk = g >> 3; // 0..1 (the dequantizer's 128-weight chunk)
+        const gc = g & 7;
+        const l_hi = gc & 1; // 0/1 -> which 16-byte run inside the 32-wide pair
+        const plane = gc >> 1; // 0..3 -> which 2-bit field of `qh`
+        const ql_off = chunk * 64 + l_hi * 16 + (plane & 1) * 32 + v * ksimd.VW;
+        const qh_off = chunk * 32 + l_hi * 16 + v * ksimd.VW;
+
+        const qh = ksimd.loadU8(&blk.qh[qh_off]);
+        // Immediate shifts (a switch, not a runtime shift) so this lowers to
+        // vpsrlw/vpsllw rather than the per-lane vpsrlvd.
+        const hi2: ksimd.VecU8 = switch (plane) {
+            0 => qh & ksimd.mask3(),
+            1 => (qh >> ksimd.shr8(2)) & ksimd.mask3(),
+            2 => (qh >> ksimd.shr8(4)) & ksimd.mask3(),
+            else => (qh >> ksimd.shr8(6)) & ksimd.mask3(),
+        };
+        const ql = ksimd.loadU8(&blk.ql[ql_off]);
+        const lo4: ksimd.VecU8 = if (plane < 2) ql & ksimd.mask4() else ql >> ksimd.shr8(4);
+
+        const q = lo4 | (hi2 << ksimd.shl8(4));
+        return (ksimd.u8ToF32(q) - ksimd.splatF(32.0)) * ksimd.splatF(sc[g]);
+    }
+};
+
+/// AVX2 Q6_K GEMM. Drop-in replacement for `gemmQ6_KScalar` (same signature,
+/// same result to f32 rounding).
+pub fn gemmQ6_K(
+    a: [*]const amx.bf16,
+    lda: usize,
+    b: [*]const BlockQ6_K,
+    ldb: usize,
+    c: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    ksimd.gemmBF16xQuant(SimdCfg, a, lda, b, ldb, c, ldc, m, n, k);
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

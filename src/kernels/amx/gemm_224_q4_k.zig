@@ -602,6 +602,72 @@ pub fn gemmQ4KxQ8_0(
 
 
 // ============================================================================
+// Q4_K x BF16 — AVX2 path
+// ============================================================================
+//
+// Same shape as `gemmQ4_KScalar` above (which stays as the readable statement
+// of the math), with the inner loop vectorized. This is the BF16-activation
+// entry point — the one `gemmQuant` uses for m > 1 and the one
+// `kt_matmul_q4_k` calls; the Q8_0-activation fused path above
+// (`gemmQ4KxQ8_0`) is a different signature and is untouched.
+//
+// Layout, from `dequantizeRowQ4_K`: `qs` is four 32-byte ranges, one per
+// 64-weight chunk. Within a chunk the LOW nibbles are the first 32 weights
+// (scale index 2c) and the HIGH nibbles the next 32 (index 2c+1) — consecutive
+// runs, not an interleave (this is the same trap as the Q4_KxQ8_0 nibble bug
+// documented on `gemmQ4KxQ8_0Scalar`). So a 32-weight scale group spans two
+// 16-lane vectors, and the nibble choice comes from the group's parity, not
+// from which vector it is.
+
+const ksimd2 = @import("kquant_simd.zig");
+
+const SimdCfg4K = struct {
+    pub const Block = BlockQ4_K;
+    pub const QK: usize = QK_K;
+    pub const GROUP: usize = SUB_BLOCK; // 32 weights per (scale, min) pair
+    pub const Scales = struct { s: [N_SUB]f32, m: [N_SUB]f32 };
+
+    pub inline fn prepare(blk: *const BlockQ4_K) Scales {
+        const d = f16_to_f32(blk.d);
+        const dmin = f16_to_f32(blk.dmin);
+        var t: Scales = undefined;
+        var sc: u8 = undefined;
+        var mn: u8 = undefined;
+        for (0..N_SUB) |i| {
+            getScaleMinK4(i, &blk.scales, &sc, &mn);
+            t.s[i] = d * @as(f32, @floatFromInt(sc));
+            t.m[i] = dmin * @as(f32, @floatFromInt(mn));
+        }
+        return t;
+    }
+
+    /// `y = (d*sc)*nibble - (dmin*m)` for 16 consecutive weights.
+    pub inline fn unpackVec(blk: *const BlockQ4_K, sc: *const Scales, comptime g: usize, comptime v: usize) ksimd2.Vec {
+        const c = g >> 1;
+        const high = (g & 1) == 1;
+        const qs = ksimd2.loadU8(&blk.qs[c * 32 + v * ksimd2.VW]);
+        const nib: ksimd2.VecU8 = if (high) qs >> ksimd2.shr8(4) else qs & ksimd2.mask4();
+        return @mulAdd(ksimd2.Vec, ksimd2.u8ToF32(nib), ksimd2.splatF(sc.s[g]), ksimd2.splatF(-sc.m[g]));
+    }
+};
+
+/// AVX2 Q4_K GEMM for BF16 activations. Drop-in replacement for
+/// `gemmQ4_KScalar` (same signature, same result to f32 rounding).
+pub fn gemmQ4_K(
+    a: [*]const amx.bf16,
+    lda: usize,
+    b: [*]const BlockQ4_K,
+    ldb: usize,
+    c: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    ksimd2.gemmBF16xQuant(SimdCfg4K, a, lda, b, ldb, c, ldc, m, n, k);
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

@@ -160,6 +160,68 @@ pub fn gemmQ8_KScalar(
 }
 
 // ============================================================================
+// AVX2 GEMM (BF16 activations x Q8_K weights -> F32)
+// ============================================================================
+//
+// Same math as `gemmQ8_KScalar` above (which stays as the readable statement
+// of the math that the tests pin against `dequantizeRowQ8_K`), restructured
+// so the 256-element inner loop is SIMD. Q8_K is the simplest K-quant: one
+// f32 scale for the whole super-block and 256 plain i8 quants, so the whole
+// kernel is "widen the bf16 activations, convert the i8 quants, FMA, reduce
+// once per output element".
+//
+// Measured on the development host at a LlamaMoe-shaped projection
+// (m=1, n=2048, k=7168) see bench/kquant_bench.zig for the numbers. The
+// scalar path sustains ~10% of what the vectorized BF16 kernel moves on the
+// same shape (docs/perf-roadmap.md, "Measured headroom, per path"), and it is
+// dequant/arithmetic-bound rather than bandwidth-bound, so the fix is SIMD.
+//
+// Driver + shared vector primitives live in kquant_simd.zig; this file only
+// supplies the format's bit layout.
+
+const ksimd = @import("kquant_simd.zig");
+
+/// Per-super-block scale table: Q8_K has exactly ONE scale (f32 `d`) for all
+/// 256 weights, so `prepare` is the identity and the table is a scalar.
+const SimdCfg = struct {
+    pub const Block = BlockQ8_K;
+    pub const QK: usize = QK_K;
+    /// One scale per super-block: 16 vectors of 16 lanes.
+    pub const GROUP: usize = QK_K;
+    pub const Scales = f32;
+
+    pub inline fn prepare(blk: *const BlockQ8_K) Scales {
+        return blk.d;
+    }
+
+    /// `qs[16*v .. 16*v+16]` as f32, scaled by the block's `d`. Bit-identical
+    /// to `dequantizeRowQ8_K`'s `blk.d * @floatFromInt(blk.qs[j])`.
+    pub inline fn unpackVec(blk: *const BlockQ8_K, sc: *const Scales, comptime g: usize, comptime v: usize) ksimd.Vec {
+        std.debug.assert(g == 0);
+        const q = ksimd.loadI8(&blk.qs[v * ksimd.VW]);
+        return ksimd.i8ToF32(q) * ksimd.splatF(sc.*);
+    }
+};
+
+/// AVX2 Q8_K GEMM. Drop-in replacement for `gemmQ8_KScalar` (same signature,
+/// same result to f32 rounding); the scalar version is kept as the readable
+/// definition of the math that `Test "Q8_K AVX2 GEMM == dequantize + dot"` and
+/// the existing constant-weight test check against.
+pub fn gemmQ8_K(
+    a: [*]const amx.bf16,
+    lda: usize,
+    b: [*]const BlockQ8_K,
+    ldb: usize,
+    c: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    ksimd.gemmBF16xQuant(SimdCfg, a, lda, b, ldb, c, ldc, m, n, k);
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

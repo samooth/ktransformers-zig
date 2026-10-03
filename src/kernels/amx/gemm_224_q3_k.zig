@@ -361,6 +361,89 @@ pub fn gemmQ3_KScalar(
 }
 
 // ============================================================================
+// AVX2 GEMM (BF16 activations x Q3_K weights -> F32)
+// ============================================================================
+//
+// Same math as `gemmQ3_KScalar` above (kept as the readable statement of the
+// math the tests pin against `dequantizeRowQ3_K`), inner loop vectorized.
+// Driver + shared primitives: kquant_simd.zig. Numbers: bench/kquant_bench.zig.
+//
+// Layout, from `dequantizeRowQ3_K`: two 128-weight chunks; inside a chunk,
+// four 2-bit planes (shift 0,2,4,6 of the same 32-byte `qs` range) times two
+// 16-weight runs, and the high-bit plane `hmask` advances one bit per plane
+// across ALL eight planes of the super-block (so chunk c, plane p uses bit
+// c*4 + p). Weight index inside the chunk is `p*32 + h*16 + l` for run
+// `h` in 0..1, which makes the group index `gc = p*2 + h` — i.e. group `g` of
+// the super-block reads 16 consecutive bytes of `qs` at `c*32 + h*16` and 16
+// bytes of `hmask` at `h*16`, with no lane shuffling:
+//     y = (d * (scales[g] - 32)) * (q2 - 4*(high_bit clear))
+
+const ksimd = @import("kquant_simd.zig");
+
+const SimdCfg = struct {
+    pub const Block = BlockQ3_K;
+    pub const QK: usize = QK_K;
+    pub const GROUP: usize = SUB_BLOCK; // 16 weights per scale
+    pub const Scales = [N_SUB]f32;
+
+    pub inline fn prepare(blk: *const BlockQ3_K) Scales {
+        const d_all = f16_to_f32(blk.d);
+        var raw: [N_SUB]i8 = undefined;
+        unpackScales(&blk.scales, &raw);
+        var t: Scales = undefined;
+        for (0..N_SUB) |i| t[i] = d_all * @as(f32, @floatFromInt(raw[i] - 32));
+        return t;
+    }
+
+    /// `y = dl * (q2 - hb)` for 16 consecutive weights, matching the scalar
+    /// dequantizer's `dl * @floatFromInt(q_val - hb)` exactly (both operands
+    /// are small integers, so the f32 conversion is exact).
+    pub inline fn unpackVec(blk: *const BlockQ3_K, sc: *const Scales, comptime g: usize, comptime v: usize) ksimd.Vec {
+        std.debug.assert(v == 0); // GROUP == VW: one vector per group
+        const c = g >> 3; // 0..1 — the 128-weight chunk
+        const gc = g & 7;
+        const plane = gc >> 1; // 0..3 — which 2-bit field
+        const half = gc & 1; // which 16-weight run of that plane
+
+        const qs = ksimd.loadU8(&blk.qs[c * 32 + half * 16 + v * ksimd.VW]);
+        const q2: ksimd.VecU8 = switch (plane) {
+            0 => qs & ksimd.mask3(),
+            1 => (qs >> ksimd.shr8(2)) & ksimd.mask3(),
+            2 => (qs >> ksimd.shr8(4)) & ksimd.mask3(),
+            else => (qs >> ksimd.shr8(6)) & ksimd.mask3(),
+        };
+
+        // hmask bit index advances across all 8 planes of the super-block.
+        // hb = 0 when the bit is SET, 4 when it is clear — do NOT spell that
+        // as `4 & ~bit`: `~` on a byte leaves every other bit set, so bit 2
+        // survives and hb is always 4 (this bug cost one debug round).
+        const bit: u3 = @intCast(c * 4 + plane);
+        const hm = ksimd.loadU8(&blk.hmask[half * 16 + v * ksimd.VW]);
+        const set = @as(ksimd.VecU8, @splat(@as(u8, 1))) << @as(@Vector(ksimd.VW, u3), @splat(bit));
+        const hb: ksimd.VecU8 = @select(u8, (hm & set) != @as(ksimd.VecU8, @splat(@as(u8, 0))), @as(ksimd.VecU8, @splat(@as(u8, 0))), @as(ksimd.VecU8, @splat(@as(u8, 4))));
+        const q: ksimd.VecI8 = @as(ksimd.VecI8, @bitCast(q2)) - @as(ksimd.VecI8, @bitCast(hb));
+
+        return ksimd.i8ToF32(q) * ksimd.splatF(sc[g]);
+    }
+};
+
+/// AVX2 Q3_K GEMM. Drop-in replacement for `gemmQ3_KScalar` (same signature,
+/// same result to f32 rounding).
+pub fn gemmQ3_K(
+    a: [*]const amx.bf16,
+    lda: usize,
+    b: [*]const BlockQ3_K,
+    ldb: usize,
+    c: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    ksimd.gemmBF16xQuant(SimdCfg, a, lda, b, ldb, c, ldc, m, n, k);
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 

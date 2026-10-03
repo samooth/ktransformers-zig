@@ -325,6 +325,77 @@ pub fn gemmQ2_KScalar(
 }
 
 // ============================================================================
+// AVX2 GEMM (BF16 activations x Q2_K weights -> F32)
+// ============================================================================
+//
+// Same math as `gemmQ2_KScalar` above (kept as the readable statement of the
+// math the tests pin against `dequantizeRowQ2_K`), inner loop vectorized.
+// Driver + shared primitives: kquant_simd.zig. Numbers: bench/kquant_bench.zig.
+//
+// Layout, from `dequantizeRowQ2_K`: two 128-weight chunks; inside a chunk four
+// 2-bit planes (shift 0,2,4,6 of the same 32-byte `qs` range) times two
+// 16-weight runs, with one (scale, min) byte per 16-weight group. Weight
+// index inside a chunk is `p*32 + h*16 + l`, so the group index is
+// `gc = p*2 + h`: group `g` of the super-block reads 16 consecutive bytes of
+// `qs` at `c*32 + h*16` and its own `scales[g]` byte, with no lane shuffling:
+//     y = (d * (scales[g] & 0xF)) * q2 - (dmin * (scales[g] >> 4))
+
+const ksimd = @import("kquant_simd.zig");
+
+const SimdCfg = struct {
+    pub const Block = BlockQ2_K;
+    pub const QK: usize = QK_K;
+    pub const GROUP: usize = SUB_BLOCK; // 16 weights per (scale, min) pair
+    pub const Scales = struct { s: [N_SUB]f32, m: [N_SUB]f32 };
+
+    pub inline fn prepare(blk: *const BlockQ2_K) Scales {
+        const d = f16_to_f32(blk.d);
+        const dmin = f16_to_f32(blk.dmin);
+        var t: Scales = undefined;
+        for (0..N_SUB) |i| {
+            t.s[i] = d * @as(f32, @floatFromInt(blk.scales[i] & 0x0F));
+            t.m[i] = dmin * @as(f32, @floatFromInt(blk.scales[i] >> 4));
+        }
+        return t;
+    }
+
+    /// `y = (d*sc)*q2 - (dmin*m)` for 16 consecutive weights (one FMA, both
+    /// operands exact in f32).
+    pub inline fn unpackVec(blk: *const BlockQ2_K, sc: *const Scales, comptime g: usize, comptime v: usize) ksimd.Vec {
+        std.debug.assert(v == 0); // GROUP == VW: one vector per group
+        const c = g >> 3; // 0..1 — the 128-weight chunk
+        const gc = g & 7;
+        const plane = gc >> 1; // 0..3 — which 2-bit field
+        const half = gc & 1; // which 16-weight run of that plane
+
+        const qs = ksimd.loadU8(&blk.qs[c * 32 + half * 16 + v * ksimd.VW]);
+        const q2: ksimd.VecU8 = switch (plane) {
+            0 => qs & ksimd.mask3(),
+            1 => (qs >> ksimd.shr8(2)) & ksimd.mask3(),
+            2 => (qs >> ksimd.shr8(4)) & ksimd.mask3(),
+            else => (qs >> ksimd.shr8(6)) & ksimd.mask3(),
+        };
+        return @mulAdd(ksimd.Vec, ksimd.u8ToF32(q2), ksimd.splatF(sc.s[g]), ksimd.splatF(-sc.m[g]));
+    }
+};
+
+/// AVX2 Q2_K GEMM. Drop-in replacement for `gemmQ2_KScalar` (same signature,
+/// same result to f32 rounding).
+pub fn gemmQ2_K(
+    a: [*]const amx.bf16,
+    lda: usize,
+    b: [*]const BlockQ2_K,
+    ldb: usize,
+    c: [*]f32,
+    ldc: usize,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    ksimd.gemmBF16xQuant(SimdCfg, a, lda, b, ldb, c, ldc, m, n, k);
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
