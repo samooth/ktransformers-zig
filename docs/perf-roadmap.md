@@ -192,24 +192,108 @@ round-trip stays byte-exact.
 
 ---
 
-### P0.3 — MXFP4 / MXFP8 · `gemm_224_{mxfp4,mxfp8}.zig`
+### P0.3 — MXFP4 / MXFP8 · `gemm_224_{mxfp4,mxfp8}.zig` — **DONE** (with a correction to the plan)
 
-**Why:** the *heaviest* vectorization in the reference — `mxfp4-moe.hpp` has 42
-`_mm256` intrinsic uses. Whatever they are doing to get that, it is
-presumably the win.
+**The plan above was wrong about the order, and finding that out was most of
+the work.** It said "vectorize the 4-bit unpack with a `vpshufb` lookup table".
+Vectorizing first would have optimized a format that could not read a real
+MXFP checkpoint at all, so the block layout and the codec had to be fixed
+first. Both are now correct and both GEMMs are vectorized.
 
-**What to do.** MXFP4 = 4-bit weights with a **shared exponent per 32
-elements**; MXFP8 = 8-bit with a shared scale per 32. So the inner loop is
-32 weights → 1 scale. The 4-bit unpack is best done with a `vpshufb` lookup
-table over the packed bytes (one LUT handles all 16 nibble values → f32),
-rather than shifts and masks. Accumulate 32-element groups separately and
-apply the group scale before adding to the total, which is exactly what the
-per-32 scale layout wants.
+**Block layout was wrong.** `scale` was `amx.bf16` (2 bytes), making MXFP8 34
+bytes and MXFP4 18 against the format's **33 / 17**, with a scale encoding MXFP
+does not have. The scale is **ue8m0**: one byte, an unbiased power of two,
+`2^(b-127)`. That appears nowhere else in the tree — the encoding was never
+implemented, only mis-laid-out. `ue8m0_to_f32` is now a pure shift,
+`@as(u32, b) << 23`, taken verbatim from `mxfp8-moe.hpp::convert_ue8m0_to_fp32`
+including its two documented edges (b=0 → 0.0 rather than 2^-127, b=255 →
+overflow into NaN). `@sizeOf` is pinned by a `comptime` guard and a test.
 
-**Acceptance.** Existing MXFP tests (2 exact-value tests each) keep passing,
-plus a GEMM-vs-dequantized-reference test with varied per-32 scales.
+Note the reference does *not* use `vpshufb` for this either — it uses a
+256-entry FP32 LUT plus `_mm256_i32gather_ps` for E4M3, and a 16-entry table for
+E2M1. The `vpshufb` idea does not work for FP32 output anyway: `vpshufb`
+produces bytes, so it can only feed a bf16 result directly, not f32.
+
+**E4M3 codec was wrong in six places.** Worst was the encoder masking the
+3-bit mantissa round-overflow (`& 0x7`) instead of carrying it into the
+exponent, so `3.875` encoded as **2.0 instead of 4.0** — a 2x error on 1/16 of
+the entire normal range. Saturation also returned `0x7F`/`0xFF`, which are the
+NaN encodings, so any weight above 448 became NaN; the decoder read subnormals
+as normals (up to 1024x too large) and `0x7F` as 480, above `E4M3_MAX`; and
+all seven subnormal encodings were flushed to zero. Now **254/256 exact round
+trip**, the 2 exceptions being `0x7F`/`0xFF`, which correctly decode to 0 by
+the reference's "treat as 0 to avoid propagation".
+
+**Both GEMMs vectorized** (`gemmAvx2`), built like `kquant_simd`: n-outer so
+the weight block streams once, MR=4, explicit `@mulAdd`, one `@reduce` per
+output row. The reference's deferred-hsum rationale applies and is adopted —
+MXFP keeps the scale separate from the payload rather than baking it into the
+dequant, so the horizontal reduce hoists out of the k loop. Folding the ue8m0
+scale into the weight vector is exact, since a power of two only changes the
+exponent.
+
+| format | m=1 | m=4 | m=8 |
+|---|---|---|---|
+| MXFP8 (33 B/blk) | 2x | 7x | 7x |
+| MXFP4 (17 B/blk) | 3x | 11x | 10x |
+
+at n=2048, k=7168, pinned, ReleaseFast, best of 5, vs the scalar triple loop in
+the same binary. MXFP4 gains most, as expected: at 4 bits per weight the stream
+is half the size, so loop order and FMA tiling matter more than the unpack.
+
+`fp4x8` emits the **low nibble first**, matching `unpackMXFP4`. That ordering
+gets its own test rather than relying on the oracle comparison, because a
+swapped pair still produces plausible numbers instead of garbage.
+
+**Acceptance met.** The two exact-value MXFP tests still pass, plus
+GEMM-vs-scalar-oracle across 7 shapes each (m % MR, n=1, ragged k), the
+nibble-order test, the block-size audit, and ue8m0 identity over all 256 bytes.
+
+**Open:** m=1 is only 2-3x because the kernel does 8 scalar table loads per 8
+weights. The vectorized **Q8_0** GEMM (P0.5) needs no table and reaches 7.8
+GB/s at m=1 against MXFP8's 3.0 and MXFP4's 2.6 from the same shape, which
+isolates the table as the cost. An asm `vgatherdps` is the obvious next
+experiment.
 
 ---
+
+### P0.5 — Q8_0 GEMM · `gemm_224_q8_0.zig` — **DONE** (4x at m=1, 13x at m=4/m=8)
+
+Not on the original worklist, and it should have been: **Q8_0 is the GGUF
+default weight format AND the LlamaMoe activation format**, so this was the
+hottest quantized GEMM in the tree. It was also the last one still on an
+`m/n/k` triple loop, and in the worst of the three orders — m-outer meant the
+whole n x k weight matrix was re-streamed from DRAM once per token row.
+
+Three call sites moved to the vectorized path: `kt_matmul_q8_0`, the
+`gemmQuant` `KT_TYPE_Q8_0` arm (so every Q8_0-weight LlamaMoe forward), and the
+root.zig comptime ref. `gemmQ8_0Scalar` stays as the oracle.
+
+| m | scalar | avx2 | speedup |
+|---|---|---|---|
+| 1 | 11 ms | 2 ms | 4x |
+| 4 | 45 ms | 3 ms | 13x |
+| 8 | 90 ms | 6 ms | 13x |
+
+at n=2048, k=7168, pinned, ReleaseFast, best of 5.
+
+**This entry is also the evidence for P0.3's open question.** Q8_0 needs no
+lookup table — its i8→f32 step is pure `vpmovsxbd` + `vcvtdq2ps` — and reaches
+**7.8 GB/s** at m=1, against 3.0 GB/s for MXFP8 and 2.6 GB/s for MXFP4 from the
+same shape with a table lookup per vector. So the ~2.6x gap in the MX kernels is
+the table, not the memory system, which makes an asm `vgatherdps` the right next
+experiment rather than an assumption that the scalar loads are near the ceiling.
+
+Disassembly (`gemm_224_q8_0.gemmAvx2`, out-of-line here, 424 insns): 28
+`vfmadd`, 141 `ymm` ops, only 5 horizontal reduces, and exactly 16 `vpmovsxbd` +
+16 `vcvtdq2ps` — the sign extension is mandatory, Q8_0 quants being signed and
+including -128. The 35 scalar FP instructions are the per-block f16 scale
+conversion (one per 32 weights) and the `@reduce` epilogue.
+
+**Acceptance met.** Oracle comparison across 7 shapes (m % MR, n=1, k to 7168)
+plus a separate sweep proving every element of [0,m) x [0,n) is written — the
+scalar version zeroes `c` then accumulates while the vector version assigns
+directly, so they are only equivalent with no uninitialised holes.
 
 ### P0.4 — INT4 families · `gemm_224_int4.zig` (+ raw-INT4 / GPTQ-INT4)
 
@@ -354,7 +438,7 @@ milliseconds move by up to 3x with load; ratios are stable.
 ./bench/cpp_vs_zig/run.sh              # A/B vs the reference
 KT_PIN=9 ./bench/cpp_vs_zig/run.sh     # pin both harnesses to one core
 zig build -Doptimize=ReleaseFast bench # internal gemm + MoE forward
-zig build test                         # 251 tests
+zig build test                         # 261 tests
 python3 tools/verify_abi.py            # 112 symbols + arity
 ```
 

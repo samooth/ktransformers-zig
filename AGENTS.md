@@ -152,16 +152,19 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
   fully revived (NumaTopology.detect + allocNuma + getThreadAffinity
   work byte-exact; getThreadAffinity bug fixed in route — kernel
   returns bytes-copied, not errno).
-- Tests: **251 across the suites, 0 leaks** (148 in the kernels suite
-  incl. all 15 GGML formats + the 16-arm gemmQuant dispatch sweep; 23
-  SIMD/suite-6f incl. the 6 K-quant AVX2 GEMM equivalence tests; 11
+- Tests: **261 across 18 suites, 0 leaks** (148 in the kernels suite
+  incl. all 15 GGML formats + the 16-arm gemmQuant dispatch sweep; 33
+  SIMD/suite-6f incl. the 6 K-quant AVX2 GEMM equivalence tests, the MXFP8
+  and MXFP4 AVX2 GEMMs, the Q8_0 AVX2 GEMM, and the MX block-layout /
+  ue8m0 / E4M3 codec audits; 11
   MLA + 4+3 MLA C-API + 2 FP8 + 9 GGML C API + 7 aarch64 + NEON +
   allocator + Qwen3 + Qwen3 C-API + GGUF e2e + to/from_float + 3
   LlamaMoe C-API incl. the KT_TYPE ABI audit + K_BLOCK runtime + 6 math-helpers (swiglu 3 variants/rms_norm/rope/softmax, numerics-pinned)). Bench:
   `zig build bench` (2.8-9.3x measured speedup A1) + `moe_bench.zig`
   (end-to-end MoE forward with tile-param tuning: -20.3% on prefill
   8×4 at K=448 vs the 1792 default on this Ryzen 512K-L2 — validates
-  the A4 wiring empirically).
+  the A4 wiring empirically) + `kquant_bench.zig` (per-format K-quant
+  scalar-vs-AVX2).
 - IMPROVE.md documents a verified external-dev-feedback audit: all
   P0-P3 items resolved (see its Parte E table for the commit map).
 

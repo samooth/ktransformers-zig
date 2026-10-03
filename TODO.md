@@ -1,6 +1,6 @@
 # ktransformers-zig TODO
 
-## Status: Beta (15/15 GGML formats + 251 tests; SIMD at/above C++ parity)
+## Status: Beta (15/15 GGML formats + 261 tests; SIMD at/above C++ parity)
 
 Last updated: 2026-10-03
 
@@ -17,7 +17,7 @@ and the reasoning, not who or what typed it. Commit messages carry no
 attribution trailers of any kind.
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
-**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels + the six K-quant AVX2 GEMMs) = **251 total pass, 0 leaks, exit 0**.
+**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels + the six K-quant AVX2 GEMMs) = **261 total pass across 18 suites, 0 leaks, exit 0**.
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon (8 installed names), each exporting **112 C API symbols** (triple-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). Runs in CI (`wheels.yml` `abi-gate` job).
 **Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
 **Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
@@ -197,7 +197,7 @@ new functions would never be emitted into the .so.
 Tests: 6 new, in `tests/kernels/simd_kernels_tests.zig`, one per format,
 `fused == dequantizeRow + f32 dot` (no approximation) with deliberately
 non-uniform per-group scales, at m ∈ {1, 4, 5} and 3 super-blocks, plus the
-scalar path on the same assertion. Suite total 251, `zig build test` exit 0.
+scalar path on the same assertion. Suite total 261 across 18 suites, `zig build test` exit 0.
 Also here: `gemmQ4_KScalar` (the BF16-activation Q4_K entry, i.e. Stream A's
 remaining item) got the same treatment and is now dispatched too.
 
