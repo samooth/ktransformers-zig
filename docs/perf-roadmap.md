@@ -380,14 +380,18 @@ row — vectorizing dequant alone buys a lot before the GEMM is touched. Cheap
 first win: `dequantizeRowQ4_K` writes 256 floats per block with a scalar
 `d1*(q&0xF) - m1`; that is 4 `vpmovzxwd` + shifts + 4 FMAs per block.
 
-**Extend the fused Q8_0-activation path beyond Q4_K.** `runMatmulScratch`
-special-cases one format; making it table-driven over `(weight_type,
-has_fused_path)` would let Q6_K/Q8_K skip the BF16 round-trip at m=1 too.
-Note the payoff is smaller now: with integer activations `vpmaddwd` halves the
-conversion cost per weight, which is why P0.1's numbers for the bf16-activation
-path (28% of the BF16 ceiling's bandwidth for Q6_K) are where a Q8_0 path
-would roughly double. Worth doing for Q6_K, which is the second most common
-GGUF format.
+**Do NOT extend the fused Q8_0-activation path to Q6_K/Q8_K.** This paragraph
+previously recommended exactly that. It is now known to be wrong, and the
+measurement is in P1.1: the one fused path that ever existed (Q4_K) turned out
+to be **3.3x slower** than the generic bf16-activation driver on the decode
+shape, 5727 us against 1778 us at m=1 n=2048 k=7168. The activation dequant it
+skips costs 4 us out of 5727 — 0.2% — so "skipping the BF16 round-trip" is not
+where the time is. Generalizing it to Q6_K would have generalized the slower
+path.
+
+The real remaining cost in front of all 16 formats is the **dequantize-to-BF16
+step itself**, not the choice of activation type. That is the first paragraph of
+this item and it is where the effort belongs.
 
 ---
 
