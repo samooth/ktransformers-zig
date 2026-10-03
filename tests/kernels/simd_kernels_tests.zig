@@ -1056,3 +1056,123 @@ test "Q8_0 AVX2 GEMM covers every output element (no uninitialised holes)" {
         for (c) |v| try testing.expect(std.math.isFinite(v));
     }
 }
+
+test "IQ4_NL scalar GEMM honours the block offset at k > one group" {
+    // Regression test. `gemmIQ4_NLScalar` indexed the activation as
+    // `input[i * input_ld + k0]` with k0 in 0..32, inside the per-block loop,
+    // never adding `blk * 32`. Every block was therefore multiplied by the SAME
+    // first 32 activations. Correct only when nb == 1 (k == 32) — the only
+    // shape the pre-existing tests used — and wrong for every real checkpoint,
+    // on a live path (`gemmQuant` dispatches KT_TYPE_IQ4_NL).
+    //
+    // Measured before the fix at n=2048-style shapes: rel error 2.2 at k=64,
+    // 8.9 at k=128, 1.5 at k=256 against a correct reference.
+    const g = kt.gemm_iq4_nl;
+    var seed: u64 = 0x1A2B_3C4D;
+
+    for ([_]usize{ 32, 64, 128, 256, 2048 }) |k| {
+        const nb = k / g.QK4_NL;
+        const m: usize = 2;
+        const n: usize = 3;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 256, 4.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ4_NL, n * nb);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = @bitCast(@as(f16, 0.05));
+            for (&blk.qs) |*q| {
+                seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                q.* = @truncate(seed >> 24);
+            }
+        }
+
+        const c = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c);
+        @memset(c, std.math.nan(f32));
+        g.gemmIQ4_NLScalar(a.ptr, w.ptr, c.ptr, m, n, k, k, nb, n);
+
+        // Reference: identical, except that it advances the activation index
+        // by the block offset.
+        var scratch: [g.QK4_NL]f32 = undefined;
+        for (0..m) |i| {
+            for (0..n) |j| {
+                var sum: f32 = 0;
+                for (0..nb) |blk| {
+                    g.dequantizeRowIQ4_NL(w.ptr + j * nb + blk, &scratch, g.QK4_NL);
+                    for (0..g.QK4_NL) |k0| {
+                        sum += amx.bf16_to_f32(a[i * k + blk * g.QK4_NL + k0]) * scratch[k0];
+                    }
+                }
+                const got = c[i * n + j];
+                try testing.expect(std.math.isFinite(got));
+                const denom = @max(@abs(sum), 1e-2);
+                try testing.expect(@abs(got - sum) / denom < 1e-3);
+            }
+        }
+    }
+}
+
+test "IQ1_M scalar GEMM honours the block offset at k > one group" {
+    // Same regression, second API shape. IQ1_M takes `(a, b, c, m, n, k, lda,
+    // ldb, ldc)` where IQ4_NL takes `(input, weight, output, m, n, k, input_ld,
+    // weight_ld, output_ld)`, and uses `QK_K` rather than `QK4_NL`. Two
+    // shapes of the same copy-pasted bug, so both are pinned.
+    const g = kt.gemm_iq1_m;
+    var seed: u64 = 0x0BAD_C0DE;
+
+    // k must be a whole number of groups: IQ1_M's group is QK_K = 256, so
+    // k = 32 or 64 would give nb = 0 and make the case vacuous.
+    for ([_]usize{ 256, 512, 1024, 2048 }) |k| {
+        const nb = k / g.QK_K;
+        const m: usize = 2;
+        const n: usize = 3;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 256, 4.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ1_M, n * nb);
+        defer testing.allocator.free(w);
+        // Fill through the byte view: this test is about the GEMM's activation
+        // indexing, so the block contents only need to be deterministic, and
+        // going via bytes keeps it independent of each format's field layout.
+        const wbytes: [*]u8 = @ptrCast(@alignCast(w.ptr));
+        for (0..n * nb * @sizeOf(g.BlockIQ1_M)) |i| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            wbytes[i] = @truncate(seed >> 24);
+        }
+
+        const c = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c);
+        @memset(c, std.math.nan(f32));
+        g.gemmIQ1_MScalar(a.ptr, w.ptr, c.ptr, m, n, k, k, nb, n);
+
+        var scratch: [g.QK_K]f32 = undefined;
+        for (0..m) |i| {
+            for (0..n) |j| {
+                var sum: f32 = 0;
+                for (0..nb) |blk| {
+                    g.dequantizeRowIQ1_M(w.ptr + j * nb + blk, &scratch, g.QK_K);
+                    for (0..g.QK_K) |k0| {
+                        sum += amx.bf16_to_f32(a[i * k + blk * g.QK_K + k0]) * scratch[k0];
+                    }
+                }
+                const got = c[i * n + j];
+                // Random block bytes can put a NaN or Inf in IQ1_M's hidden
+                // f16 scale (4 random bits interpreted as an f16 exponent),
+                // and the dequantizer faithfully propagates it. So the
+                // assertion has to be NaN-aware rather than `isFinite` — what
+                // matters is that the kernel and the reference agree on WHICH
+                // outputs are non-finite, not that all of them are finite.
+                if (std.math.isNan(sum)) {
+                    try testing.expect(std.math.isNan(got));
+                } else {
+                    try testing.expect(std.math.isFinite(got));
+                    const denom = @max(@abs(sum), 1e-2);
+                    try testing.expect(@abs(got - sum) / denom < 1e-3);
+                }
+            }
+        }
+    }
+}

@@ -124,8 +124,13 @@ pub fn gemmIQ4_NLScalar(
             var sum: f32 = 0;
             for (0..nb) |blk| {
                 dequantizeRowIQ4_NL(weight + j * weight_ld + blk, &scratch, QK4_NL);
+                // BUG (pre-existing): the activation index omitted `blk * QK4_NL`, so every
+                // block was multiplied by the SAME first QK4_NL activations. Correct
+                // only when nb == 1 (k == QK4_NL); wrong for every real checkpoint.
+                // Pinned by "IQ scalar GEMMs honour the block offset" in
+                // tests/kernels/simd_kernels_tests.zig.
                 for (0..QK4_NL) |k0| {
-                    sum += amx.bf16_to_f32(input[i * input_ld + k0]) * scratch[k0];
+                    sum += amx.bf16_to_f32(input[i * input_ld + blk * QK4_NL + k0]) * scratch[k0];
                 }
             }
             output[i * output_ld + j] = sum;

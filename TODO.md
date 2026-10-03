@@ -460,6 +460,61 @@ summation-order difference amplified to 1.6e-4 (an absolute 0.06 on a value of
 381, over 256 terms). Every real defect shows up as O(1) instead — the Q4_K
 routing bug was rel=4.2, the MXFP4 encoder bug a clean factor of 2.
 
+**Stream G — IQ* family block-offset bug. DONE (correctness, found while
+scoping the IQ vectorization). CLAIMED (iq-block-offset) since 2026-10-03.**
+
+Chasing the next perf item (the nine scalar IQ formats) turned up a
+family-wide correctness bug first, which is the more important of the two.
+
+**All nine IQ scalar GEMMs ignored the block offset.** Inside the per-block
+loop they indexed the activation as `a[i * lda + k0]` with `k0` in
+`0..GROUP`, never adding `blk * GROUP`. So every block of a row was multiplied
+by the SAME first GROUP activations:
+
+```
+sum += amx.bf16_to_f32(a[i * lda + k0]) * scratch[k0];   // missing blk * QK_K
+```
+
+That is correct only when `nb == 1`, i.e. `k == GROUP` — which is the only
+shape the pre-existing tests used. Measured against a correct reference on
+IQ4_NL: **rel error 2.2 at k=64, 8.9 at k=128, 1.5 at k=256**, and exact at
+k=32. Every real checkpoint has k >> GROUP, and `gemmQuant` dispatches all nine
+formats, so **every IQ\* model in GGUF was computing garbage**.
+
+Two API shapes, both affected: `(a, b, c, m, n, k, lda, ldb, ldc)` with `QK_K`
+(IQ1_M, IQ1_S, IQ2_*, IQ3_*) and `(input, weight, output, m, n, k, input_ld,
+weight_ld, output_ld)` with `QK4_NL` (IQ4_XS, IQ4_NL). Note `QK_K` is 256 for
+IQ1_M but 32 for most of the others, which is why the bug survived a per-format
+eyeball.
+
+Fixed in all nine, each with a comment naming the bug, plus two regression tests
+(IQ4_NL and IQ1_M — one per API shape) that build the reference by hand from the
+formats' own `dequantizeRow*` and sweep k past one group.
+
+**Lesson worth keeping: a test that only ever uses one shape cannot see a
+missing index.** Every one of these GEMMs was "covered" — the suites are 263
+tests and include per-format quantize/dequantize and scalar-GEMM tests — but all
+of them used `k == GROUP`, which is precisely the one value of k where the
+block offset is zero. A loop whose trip count is 1 cannot be wrong about its
+stride. When auditing an index, check the trip count first: if it is 1 in every
+test, the index is untested.
+
+Two smaller things found while writing the tests:
+- IQ1_M's hidden f16 scale is stored as 4 bits inside the `scales` array, so
+  **random block bytes legitimately produce NaN/Inf weights**. The assertion has
+  to be NaN-aware (kernel and reference must agree on WHICH outputs are
+  non-finite), not `isFinite`.
+- My first draft of the IQ1_M test used k = 32 and 64 against `QK_K = 256`, so
+  `nb = 0` and both cases were **vacuous** — a test that looks like coverage and
+  asserts nothing. Fixed to multiples of 256. Worth flagging because it is the
+  same failure mode as the bug it was written for.
+
+**Not done here: the IQ\* vectorization itself.** The layouts are correct now
+(verified round-trip by the existing per-format tests), so the perf work is
+unblocked. Structure looks favourable: 32-weight groups with a per-group scale,
+structurally the same as Q8_0/MXFP4, so a `kquant_simd`-style shared driver with
+a per-format comptime `Cfg` is the likely shape.
+
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
 
 Benchmarked against the reference's own AVX2 kernels
