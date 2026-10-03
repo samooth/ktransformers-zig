@@ -152,11 +152,11 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
   fully revived (NumaTopology.detect + allocNuma + getThreadAffinity
   work byte-exact; getThreadAffinity bug fixed in route — kernel
   returns bytes-copied, not errno).
-- Tests: **261 across 18 suites, 0 leaks** (148 in the kernels suite
-  incl. all 15 GGML formats + the 16-arm gemmQuant dispatch sweep; 33
-  SIMD/suite-6f incl. the 6 K-quant AVX2 GEMM equivalence tests, the MXFP8
-  and MXFP4 AVX2 GEMMs, the Q8_0 AVX2 GEMM, and the MX block-layout /
-  ue8m0 / E4M3 codec audits; 11
+- Tests: **263 across 18 suites, 0 leaks** (148 in the kernels suite
+  incl. all 15 GGML formats + the 16-arm gemmQuant dispatch sweep; 35
+  SIMD/suite-6f incl. the 6 K-quant AVX2 GEMM equivalence tests, the MXFP8,
+  MXFP4 and Q8_0 AVX2 GEMMs, the MX block-layout / ue8m0 / E4M3 codec
+  audits, and the IQ scalar-GEMM block-offset regression tests; 11
   MLA + 4+3 MLA C-API + 2 FP8 + 9 GGML C API + 7 aarch64 + NEON +
   allocator + Qwen3 + Qwen3 C-API + GGUF e2e + to/from_float + 3
   LlamaMoe C-API incl. the KT_TYPE ABI audit + K_BLOCK runtime + 6 math-helpers (swiglu 3 variants/rms_norm/rope/softmax, numerics-pinned)). Bench:
