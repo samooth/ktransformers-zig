@@ -33,6 +33,10 @@ already completed and it did not mention the SIMD work at all).
 
 ### Parallel work streams (2026-10-03) — CLAIM before starting
 
+**Full roadmap with per-item technique, acceptance criteria and payoff targets:
+`docs/perf-roadmap.md`.** That is the document to read before starting any
+kernel work; the summary below is the index.
+
 The AVX2 SIMD audit found that after the GEMM/activation rework, **BF16 is the
 only kernel with a real AVX2 vector path**. Everything else has an AMX tile
 path (dead on any non-AMX host, `AmxFeatures.available == false`) plus a

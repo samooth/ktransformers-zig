@@ -255,6 +255,12 @@ the feature set comes from the native target. `zig build -Dtarget=x86_64-linux-g
 Tests for all of the above live in `tests/kernels/simd_kernels_tests.zig`
 (kept separate from `test_kernels.zig`).
 
+**Next performance work is in `docs/perf-roadmap.md`.** Short version: BF16
+GEMM is won (1.24-3.23x), but every *quantized* family is still scalar on
+non-AMX hosts — measured at 4-14% of the bandwidth a vectorized kernel
+sustains — and the C++ reference has 10 AVX2 kernels we do not. That, plus the
+0.59x SwiGLU activation, is where the remaining gap lives.
+
 ## sentrux (architecture sensor — MCP + CLI)
 
 `.sentrux/rules.toml` is the **layering contract** for this repo, enforced by
@@ -330,6 +336,9 @@ rules.toml edit, that's what happened.
 - `LESSONS_ZIG.md` — Zig 0.16 gotchas, verified AMX asm patterns, lazy-analysis/integration lessons (**read first**)
 - `include/kt_kernel.h` — C API contract (do not change without coordinating: Python/pybind11 depends on it; additive changes to the clearly-marked 'Zig extensions' section are the established pattern)
 - `docs/api.md` — C API reference for integrators
+- `docs/perf-roadmap.md` — **read before any kernel work.** Per-operator list of
+  what is still scalar, measured headroom, the four rules that make kernels
+  fast here, acceptance criteria, and the parallel-work rules
 - `docs/porting-guide.md` — C++ → Zig porting patterns
 
 
