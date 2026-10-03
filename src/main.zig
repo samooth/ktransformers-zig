@@ -2615,7 +2615,10 @@ pub export fn kt_dequantize_q8_k(src: *const anyopaque, dst: [*]f32, k: usize) v
 }
 
 /// GGML GEMMs: a [m,k] BF16 activations, b [n, k/QK] blocks (row-major,
-/// ldb in BLOCKS), c [m,n] F32. On-the-fly dequant (scalar kernels).
+/// ldb in BLOCKS), c [m,n] F32. On-the-fly dequant. The four K-quant formats
+/// run the AVX2 fused path (`gemmQ*_K`: 16-lane unpack, one reduction per
+/// output element, scale folded into the weights); Q8_0 is still scalar. The
+/// `*Scalar` siblings remain the reference definition of each format's math.
 pub export fn kt_matmul_q8_0(
     a: [*]const amx.bf16,
     b: [*]const gemm_q8_0.BlockQ8_0,
@@ -2641,7 +2644,7 @@ pub export fn kt_matmul_q4_k(
     ldb: usize,
     ldc: usize,
 ) void {
-    gemm_q4_k.gemmQ4_KScalar(a, lda, b, ldb, c, ldc, m, n, k);
+    gemm_q4_k.gemmQ4_K(a, lda, b, ldb, c, ldc, m, n, k);
 }
 
 pub export fn kt_matmul_q5_k(
@@ -2655,7 +2658,7 @@ pub export fn kt_matmul_q5_k(
     ldb: usize,
     ldc: usize,
 ) void {
-    gemm_q5_k.gemmQ5_KScalar(a, lda, b, ldb, c, ldc, m, n, k);
+    gemm_q5_k.gemmQ5_K(a, lda, b, ldb, c, ldc, m, n, k);
 }
 
 pub export fn kt_matmul_q6_k(
@@ -2669,7 +2672,7 @@ pub export fn kt_matmul_q6_k(
     ldb: usize,
     ldc: usize,
 ) void {
-    gemm_q6_k.gemmQ6_KScalar(a, lda, b, ldb, c, ldc, m, n, k);
+    gemm_q6_k.gemmQ6_K(a, lda, b, ldb, c, ldc, m, n, k);
 }
 
 pub export fn kt_matmul_q8_k(
@@ -2683,7 +2686,7 @@ pub export fn kt_matmul_q8_k(
     ldb: usize,
     ldc: usize,
 ) void {
-    gemm_q8_k.gemmQ8_KScalar(a, lda, b, ldb, c, ldc, m, n, k);
+    gemm_q8_k.gemmQ8_K(a, lda, b, ldb, c, ldc, m, n, k);
 }
 
 // ============================================================================

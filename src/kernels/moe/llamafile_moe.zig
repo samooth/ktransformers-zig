@@ -228,12 +228,18 @@ pub fn gemmQuant(
     const ldc = n;
     switch (fmt) {
         KT_TYPE_Q8_0 => gemm_q8_0.gemmQ8_0Scalar(a, lda, @as([*]const gemm_q8_0.BlockQ8_0, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
-        KT_TYPE_Q4_K => gemm_q4_k.gemmQ4_KScalar(a, lda, @as([*]const gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
-        KT_TYPE_Q5_K => gemm_q5_k.gemmQ5_KScalar(a, lda, @as([*]const gemm_q5_k.BlockQ5_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
-        KT_TYPE_Q6_K => gemm_q6_k.gemmQ6_KScalar(a, lda, @as([*]const gemm_q6_k.BlockQ6_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
-        KT_TYPE_Q8_K => gemm_q8_k.gemmQ8_KScalar(a, lda, @as([*]const gemm_q8_k.BlockQ8_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
-        KT_TYPE_Q2_K => gemm_q2_k.gemmQ2_KScalar(a, lda, @as([*]const gemm_q2_k.BlockQ2_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
-        KT_TYPE_Q3_K => gemm_q3_k.gemmQ3_KScalar(a, lda, @as([*]const gemm_q3_k.BlockQ3_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        // The six K-quants use the AVX2 fused path (fused dequant + dot, scale
+        // folded into the weights). The `*Scalar` siblings are still the
+        // reference definition of each format's math and are what
+        // tests/kernels/simd_kernels_tests.zig pins the vectorized kernels
+        // against via `dequantizeRow* + f32 dot`; they are kept for that and
+        // for reading, not for speed. Numbers: bench/kquant_bench.zig.
+        KT_TYPE_Q4_K => gemm_q4_k.gemmQ4_K(a, lda, @as([*]const gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q5_K => gemm_q5_k.gemmQ5_K(a, lda, @as([*]const gemm_q5_k.BlockQ5_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q6_K => gemm_q6_k.gemmQ6_K(a, lda, @as([*]const gemm_q6_k.BlockQ6_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q8_K => gemm_q8_k.gemmQ8_K(a, lda, @as([*]const gemm_q8_k.BlockQ8_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q2_K => gemm_q2_k.gemmQ2_K(a, lda, @as([*]const gemm_q2_k.BlockQ2_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
+        KT_TYPE_Q3_K => gemm_q3_k.gemmQ3_K(a, lda, @as([*]const gemm_q3_k.BlockQ3_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
         KT_TYPE_IQ2_XXS => gemm_iq2_xxs.gemmIQ2_XXSScalar(a, @as([*]const gemm_iq2_xxs.BlockIQ2_XXS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ2_XS => gemm_iq2_xs.gemmIQ2_XSScalar(a, @as([*]const gemm_iq2_xs.BlockIQ2_XS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ2_S => gemm_iq2_s.gemmIQ2_SScalar(a, @as([*]const gemm_iq2_s.BlockIQ2_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
