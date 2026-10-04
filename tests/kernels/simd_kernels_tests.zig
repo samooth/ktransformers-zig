@@ -2688,3 +2688,223 @@ test "IQ1_M AVX2 GEMM == the scalar oracle, across super-blocks and m tails" {
         }
     }
 }
+
+
+// ============================================================================
+// INT4 GPTQ
+// ============================================================================
+
+/// Local aliases: this suite is shared and the INT4 names are declared here
+/// rather than at the top so an append-only edit cannot collide with another
+/// stream's import block.
+const g4 = kt.gemm_int4;
+const K4 = g4.GemmKernel224Int4;
+
+test "INT4 nibble unpack is in weight order and the zero point is subtracted" {
+    // The two things a nibble unpack can get wrong while still producing
+    // plausible numbers: the lo/hi ORDER (byte q holds weight 2q in its low
+    // nibble and 2q+1 in its high nibble, so a swapped pair still gives a
+    // sensible-looking weight) and the zero point (forgetting -8 shifts every
+    // weight by +8*d). Neither shows up as an obviously broken magnitude, so
+    // both are asserted directly against the spec rather than through the GEMM.
+    //
+    // One word (4 bytes) = 8 weights. Bytes chosen so every nibble is distinct:
+    // byte q = (q+8)<<4 | q, so weight 2q = q and weight 2q+1 = q+8.
+    var word: [4]u8 = undefined;
+    for (&word, 0..) |*b, q| b.* = @as(u8, @intCast(q)) | (@as(u8, @intCast(q + 8)) << 4);
+    const d: f32 = 0.5;
+    const got: [8]f32 = K4.nibble8(&word[0], d);
+    for (0..8) |t| {
+        const byte = word[t / 2];
+        const q: f32 = if (t % 2 == 0) @floatFromInt(byte & 0x0F) else @floatFromInt(byte >> 4);
+        try testing.expectEqual((q - K4.ZERO_POINT) * d, got[t]);
+    }
+    // The zero point is a SEPARATE per-group term, not folded into the scale:
+    // code 8 is the zero point, so a block of them dequantizes to exactly zero.
+    var eight: [4]u8 = .{ 0x88, 0x88, 0x88, 0x88 };
+    const zero: [8]f32 = K4.nibble8(&eight[0], 1234.5);
+    for (zero) |v| try testing.expectEqual(@as(f32, 0.0), v);
+    // ...and code 0 is -8*d, code 15 is +7*d.
+    var zero_code: [4]u8 = .{ 0x00, 0x00, 0x00, 0x00 };
+    const neg: [8]f32 = K4.nibble8(&zero_code[0], 0.25);
+    for (neg) |v| try testing.expectEqual(-8.0 * 0.25, v);
+    var max_code: [4]u8 = .{ 0xFF, 0xFF, 0xFF, 0xFF };
+    const pos: [8]f32 = K4.nibble8(&max_code[0], 0.25);
+    for (pos) |v| try testing.expectEqual(7.0 * 0.25, v);
+}
+
+test "INT4 AVX2 GEMM == the scalar oracle, bit-exactly, across shapes" {
+    // With i8 activations and 4-bit weights the whole computation is integer
+    // arithmetic times `d`: each product needs at most 11 significant bits and
+    // the 8-bit significand of `d` fits inside f32's 24, so both paths are
+    // EXACT, not merely close. That is a much stronger assertion than a
+    // tolerance and it is the point of this test: a wrong unpack, a wrong
+    // group offset or a per-element-vs-per-group scale all show up as a
+    // different integer, not as a 1e-7 wobble.
+    //
+    // Activations are kept small (|a| <= 8) so that |sum of integer products|
+    // stays under 2^16, which is what makes the exactness a guarantee rather
+    // than luck: 8 * 8 * 512 = 32768 < 65536.
+    //
+    // Shapes hit: m = 1 (the m % MR tail path only), m = 4 (exactly MR), m = 5
+    // (group + tail), n = 1 (no vectorisation on the n axis at all), k = 32
+    // exactly (one group), k = 31 (a partial group and an ODD tail, so the last
+    // weight comes from a LOW nibble), k = 33 (a full group plus one weight),
+    // and k = 48 (full group + even tail).
+    var seed: u64 = 0x1A2B_3C4D;
+    const shapes = [_][3]usize{
+        .{ 1, 1, 32 },
+        .{ 1, 1, 8 },
+        .{ 1, 3, 31 },
+        .{ 4, 7, 32 },
+        .{ 5, 1, 33 },
+        .{ 5, 2, 48 },
+        .{ 5, 7, 64 },
+        .{ 4, 2, 129 },
+        .{ 5, 7, 256 },
+        .{ 3, 5, 512 },
+    };
+    for (shapes) |sh| {
+        const m = sh[0];
+        const n = sh[1];
+        const k = sh[2];
+        const kb = (k + K4.GROUP_SIZE - 1) / K4.GROUP_SIZE;
+        const a = try testing.allocator.alloc(i8, m * k);
+        defer testing.allocator.free(a);
+        for (a) |*v| v.* = @intFromFloat(rnd(&seed, 16, 1.0));
+
+        const b = try testing.allocator.alloc(g4.BlockQ4_0, n * kb);
+        defer testing.allocator.free(b);
+        for (b) |*blk| {
+            blk.d = amx.f32_to_bf16(rnd(&seed, 64, 0.03));
+            for (&blk.qs) |*q| {
+                seed = seed *% 6364136223846793005 +% 1442695040888963407;
+                q.* = @truncate(seed >> 24);
+            }
+        }
+
+        const got = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(got);
+        const ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(ref);
+        // Poison: the vector path assigns where the scalar one assigns, so a
+        // hole in [0,m) x [0,n) has to fail rather than pass as "close".
+        @memset(got, std.math.nan(f32));
+        @memset(ref, std.math.nan(f32));
+
+        K4.gemmAvx2(@as(*const i8, @ptrCast(a.ptr)), k, @as(*const g4.BlockQ4_0, @ptrCast(b.ptr)), kb, got.ptr, n, m, n, k);
+        K4.gemmFullTileScalar(@as(*const i8, @ptrCast(a.ptr)), k, @as(*const g4.BlockQ4_0, @ptrCast(b.ptr)), kb, ref.ptr, n, m, n, k);
+
+        for (got, ref) |gv, rv| {
+            try testing.expect(std.math.isFinite(gv));
+            try testing.expectEqual(rv, gv); // EXACT
+        }
+    }
+}
+
+test "INT4 per-group scale: two groups, two scales, one answer" {
+    // The K-block-boundary trap. `applyScales` exists on the AMX path because
+    // its INT32 accumulator spans a K-block; if the scale were applied once for
+    // the whole k instead of once per group, this shape would come out as
+    // 448 (group 1's scale applied to both groups) or 224 (group 0's applied to
+    // both). Correct is 672.
+    //
+    // k = 64: group 0 is all code 15 (7*d0 per weight), group 1 all code 15
+    // (7*d1). With a = 1 everywhere and d0 = 1, d1 = 2:
+    //   32 * 7 * 1 + 32 * 7 * 2 = 224 + 448 = 672.
+    const m: usize = 1;
+    const n: usize = 2;
+    const k: usize = 64;
+    const kb: usize = 2;
+    var a: [m * k]i8 = undefined;
+    for (&a) |*v| v.* = 1;
+    var b: [n * kb]g4.BlockQ4_0 = undefined;
+    for (0..n) |j| {
+        for (0..kb) |g| {
+            b[j * kb + g].d = amx.f32_to_bf16(if (g == 0) 1.0 else 2.0);
+            for (&b[j * kb + g].qs) |*q| q.* = 0xFF; // code 15 both nibbles -> 7*d
+        }
+    }
+    var got: [m * n]f32 = undefined;
+    var scal: [m * n]f32 = undefined;
+    K4.gemmAvx2(&a[0], k, &b[0], kb, &got, n, m, n, k);
+    K4.gemmFullTileScalar(&a[0], k, &b[0], kb, &scal, n, m, n, k);
+    for (got) |v| try testing.expectEqual(@as(f32, 672.0), v);
+    for (scal) |v| try testing.expectEqual(@as(f32, 672.0), v);
+    // 672 = 224 + 448 is 3 * 224; a single-scale implementation would return
+    // 224 or 448, so the assertion above is not satisfiable by accident.
+    try testing.expect(got[0] != 224.0 and got[0] != 448.0);
+}
+
+test "INT4 ragged k: the tail is the low nibble of the last byte" {
+    // k = 33: one full 32-weight group plus ONE weight, which lives in the LOW
+    // nibble of byte 0 of the second block. Getting this wrong (reading the
+    // high nibble, or the low nibble of byte 1) still returns a plausible
+    // number, which is exactly how `kt_matmul_q{4,5,6,8}_k` and FP8 shipped
+    // ragged-k bugs.
+    const m: usize = 1;
+    const n: usize = 1;
+    const k: usize = 33;
+    const kb: usize = 2;
+    var a: [m * k]i8 = undefined;
+    for (&a) |*v| v.* = 1;
+    var b: [n * kb]g4.BlockQ4_0 = undefined;
+    // Group 0: every weight is code 8 (the zero point) -> contributes 0.
+    b[0].d = amx.f32_to_bf16(1.0);
+    for (&b[0].qs) |*q| q.* = 0x88;
+    // Group 1: byte 0 = low nibble code 15, high nibble code 0 (junk: only the
+    // low nibble is a real weight at k=32). d = 2 -> 7 * 2 = 14.
+    b[1].d = amx.f32_to_bf16(2.0);
+    for (&b[1].qs) |*q| q.* = 0x0F;
+    b[1].qs[1] = 0xF0; // if this leaked in, the answer would be 14 + (-16)
+    var got: [m * n]f32 = undefined;
+    var scal: [m * n]f32 = undefined;
+    K4.gemmAvx2(&a[0], k, &b[0], kb, &got, n, m, n, k);
+    K4.gemmFullTileScalar(&a[0], k, &b[0], kb, &scal, n, m, n, k);
+    try testing.expectEqual(@as(f32, 14.0), got[0]);
+    try testing.expectEqual(@as(f32, 14.0), scal[0]);
+}
+
+test "INT4 AVX2 GEMM survives the full i8 range at k=7168" {
+    // Deliberately NOT bit-exact here: with |a| up to 127 the integer sums stop
+    // being representable in f32 for large k, so this shape asserts a tight
+    // relative bound instead. It is the shape the benchmark runs, so the
+    // agreement number quoted in TODO.md is pinned here.
+    var seed: u64 = 0x5EED_1234;
+    const m: usize = 4;
+    const n: usize = 7;
+    const k: usize = 7168;
+    const kb: usize = k / 32;
+    const a = try testing.allocator.alloc(i8, m * k);
+    defer testing.allocator.free(a);
+    for (a) |*v| {
+        seed = seed *% 6364136223846793005 +% 1442695040888963407;
+        v.* = @bitCast(@as(u8, @truncate(seed >> 24)));
+    }
+    const b = try testing.allocator.alloc(g4.BlockQ4_0, n * kb);
+    defer testing.allocator.free(b);
+    for (b) |*blk| {
+        blk.d = amx.f32_to_bf16(rnd(&seed, 64, 0.01));
+        for (&blk.qs) |*q| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            q.* = @truncate(seed >> 24);
+        }
+    }
+    const got = try testing.allocator.alloc(f32, m * n);
+    defer testing.allocator.free(got);
+    const ref = try testing.allocator.alloc(f32, m * n);
+    defer testing.allocator.free(ref);
+    K4.gemmAvx2(@as(*const i8, @ptrCast(a.ptr)), k, @as(*const g4.BlockQ4_0, @ptrCast(b.ptr)), kb, got.ptr, n, m, n, k);
+    K4.gemmFullTileScalar(@as(*const i8, @ptrCast(a.ptr)), k, @as(*const g4.BlockQ4_0, @ptrCast(b.ptr)), kb, ref.ptr, n, m, n, k);
+    var worst: f64 = 0;
+    var worst_abs: f64 = 0;
+    for (got, ref) |gv, rv| {
+        try testing.expect(std.math.isFinite(gv));
+        const denom = @max(@abs(rv), 1e-2);
+        const rel = @abs(gv - rv) / denom;
+        worst = @max(worst, rel);
+        worst_abs = @max(worst_abs, @abs(gv - rv));
+    }
+    std.debug.print("k=7168 full-i8: worst rel {e:.3}, worst abs {e:.3}\n", .{ worst, worst_abs });
+    try testing.expect(worst < 1e-5);
+}
