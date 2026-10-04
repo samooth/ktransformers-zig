@@ -92,7 +92,22 @@ fn makeQPQuants(n: usize, nmax: i32, x: []const f32, L: []u8, qw: []const f32) f
             const sl2 = suml2 - w * lf * lf;
             if (slx > 0 and sl2 > 0) {
                 var new_l = nearestInt(x[i] * sl2 / slx);
-                new_l = @min(new_l, nmax);
+                // Clamp BOTH ends, like the four sibling sites above. This one
+                // clamped only from above, so input magnitudes outside the range
+                // this fit was designed for drove `new_l` negative and the
+                // `@intCast` below PANICKED rather than saturating — found by the
+                // measurement session, whose activations were ~128x the range the
+                // bench uses. Nothing else caught it: the bench compares the
+                // vector path against the scalar path and BOTH consume this
+                // quantizer's output, so a quantizer bug cancels out of that
+                // comparison entirely. A panic in a shared file also breaks
+                // `zig build test` for every session on the box, so the test that
+                // found it was reverted rather than shipped.
+                //
+                // Checked while fixing: `nmax` is `KMAX + 1` = 4, so there is no
+                // upper-overflow into the `u8` destination. The defect is the
+                // lower bound alone.
+                new_l = std.math.clamp(new_l, 0, nmax);
                 if (new_l != L[i]) {
                     const nf: f32 = @floatFromInt(new_l);
                     const nsx = slx + w * x[i] * nf;
