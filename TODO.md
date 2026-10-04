@@ -1091,8 +1091,30 @@ Also: the f16 trap again. `blk.d = 0.05` is stored as f16 = 0.050048828125, so a
 hand-rolled reference using the f32 literal disagrees by ~5e-4 and looks like a
 kernel bug. Two tests in this session have now been derailed by it.
 
-**IQ2_XS not started.** It shares the grid machinery plus 16 packed 4-bit
-sub-scales, so it should reuse `grid8` unchanged.
+**IQ2_XS DONE too, reusing `grid8` unchanged** — the layouts are identical
+(8 magnitude bytes per grid word, same sign convention), only the scale differs:
+16 packed 4-bit scales instead of one exponent nibble, low scale for sub-blocks
+0-1 of each group and high for 2-3.
+
+| m | scalar | avx2 | speedup | absolute |
+|---|---|---|---|---|
+| 1 | 180 ms | 4 ms | 39x | 4.24 MB / 4 ms = 1.06 GB/s |
+| 4 | 730 ms | 7 ms | 101x | |
+| 8 | 1494 ms | 19 ms | 78x | |
+
+Checksums agree on all three (e.g. 10216204.0 vs 10215942.0 at m=1).
+
+**Both formats' `gemmQuant` arms now dispatch to `gemmAvx2`, and both scalar
+references are kept** as the readable statement of the math and the oracle the
+vector paths are diffed against.
+
+**Remaining IQ: 5 formats** — IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M. The 3-bit pair
+and IQ2_S are codebook-based rather than grid-based; the two 1-bit formats add a
+sequential delta code and are the least tractable. **Apply this stream's lesson
+to all of them: write the unpack with explicit vector ops from the start.** The
+`inline for` + array-staging version of `grid8` cost a factor of ~100 on IQ2_XXS
+and the only reason it was caught is that the end-to-end ratio looked implausible
+— it did not look like a bug, it looked like a weak format.
 
 
 `src/kernels/amx/gemm_224_{iq2_xxs,iq2_xs}.zig`. The next real DeepSeek formats;

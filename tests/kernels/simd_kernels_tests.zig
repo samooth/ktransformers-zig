@@ -2150,3 +2150,62 @@ test "FP8 E4M3 encode∘decode round trips every encoding; saturation is 448, no
         try testing.expectEqual(fp8.f32_to_fp8e4m3(fp8.fp8e4m3_to_f32(b)), mxfp8.f32_to_fp8e4m3(mxfp8.fp8e4m3_to_f32(b)));
     }
 }
+
+test "IQ2_XS AVX2 GEMM == the scalar oracle, across super-blocks and m tails" {
+    // Oracle is `gemmIQ2_XSScalar` / `dequantizeRowIQ2_XS`, not a clean-room
+    // reading of the GGUF layout. k spans 1..3 super-blocks deliberately: a
+    // block-0-only test cannot catch a missing `blk * QK_K`, which is the exact
+    // bug class of e6372ee (all nine IQ scalar GEMMs). Verified by mutation —
+    // dropping `blk * QK_K` makes this test fail.
+    const g = kt.gemm_iq2_xs;
+    var state: u64 = 0x12A5_0001;
+
+    for ([_]usize{ 1, 2, 3 }) |blocks| {
+        const k = blocks * g.QK_K;
+        const nb = blocks;
+        try testing.expect(nb > 0); // a 0-block case would be vacuous
+        const m: usize = 5; // m % MR != 0, so the row tail runs
+        const n: usize = 3;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&state, 64, 2.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ2_XS, n * nb);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = @bitCast(@as(f16, 0.05));
+            for (&blk.scales) |*s| {
+                state = state *% 6364136223846793005 +% 1442695040888963407;
+                s.* = @truncate(state >> 24);
+            }
+            for (&blk.qs) |*q| {
+                state = state *% 6364136223846793005 +% 1442695040888963407;
+                q.* = @truncate(state >> 24);
+            }
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        g.gemmAvx2(a.ptr, w.ptr, c_avx.ptr, m, n, k, k, nb, n);
+        g.gemmIQ2_XSScalar(a.ptr, w.ptr, c_ref.ptr, m, n, k, k, nb, n);
+
+        for (0..m * n) |i| {
+            const av = c_avx[i];
+            const rf = c_ref[i];
+            if (std.math.isNan(rf)) {
+                try testing.expect(std.math.isNan(av));
+            } else if (std.math.isInf(rf)) {
+                try testing.expectEqual(std.math.isInf(av), std.math.isInf(rf));
+            } else {
+                try testing.expect(std.math.isFinite(av));
+                const denom = @max(@abs(rf), 1e-2);
+                try testing.expect(@abs(av - rf) / denom < 1e-3);
+            }
+        }
+    }
+}

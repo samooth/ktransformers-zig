@@ -1,3 +1,4 @@
+// CLAIM: iq2xs-avx2 — IQ2_XXS/IQ2_XS GEMM — 2026-10-04
 // GEMM Kernel 224 IQ2_XS (GGML non-linear 2.3125-bpw grid quant)
 //
 // Canonical GGUF layout (llama.cpp ggml-common.h, QK_K = 256):
@@ -26,6 +27,7 @@
 // from KGRID_2BIT_512 (iq2xs_init.initIq2XsData512).
 
 const std = @import("std");
+const buffers = @import("buffers.zig");
 const amx = @import("../arch/amx.zig");
 
 // ============================================================================
@@ -49,10 +51,14 @@ comptime {
 // Lookup tables (byte-exact from ggml-common.h / shared with IQ2_XXS)
 // ============================================================================
 
-/// kmask_iq2xs / ksigns_iq2xs shared with IQ2_XXS.
+/// kmask_iq2xs / ksigns_iq2xs, and the `grid8` unpack, are owned by
+/// gemm_224_iq2_xxs.zig. Import them, never re-declare: IQ2_XS has the identical
+/// 8-magnitude-bytes-per-grid-word layout and the same sign-bit convention, and
+/// a second copy is exactly how two formats drift apart.
 const iq2xxs = @import("gemm_224_iq2_xxs.zig");
 pub const KMASK_IQ2XS = iq2xxs.KMASK_IQ2XS;
 pub const KSIGNS_IQ2XS = iq2xxs.KSIGNS_IQ2XS;
+const grid8 = iq2xxs.grid8;
 
 /// iq2xs_grid: 512-entry u64 table (8 packed magnitude bytes per entry,
 /// alphabet {0x08, 0x19, 0x2b} — same as IQ2_XXS but denser).
@@ -250,6 +256,107 @@ pub fn dequantizeRowIQ2_XSToBF16(x: [*]const BlockIQ2_XS, y: [*]amx.bf16, k: usi
 // ============================================================================
 // Scalar GEMM (BF16 activations x IQ2_XS weights -> F32)
 // ============================================================================
+
+// ============================================================================
+// AVX2 GEMM
+// ============================================================================
+//
+// Same four rules as everywhere else: n-outer so the weight block streams from
+// DRAM once, MR=4 so four activation rows share one unpacked weight vector,
+// explicit `@mulAdd` because FP contraction is off in this toolchain, and one
+// `@reduce` per output element.
+//
+// The unpack is `grid8` from iq2_xxs, unchanged: IQ2_XS has the identical
+// 8-magnitude-bytes-per-grid-word layout and the same sign-bit convention. Only
+// the SCALE differs from IQ2_XXS — instead of one exponent nibble packed into
+// the qs u32, there are 16 packed 4-bit scales, two per `scales` byte, and the
+// first two sub-blocks of each 32-weight group use the low one while the last two
+// use the high one.
+//
+// `grid8` MUST be the vector-op version. Its first implementation used
+// `inline for` + array staging, which meant eight scalar 64-bit shifts (AVX2 has
+// none) and made this GEMM 1x instead of 69x at m=1 — see the comment on
+// `iq2xxs.grid8`.
+
+const MR: usize = 4;
+const Vec: type = @Vector(8, f32);
+
+/// 8 bf16 -> 8 f32, unaligned.
+inline fn widen8(p: [*]const amx.bf16) Vec {
+    const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+    return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+}
+
+/// AVX2 IQ2_XS GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
+/// `k` must be a multiple of QK_K, as for the scalar version.
+pub fn gemmAvx2(
+    a: [*]const amx.bf16,
+    b: [*]const BlockIQ2_XS,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    const nb = k / QK_K;
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        const brow = b + j * ldb;
+
+        var i: usize = 0;
+        while (i + MR <= m) : (i += MR) {
+            var acc = [_]Vec{@splat(0.0)} ** MR;
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                // Per-BLOCK, hoisted: the f16 super-block scale covers all 256
+                // weights. Recomputing per group was the IQ4_XS mistake.
+                const dsuper = f16_to_f32(blk_ptr.d);
+                const abase = blk * QK_K;
+                for (0..QK_K / 32) |ib32| {
+                    const sb = blk_ptr.scales[ib32];
+                    const db_lo = dsuper * (0.5 + @as(f32, @floatFromInt(sb & 0xf))) * 0.25;
+                    const db_hi = dsuper * (0.5 + @as(f32, @floatFromInt(sb >> 4))) * 0.25;
+                    inline for (0..4) |l| {
+                        const db: f32 = if (l / 2 == 0) db_lo else db_hi;
+                        const word: u16 = blk_ptr.qs[4 * ib32 + l];
+                        const grid: u64 = IQ2XS_GRID[word & 511];
+                        const signs: u8 = KSIGNS_IQ2XS[(word >> 9) & 127];
+                        const w = grid8(grid, signs) * @as(Vec, @splat(db));
+                        const koff = abase + ib32 * 32 + l * 8;
+                        inline for (0..MR) |r| {
+                            acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + koff), w, acc[r]);
+                        }
+                    }
+                }
+            }
+            inline for (0..MR) |r| c[(i + r) * ldc + j] = @reduce(.Add, acc[r]);
+        }
+
+        // Row tail (m % MR), one row at a time.
+        while (i < m) : (i += 1) {
+            var acc: Vec = @splat(0.0);
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                const dsuper = f16_to_f32(blk_ptr.d);
+                const abase = blk * QK_K;
+                for (0..QK_K / 32) |ib32| {
+                    const sb = blk_ptr.scales[ib32];
+                    const db_lo = dsuper * (0.5 + @as(f32, @floatFromInt(sb & 0xf))) * 0.25;
+                    const db_hi = dsuper * (0.5 + @as(f32, @floatFromInt(sb >> 4))) * 0.25;
+                    inline for (0..4) |l| {
+                        const db: f32 = if (l / 2 == 0) db_lo else db_hi;
+                        const word: u16 = blk_ptr.qs[4 * ib32 + l];
+                        const koff = abase + ib32 * 32 + l * 8;
+                        acc = @mulAdd(Vec, widen8(a + i * lda + koff), grid8(IQ2XS_GRID[word & 511], KSIGNS_IQ2XS[(word >> 9) & 127]) * @as(Vec, @splat(db)), acc);
+                    }
+                }
+            }
+            c[i * ldc + j] = @reduce(.Add, acc);
+        }
+    }
+}
 
 pub fn gemmIQ2_XSScalar(
     a: [*]const amx.bf16,

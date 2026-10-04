@@ -258,7 +258,7 @@ inline fn widen8(p: [*]const amx.bf16) Vec {
 ///
 /// The sign multiplier is `(bit << 1) - 1`, i.e. -1 for a clear bit and +1 for a
 /// set bit, so the sign is a shift/subtract/convert rather than a select.
-inline fn grid8(grid64: u64, signs: u8) Vec {
+pub inline fn grid8(grid64: u64, signs: u8) Vec {
     const bytes: @Vector(8, u8) = @bitCast(grid64);
     const mag: Vec = @floatFromInt(@as(@Vector(8, i32), @intCast(bytes)));
 

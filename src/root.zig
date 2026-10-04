@@ -146,6 +146,7 @@ comptime {
     _ = &gemm_iq2_xs.dequantizeRowIQ2_XS;
     _ = &gemm_iq2_xs.dequantizeRowIQ2_XSToBF16;
     _ = &gemm_iq2_xs.gemmIQ2_XSScalar;
+    _ = &gemm_iq2_xs.gemmAvx2;
     _ = &gemm_iq2_xs.quantizeRowIQ2_XS_WithInit;
     _ = &iq2xs_init.KGRID_2BIT_512;
     _ = &iq2xs_init.initIq2XsData512;
