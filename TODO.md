@@ -231,7 +231,16 @@ threshold or the quantizer deserves a second look). Both need test_kernels.zig
 or a live-suite home, which this stream did not touch.
 
 
-**Stream D — SwiGLU activation, 0.57x. UNCLAIMED, with a diagnosis.**
+**Stream D — SwiGLU activation, 0.57x. CLAIMED (swiglu-regalloc) since
+2026-10-04.**
+**This claim edits `src/kernels/arch/amx.zig`** (`expVec`/`expScalar` only) plus
+append-only test lines in `tests/kernels/simd_kernels_tests.zig` and this
+section. The arch-layer hold is free: Stream J (`iq4xs-avx2`) committed its
+`pshufb16` work as `2416b68` and released the exclusive claim, which had
+explicitly blocked this item until then. `amx.zig` is clean at HEAD, and the only
+other live claim in the tree (Stream B / `fp8-gemm-avx2`,
+`src/kernels/amx/gemm_224_fp8.zig`) does not overlap. Any *other* task that needs
+`amx.zig` must wait for this one the way Stream J waited for P1.3.
 The activation is the one place the port is still clearly behind. Measured
 instruction counts for the 8-element body: **Zig 48, C++ 40.** The difference
 is not algorithmic — both do `vpmovzxwd` + `vpslld` and an FMA polynomial — it
@@ -638,40 +647,6 @@ together, then the two 1-bit formats last. The open `vpshufb` item below would
 also lift IQ4_NL, IQ4_XS and MXFP4 together, so doing it before the remaining
 seven may be worth more than a seventh format.
 
-**Stream J — `vpshufb` table lookup, shared. CLAIMED (iq4xs-avx2) since
-2026-10-03.** IN FLIGHT at the time of writing: `pshufb16` / `pshufbTable` in
-`src/kernels/arch/amx.zig`, `kvalues16` in `gemm_224_iq4_xs.zig`, uncommitted.
-
-**This claim holds `src/kernels/arch/amx.zig` exclusively until the work is
-committed.** That file is layer 1 and every kernel in the tree imports it, so no
-other task may touch it in the meantime. In particular it **blocks roadmap
-P1.3, the SwiGLU activation**, whose fix lives in `expVec` in the same file —
-do not start that task until this claim is released.
-
-Why the arch layer is the right home rather than a copy per format: `vpshufb`
-is an arch intrinsic, like the AMX tile helpers already there, and the whole
-point of the item is to have ONE implementation that the IQ and MX formats
-share. The cost is the wide blast radius, which is what the exclusive hold is
-for.
-
-The win it targets: the small quant tables (`KVALUES_IQ4NL` and its relatives)
-are 16 bytes, and `vpshufb` is exactly a 16-entry byte-indexed lookup, so the
-non-linear dequant that currently costs 8 scalar table loads per 8 weights
-becomes one instruction. IQ4_NL was measured lookup-bound at m=1 for that
-reason — 2.1 GB/s against Q8_0's table-free 7.8 GB/s.
-
-**Two traps in the helper, both worth a test rather than a comment.**
-- The AT&T operand order is the reverse of Intel's: `vpshufb %[i], %[t], %[r]`
-  means `r = shuffle(t, i)`. Written the other way round it still compiles and
-  still emits bytes, and it returns zero for any table byte with bit 7 set — a
-  silent wrong answer, not a build failure. `KVALUES_IQ4NL` is non-negative so
-  its bytes are clear, but the same helper is about to be applied to the 2-bit
-  and 1-bit tables, and at least one of those has signed entries. The round-trip
-  test must cover a table with a high-bit byte before the helper is shared.
-- Do **not** sweep `src/kernels/amx/gemm_224_fp8.zig` into this commit. It holds
-  an uncommitted lookup table written by a different session (see Stream B); it
-  is not part of this work. Stage by filename.
-
 **Stream J — `vpshufb` table lookup + the real IQ4_XS bottleneck. DONE. CLAIMED
 (pshufb) since 2026-10-03.**
 
@@ -734,6 +709,26 @@ than fixed, since the worker pool is not this stream's file.
 **Verification.** Because the parallel runner stalls, every suite was verified by
 running its compiled binary directly: **268 tests, all passing** (266 plus the two
 new `vpshufb` tests). `verify_abi.py` 112/112; avx2 and amx variants build.
+
+**Housekeeping left by this stream.**
+- The arch-layer hold is **released**: `src/kernels/arch/amx.zig` is committed and
+  clean, so roadmap **P1.3 (the SwiGLU activation) is unblocked** and can be
+  claimed. Note that `expVec` moved down the file when `pshufb` landed —
+  it is now at line 675, with the EXP_* constants at 634-645 — so any anchor
+  written before that commit is stale.
+- `pshufb16` now shares the file with everything else, and `ByteVec`
+  (`@Vector(32, u8)`) is a new shared type there. Any task that needs the arch
+  layer must claim it again; it is no longer held.
+- **One forward-looking warning, still open:** `KVALUES_IQ4NL` has no bytes with
+  bit 7 set, so the round-trip test proves the operand order for that table
+  only. Before `pshufb16` is reused for the 2-bit and 1-bit tables, check
+  whether those tables carry signed entries — a table byte with bit 7 set makes
+  the swapped-operand-order bug return zeros, and it would still compile.
+- The uncommitted FP8 lookup table that briefly sat next to this work was
+  committed separately (`1e8369a`, `4f222ba`) and is Stream B's; nothing from
+  that stream was absorbed here.
+- The CI test step is now bounded (`timeout 2400 zig build test`), so the hang
+  recorded above fails the job instead of stalling it.
 
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
 
