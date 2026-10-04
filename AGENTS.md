@@ -238,9 +238,19 @@ Benchmarked against the C++ reference's own AVX2 kernels
 (`kt-kernel/operators/avx2/avx2_bf16_gemm.hpp`) with
 `bench/cpp_vs_zig/run.sh` — see that directory's `README.md` (how to run,
 `KT_REF`/`KT_PIN`) and `RESULTS.md` (the measurement record); as of the SIMD
-rework the Zig port is **1.13x-1.88x the reference** on BF16 GEMM and
-**0.67x** on SwiGLU (with bit-identical output). Four rules carry almost all of
-it:
+rework the Zig port is **1.21x-1.34x the reference** on BF16 GEMM and
+**0.68x** on SwiGLU (with bit-identical output). Four rules carry almost all of
+it.
+
+That range was previously written up here as 1.13x-1.88x, and it was wrong: it
+accumulated across mixed load conditions and most of the spread was the host, not
+the kernels. The 1.88x was a real measurement of a run at load 74 where the same
+binary took 2139 ms against 509 ms on a quiet box. Re-measured with a
+same-code control arm on each side, the range is **tighter and lower than
+advertised** — the work really is ahead of the reference, but by less than this
+file used to claim. Read `docs/measuring.md` before quoting ANY ratio from this
+file: the noise floor is load-dependent (1.02x-1.14x at load 2-4, ~1.25x at load
+80), so a ratio without the floor beside it is not a result.
 
 1. **`@exp` does not vectorize.** compiler-rt has only scalar `expf` and Zig
    does not target libmvec, so `@exp` on `@Vector(8, f32)` becomes 8 scalar
@@ -292,7 +302,8 @@ format's math and the reference the new tests compare against. Note their
 `tests/kernels/simd_kernels_tests.zig`.
 
 **Next performance work is in `docs/perf-roadmap.md`.** Short version: BF16
-GEMM is won (1.13x-1.88x of the C++ reference) and the six K-quants are now
+GEMM is won (1.21x-1.34x of the C++ reference, re-measured with a control arm;
+the old 1.13x-1.88x was mostly the host) and the six K-quants are now
 vectorized too (6.3x-15.7x over their own scalar versions), but the remaining
 *quantized* families — Q8_0 and the nine IQ* formats — are still scalar on
 non-AMX hosts, and the C++ reference has 10 AVX2 kernels we do not run at all
@@ -391,3 +402,32 @@ rules.toml edit, that's what happened.
 - `PLAN.md`, `LESSONS_KTRANSFORMERS.md` referenced by older docs do not exist.
 - Multiple agents have worked in this tree concurrently: before running
   `git stash`/`git checkout`, check `git status` for live WIP that isn't yours.
+
+### Claims — including on SHARED files
+
+`grep -rn "^// CLAIM:" src/` answers "is this file free?" without anyone having
+to ask. Claim a file before editing it, and release the marker in the same
+commit that lands the work, so the two never disagree.
+
+**`TODO.md` and `tests/kernels/simd_kernels_tests.zig` are CLAIMABLE like any
+other file.** That is not a technicality — it is the fix for a failure that
+happened twice here. `git add <file>` stages the file's *entire* working state,
+so two sessions with uncommitted edits in one file will always sweep each other's
+work into whichever commit lands first. It happened to a test suite and to a
+`TODO.md` write-up before this rule existed. "Stage by filename" does not prevent
+it; it is the wrong instinct, not a solution.
+
+If a shared file is held and you cannot wait: put your write-up in your own notes
+file and hand the text to the coordinator to fold in. If you are the coordinator,
+integrating someone else's text is your job, not theirs.
+
+Two more coordination rules learned the hard way:
+
+- **`docs/measuring.md` governs any performance claim.** A ratio without its
+  noise floor is not a result, and a floor quoted from an earlier session is
+  fabricated rather than conservative.
+- **A negative result is a deliverable.** Implement the fix, measure it, revert
+  it, and write up why it did not work. Three of the most useful findings in this
+  repo are a register-pressure diagnosis that was wrong, an instruction count
+  that was off by 8, and a kernel that turned out to be 165x faster than a
+  microbenchmark claimed.

@@ -844,11 +844,15 @@ var list2 = try std.ArrayList(u32).initCapacity(allocator, 8);
 defer list2.deinit(allocator);
 ```
 
-NOTE: some older files in this repo (`runtime/task_queue.zig`, `memory.zig`,
-`worker_pool.zig`, `cpu_detect.zig`) still use `ArrayList(T).init(allocator)` /
-managed `.append(item)`. That code predates this check — it compiles only if
-those paths are never analyzed, and will break the moment they are. Treat the
-unmanaged style as the repo standard for new code.
+NOTE: two older files in this repo still use `ArrayList(T).init(allocator)` /
+managed `.append(item)`: `runtime/task_queue.zig` (2 sites) and `memory.zig`
+(1 site). That code predates this check — it compiles only if those paths are
+never analyzed, and will break the moment they are. Treat the unmanaged style as
+the repo standard for new code.
+
+(This list previously also named `worker_pool.zig` and `cpu_detect.zig`. Both
+have been converted and have zero managed `.init` calls now; the list is
+re-verified against the source rather than left to rot.)
 
 ### 2. `alignedAlloc` takes a `std.mem.Alignment` enum, not a number
 
