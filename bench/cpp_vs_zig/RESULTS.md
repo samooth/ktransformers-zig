@@ -29,6 +29,10 @@ moves them by up to 3x.
 
 ## GEMM: `gemmExpert` vs `avx2::gemm_bf16`
 
+> Superseded by the control-armed re-measurement below, which has a noise floor
+> attached to every ratio. Kept for the record of what was claimed and when;
+> where the two disagree, the control-armed table is the one to believe.
+
 Best-of-5 runs x 5 harness invocations, pinned to one core.
 
 | case | shape | C++ ms | Zig ms | C++ GF/s | Zig GF/s | **Zig/C++** |
@@ -117,11 +121,90 @@ prefill (8 tok, k=4) 7.98 ms.
 
 | | before | after |
 |---|---|---|
-| BF16 GEMM vs C++ reference | 0.19x – 0.46x | **1.13x – 1.88x** |
-| SwiGLU vs C++ reference | 0.06x | **0.67x** |
+| BF16 GEMM vs C++ reference | 0.19x – 0.46x | **1.22x – 1.33x** (control-armed, quiet box; see below) |
+| SwiGLU vs C++ reference | 0.06x | **0.68x** |
 | MLA o_proj | 63.5 ms | **13.7 ms** (19.3 GB/s) |
 | `f32_to_bf16` | truncate (biased, disagrees with ggml) | round-to-nearest-even |
 | `exp` accuracy | libm `expf` | <= 1 ULP, 89.8% bit-identical |
+
+## Control-armed re-measurement (2026-10-04, commit `00c67e2`)
+
+Produced by `zig run bench/cpp_vs_zig/measure.zig -- --iters 3 --pin 9`, which
+is the first pass over this table that carries its own **noise floor** rather
+than asking the reader to trust a ratio. Each side runs twice per iteration as
+a same-code control (`cpp`/`cppctl`, `zig`/`ctl`), four arms interleaved and
+pinned; a row's floor is the widest spread over all samples of identical code
+per side, compounded across the two sides. A ratio inside the floor is not
+printed at all.
+
+**Load average 2.83 / 3.98 / 14.98** on 16 cores — a quiet box, which matters
+more than anything else here (see the floor note at the end).
+
+| case | shape | C++ ms | Zig ms | floor | ratio | verdict |
+|---|---|---|---|---|---|---|
+| decode gate/up | m=1, n=2048, k=7168 | 1.3035 | 1.3637 | 1.087x | — | **UNMEASURABLE** |
+| decode down | m=1, n=7168, k=2048 | 1.4406 | 1.3756 | 1.054x | — | **UNMEASURABLE** |
+| small decode | m=8 | 8.1028 | 6.0895 | 1.011x | **1.33x** | faster |
+| prefill 32 | m=32 | 30.8928 | 23.7257 | 1.051x | **1.30x** | faster |
+| prefill 128 | m=128 | 124.3171 | 101.8572 | 1.022x | **1.22x** | faster |
+| prefill 512 | m=512 | 505.1957 | 413.7446 | 1.031x | **1.22x** | faster |
+| SwiGLU | m=128, n=2048 | 0.1377 | 0.2029 | 1.051x | **0.68x** | slower |
+
+**5 of 7 rows resolved.** An earlier pass of the same run, at load 3.60, gave
+1.34 / 1.32 / 1.22 / 1.20 / 0.67 on the same five rows — agreement to 1-2%, which
+is what a resolved row should look like.
+
+### What changed against the recorded table
+
+- **The two `m=1` rows are not measurable and never were.** The recorded
+  1.20x / 1.18x, the "Zig/C++ today" column's 0.83x / 1.02x, and the 0.79x /
+  0.45x that `run.sh` printed on the day are three mutually inconsistent answers
+  to the same question. The floor (1.087x, 1.054x) is wider than any of them.
+  The old prose verdict — "treat it as parity, ±20%" — was the right conclusion
+  reached without the instrument to justify it. Now it is measured, and it is
+  unmeasurable on this host at any iteration count that fits in a work session.
+- **`prefill 512` is 1.22x, not 1.88x.** The recorded 1.88x is above the floor
+  and so was, in fairness, a real measurement — of a run at load 74, where this
+  harness took 2139 ms against today's 505 ms for the same binary. The GEMM is
+  bandwidth-bound and the box was 4x oversubscribed. This is the row that most
+  needs a quiet host and least benefits from a busy one.
+- **`prefill 128` is 1.22x, not the 0.78x `run.sh` printed on the day.** Same
+  cause, opposite direction: that 0.78x was below the floor and was noise
+  reading low. A published ratio of 0.78x on this row would have been read as a
+  regression.
+- **`prefill 128` recorded 1.13x → 1.22x**, and the headline range
+  "1.13x – 1.88x" in the summary above should become **1.22x – 1.33x**.
+- **SwiGLU 0.68x reproduces exactly.** Three independent measurements today
+  (0.67 / 0.68 / 0.68) and the recorded 0.67x. It is the only row in the table
+  that was ever a reliable signal, which is consistent with P1.3: it is the one
+  row small enough to pin.
+
+### The floor is load-dependent, and that is the actionable finding
+
+| load average | measured floor |
+|---|---|
+| 2.8 – 6 | 1.01x – 1.09x |
+| 17 – 27 | ~1.17x |
+| ~80 | ~1.25x |
+
+The 14–23% noise figures quoted elsewhere in this repo (TODO.md, roadmap P1.3)
+were measured at load 17–80. On a **quiet** box the floor is ~1.01–1.09x, five
+rows resolve, and the `m>=8` GEMM spread is 1.22–1.33x rather than the
+1.13–1.88x the record accumulated across mixed conditions. Re-measuring is worth
+doing; so is picking when.
+
+### Reproducing, and checking the instrument
+
+    zig run bench/cpp_vs_zig/measure.zig -- --self-test --iters 3 --pin 9
+
+Both arms become the same binary, so the true ratio is exactly 1.0 and **every
+row must read UNMEASURABLE**. This is how the floor above was established, and
+it should be re-run before trusting any table produced by this tool: the first
+two implementations of the floor both passed a casual look and failed it (one
+printed a spurious "0.80x, slower" at load 80, another printed "0.96x, slower"
+twice in three on a quiet box), because the minimum is an extreme order
+statistic and two small samples of it agree by luck. Run the self-test and watch
+for zero resolved rows.
 
 ## Cross-check re-measurement (2026-10-03, after the K-quant AVX2 work)
 
