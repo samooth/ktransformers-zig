@@ -205,9 +205,18 @@ pub const Subpool = struct {
                 _ = self.done_count.fetchAdd(1, .monotonic);
             }
 
-            // Signal completion (hold mutex to avoid missed wakeup)
+            // Signal completion (hold mutex to avoid missed wakeup).
+            //
+            // BROADCAST, not signal. `done_cv` carries TWO predicates: this
+            // job's dispatcher (`done_count >= task_end`) and any concurrent
+            // `waitIdle` (`pending_jobs <= allow`). `signal` wakes exactly one of
+            // them, and if that is the waitIdle caller then a dispatcher sitting
+            // on an ALREADY-SATISFIED predicate stays asleep — with the only
+            // remaining wakeup emitted by doWorkStealingJob after it returns, so
+            // the two wait on each other. There are at most two waiters here,
+            // which makes waking both free and the lost wakeup impossible.
             _ = c.pthread_mutex_lock(&self.mutex);
-            _ = c.pthread_cond_signal(&self.done_cv);
+            _ = c.pthread_cond_broadcast(&self.done_cv);
             _ = c.pthread_mutex_unlock(&self.mutex);
         }
     }
@@ -217,6 +226,25 @@ pub const Subpool = struct {
         // B3: register this job as in-flight BEFORE any observable
         // work begins, so a concurrent waitIdle can't miss it.
         _ = self.pending_jobs.fetchAdd(1, .acq_rel);
+
+        // Degenerate subpool: no workers were ever spawned, so the completion
+        // wait below can never be satisfied and the caller blocks forever. Run
+        // the tasks on the CALLING thread instead.
+        //
+        // This is a safety net for a Subpool constructed directly with
+        // thread_count == 0, which `WorkerPool.init` now clamps away — it exists
+        // so that "no workers" degrades to serial execution rather than to a
+        // permanent hang. The pending_jobs accounting is identical either way,
+        // so a concurrent waitIdle still sees the job as in flight for its
+        // whole duration and cannot return early.
+        if (self.thread_count == 0) {
+            for (0..count) |i| work_fn(i);
+            _ = self.pending_jobs.fetchSub(1, .acq_rel);
+            _ = c.pthread_mutex_lock(&self.mutex);
+            _ = c.pthread_cond_broadcast(&self.done_cv);
+            _ = c.pthread_mutex_unlock(&self.mutex);
+            return;
+        }
 
         _ = c.pthread_mutex_lock(&self.mutex);
         self.task_curr.store(0, .monotonic);
@@ -310,11 +338,29 @@ pub const WorkerPool = struct {
                 if (i < lists.len) lists[i] else null
             else
                 null;
+            // A subpool with ZERO threads can never complete a job: nothing
+            // exists to increment `done_count`, so `doWorkStealingJob` blocks
+            // forever on `done_cv` — no timeout, no CPU use, and every worker
+            // the caller *did* ask for elsewhere is idle. It looks exactly like
+            // the deadlock this suite was written for, which is why it needs
+            // naming rather than leaving to be rediscovered.
+            //
+            // It is reachable from the C ABI, which takes
+            // `subpool_thread_count[i]` straight from the caller: deriving it
+            // from a per-node CPU count is the obvious thing to do, and a node
+            // reporting no CPUs yields 0. The test at the top of the sibling
+            // suite documents that this host has a node whose CPU list comes
+            // back empty.
+            //
+            // Clamp to 1 rather than reject: a subpool whose CPU list is empty
+            // is still a legitimate request, and running one worker unpinned is
+            // strictly better than refusing to build the pool at all.
+            const nthreads = @max(1, config.subpool_thread_count[i]);
             subpools[i] = try Subpool.init(
                 allocator,
                 i,
                 config.subpool_numa_map[i],
-                config.subpool_thread_count[i],
+                nthreads,
                 subpool_cpus,
                 config.enable_work_stealing,
             );

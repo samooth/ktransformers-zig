@@ -5,7 +5,7 @@ const std = @import("std");
 const root = @import("root.zig");
 
 const memory = root.memory;
-const worker_pool = root.worker_pool;
+pub const worker_pool = root.worker_pool;
 const task_queue = root.task_queue;
 const cpu_detect = root.cpu_detect;
 const numa = root.numa;
