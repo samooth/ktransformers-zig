@@ -130,6 +130,7 @@ comptime {
     _ = &gemm_iq2_xxs.dequantizeRowIQ2_XXS;
     _ = &gemm_iq2_xxs.dequantizeRowIQ2_XXSToBF16;
     _ = &gemm_iq2_xxs.gemmIQ2_XXSScalar;
+    _ = &gemm_iq2_xxs.gemmAvx2;
     _ = &gemm_iq3_xxs.BlockIQ3_XXS;
     _ = &gemm_iq3_xxs.IQ3XXS_GRID;
     _ = &gemm_iq3_xxs.dequantizeRowIQ3_XXS;

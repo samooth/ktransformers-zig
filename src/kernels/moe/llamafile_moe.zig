@@ -240,7 +240,7 @@ pub fn gemmQuant(
         KT_TYPE_Q8_K => gemm_q8_k.gemmQ8_K(a, lda, @as([*]const gemm_q8_k.BlockQ8_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
         KT_TYPE_Q2_K => gemm_q2_k.gemmQ2_K(a, lda, @as([*]const gemm_q2_k.BlockQ2_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
         KT_TYPE_Q3_K => gemm_q3_k.gemmQ3_K(a, lda, @as([*]const gemm_q3_k.BlockQ3_K, @ptrCast(@alignCast(b))), ldb, c, ldc, m, n, k),
-        KT_TYPE_IQ2_XXS => gemm_iq2_xxs.gemmIQ2_XXSScalar(a, @as([*]const gemm_iq2_xxs.BlockIQ2_XXS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
+        KT_TYPE_IQ2_XXS => gemm_iq2_xxs.gemmAvx2(a, @as([*]const gemm_iq2_xxs.BlockIQ2_XXS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ2_XS => gemm_iq2_xs.gemmIQ2_XSScalar(a, @as([*]const gemm_iq2_xs.BlockIQ2_XS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ2_S => gemm_iq2_s.gemmIQ2_SScalar(a, @as([*]const gemm_iq2_s.BlockIQ2_S, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),
         KT_TYPE_IQ3_XXS => gemm_iq3_xxs.gemmIQ3_XXSScalar(a, @as([*]const gemm_iq3_xxs.BlockIQ3_XXS, @ptrCast(@alignCast(b))), c, m, n, k, lda, ldb, ldc),

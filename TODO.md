@@ -677,7 +677,8 @@ Q8_0's table-free 7.8 GB/s). `vpshufb` would be the natural fix since the table
 is 16 bytes and `vpshufb` is exactly a 16-entry byte shuffle, but it needs
 inline asm.
 
-**Stream I — IQ4_XS GEMM. DONE (3x at m=1, 12x at m=4/m=8). CLAIMED (iq4xs-avx2)
+**Stream I — IQ4_XS GEMM. DONE (see Stream J for the final number: 5-9x at m=1,
+17-19x at m=4/m=8 after the pshufb + scale-hoist follow-up). CLAIMED (iq4xs-avx2)
 since 2026-10-03.** Second of the nine IQ formats.
 
 | m | scalar | avx2 | speedup |
@@ -823,6 +824,94 @@ new `vpshufb` tests). `verify_abi.py` 112/112; avx2 and amx variants build.
   that stream was absorbed here.
 - The CI test step is now bounded (`timeout 2400 zig build test`), so the hang
   recorded above fails the job instead of stalling it.
+
+**Stream K — IQ2_XXS GEMM. PARTIAL/WEAK RESULT (1x at m=1, 4x at m=4/m=8).
+CLAIMED (iq2xs-avx2) since 2026-10-04.**
+
+**This is a much weaker result than every other format in this session, and the
+reason is structural rather than a mistake.** Recorded as a negative result
+because "it vectorizes, therefore it's fast" is exactly the assumption this
+format breaks.
+
+| format | m=1 | m=4/m=8 |
+|---|---|---|
+| IQ4_XS | 5-9x | 17-19x |
+| Q8_0 | 4x | 13x |
+| MXFP4 | 3x | 11x |
+| **IQ2_XXS** | **1x** | **4x** |
+
+| m | scalar | avx2 | speedup |
+|---|---|---|---|
+| 1 | 313 ms | 283 ms | 1x |
+| 4 | 1332 ms | 295 ms | 4x |
+| 8 | 2463 ms | 604 ms | 4x |
+
+at n=2048, k=7168, pinned, ReleaseFast, best of 3, reproducible across three
+consecutive runs.
+
+**Why it is unpack-bound.** IQ2_XXS needs, per 8 weights, TWO table lookups
+(`IQ2XXS_GRID[fp]` — 256 entries of u64, 2 KB — and `KSIGNS_IQ2XS[idx]`, 128
+entries) plus eight byte extractions out of a u64. AVX2 has **no 64-bit integer
+shift**, so those eight extractions are scalar work that LLVM can only partly
+bundle (disassembly shows 8 `vcvtdq2ps` + 4 `vpmovzxbd`, so it does vectorize the
+int-to-float part, but the 64-bit shifts stay scalar). The unpack cost is paid
+per output element and is INDEPENDENT of m, so MR=4 can only amortize it 4x —
+which is precisely the 4x observed, and why m=1 is flat. Time is nearly constant
+in m (283 / 295 / 604 ms), which is the signature of an unpack-bound kernel.
+
+**UNEXPLAINED ANOMALY — do not trust these absolute numbers.** 3.8 MB in ~290 ms
+is 13 MB/s, roughly 40x worse than IQ4_XS on the same host at the same moment
+(7.8 MB in 15-18 ms). An op-count estimate puts this kernel at single-digit
+milliseconds. A 90x gap between the estimate and the measurement means something
+is badly wrong that I have not found, and it is the first thing to check before
+building on this. Candidates I did not rule out: the 2 KB grid table thrashing
+L1 under realistic (non-constant) fingerprints; the scalar 64-bit shifts not
+pipelining; or the benchmark's constant `0x35` payloads producing a pathological
+access pattern that a real model would not. The 4x ratio is real; the absolute
+throughput is not understood.
+
+**Kept the dispatch change** (never slower: 283 vs 313 ms at m=1) but the vector
+path should not be considered a win for this format until the anomaly is
+explained.
+
+**A real bug caught en route, and it is the reason the claim names the oracle.**
+`grid8` first extracted **nibbles** (`>> 4*j`) where `dequantizeRowIQ2_XXS` reads
+`grid_bytes[j]`, i.e. a **byte** index into the u64. Wrong for all 256 weights.
+Confirmed by hand: grid `0x192B19190819082B`, byte 0 = 0x2B = 43, and
+6.179741 / 0.14375 = 43.0. This is precisely the "packed exponent nibble in the
+same u32 as the sign indices" hazard the claim warned about — a clean-room
+reading of the spec gets it wrong, and only diffing against the existing
+dequantizer catches it.
+
+Also: the f16 trap again. `blk.d = 0.05` is stored as f16 = 0.050048828125, so a
+hand-rolled reference using the f32 literal disagrees by ~5e-4 and looks like a
+kernel bug. Two tests in this session have now been derailed by it.
+
+**IQ2_XS not started.** It shares the grid machinery plus 16 packed 4-bit
+sub-scales, so it should reuse `grid8` unchanged.
+
+
+`src/kernels/amx/gemm_224_{iq2_xxs,iq2_xs}.zig`. The next real DeepSeek formats;
+both are 256-weight super-blocks with a 32 x 16-bit packed field that has to be
+reinterpreted as 2 x u32 before anything can be unpacked.
+
+Much heavier than the 4-bit formats: **two table lookups per 8 weights**, not a
+nibble unpack. Per 8-weight sub-block it needs `IQ2XXS_GRID[fingerprint]` (a
+256-entry u64 table, 2 KB) and `KSIGNS_IQ2XS[sign_idx]` (128 entries), then 8
+nibble extractions from the grid and 8 sign bits from the signs byte. The saving
+grace is that both tables are tiny and L1-resident.
+
+Two things that make it more tractable than it first looks:
+- `KMASK_IQ2XS = {1,2,4,8,16,32,64,128}`, so `signs & KMASK[j]` is exactly
+  **bit j of the signs byte**. No mask table is needed at all.
+- `KSIGNS_IQ2XS` is 128 entries, which does NOT fit a `vpshufb` (16 per lane),
+  so it stays a scalar load — but it is only 128 bytes and always hot in L1.
+
+**The oracle for both is the existing `dequantizeRow*`, not my reading of the
+GGUF spec.** These formats pack an exponent nibble into the same u32 as the sign
+indices, which is exactly the kind of detail that is easy to misread and that a
+"clean-room" reimplementation gets wrong. The vector path must reproduce the
+existing dequantizer's output exactly; that is the acceptance criterion.
 
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
 

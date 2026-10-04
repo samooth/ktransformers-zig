@@ -1,3 +1,4 @@
+// CLAIM: iq2xs-avx2 — IQ2_XXS/IQ2_XS GEMM — 2026-10-04
 // GEMM Kernel 224 IQ2_XXS (GGML non-linear 2.0625-bpw grid quant)
 //
 // Canonical GGUF layout (llama.cpp ggml-common.h, QK_K = 256):
@@ -202,6 +203,147 @@ pub fn dequantizeRowIQ2_XXSToBF16(x: [*]const BlockIQ2_XXS, y: [*]amx.bf16, k: u
 // ============================================================================
 // Scalar GEMM (BF16 activations x IQ2_XXS weights -> F32)
 // ============================================================================
+
+// ============================================================================
+// AVX2 GEMM
+// ============================================================================
+//
+// Same four rules as everywhere else: n-outer so the weight block streams from
+// DRAM once, MR=4 so four activation rows share one unpacked weight vector,
+// explicit `@mulAdd` because FP contraction is off in this toolchain, and one
+// `@reduce` per output element.
+//
+// This format is the heaviest of the ones vectorized so far: TWO table lookups
+// per 8 weights (a 256-entry u64 grid table and a 128-entry sign table) rather
+// than a nibble unpack. What keeps it cheap is that both tables are tiny and
+// L1-resident — 2 KB and 128 B — so both are scalar loads on purpose.
+//
+// `KMASK_IQ2XS = {1,2,4,8,16,32,64,128}` means `signs & KMASK[j]` is simply bit
+// j of the signs byte, so the sign vector needs no mask table: broadcast the
+// byte, shift by 0..7, and select.
+//
+// ORACLE DISCIPLINE: `grid8` reproduces `dequantizeRowIQ2_XXS` exactly, it is
+// not an independent reading of the GGUF layout. These formats pack an exponent
+// nibble into the same u32 as the sign indices, which is precisely the sort of
+// detail a clean-room reimplementation gets wrong, so the vector path is
+// required to match the existing dequantizer bit for bit.
+
+const MR: usize = 4;
+const Vec: type = @Vector(8, f32);
+
+/// 8 bf16 -> 8 f32, unaligned.
+inline fn widen8(p: [*]const amx.bf16) Vec {
+    const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+    return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+}
+
+/// 8 weights from one grid word and one signs byte: **byte** j of the grid is
+/// the magnitude of weight j, and bit j of `signs` is its sign.
+///
+/// BYTE, not nibble. The first version of this extracted nibbles (`>> 4*j`) and
+/// was wrong for all 256 weights; `dequantizeRowIQ2_XXS` reads
+/// `grid_bytes[j]`, i.e. a byte index into the u64. Checked by hand against a
+/// random block: grid `0x192B19190819082B`, byte 0 = 0x2B = 43, and the
+/// reference value divided by the group scale is 6.179741 / 0.14375 = 43.0.
+///
+/// The sign needs no mask table: `KMASK_IQ2XS = {1,2,4,...,128}` means
+/// `signs & KMASK[j]` is exactly bit j of the byte. Register-only work, so
+/// `inline for` unrolls it to vector ops rather than 8 scalar memory
+/// round-trips.
+inline fn grid8(grid64: u64, signs: u8) Vec {
+    var mag: [8]f32 = undefined;
+    var sgn: [8]f32 = undefined;
+    inline for (0..8) |j| {
+        const m: u32 = @intCast((grid64 >> @intCast(8 * j)) & 0xFF);
+        mag[j] = @floatFromInt(m);
+        sgn[j] = if ((signs >> @intCast(j)) & 1 != 0) @as(f32, -1.0) else @as(f32, 1.0);
+    }
+    const mv: Vec = mag;
+    const sv: Vec = sgn;
+    return mv * sv;
+}
+
+/// AVX2 IQ2_XXS GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
+/// `k` must be a multiple of QK_K, as for the scalar version.
+pub fn gemmAvx2(
+    a: [*]const amx.bf16,
+    b: [*]const BlockIQ2_XXS,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    const nb = k / QK_K;
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        const brow = b + j * ldb;
+
+        var i: usize = 0;
+        while (i + MR <= m) : (i += MR) {
+            var acc = [_]Vec{@splat(0.0)} ** MR;
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                // Per-BLOCK, hoisted: the f16 super-block scale is the same for
+                // all 256 weights. Doing this per group was the IQ4_XS mistake.
+                const dsuper = f16_to_f32(blk_ptr.d);
+                const abase = blk * QK_K;
+                for (0..N_GROUPS) |ib32| {
+                    // 4 u16 -> 2 u32, exactly as dequantizeRow does.
+                    const qs_base = ib32 * 4;
+                    const aux0: u32 = @as(u32, blk_ptr.qs[qs_base]) | (@as(u32, blk_ptr.qs[qs_base + 1]) << 16);
+                    const aux1: u32 = @as(u32, blk_ptr.qs[qs_base + 2]) | (@as(u32, blk_ptr.qs[qs_base + 3]) << 16);
+                    // The 8 grid fingerprints are the 8 bytes of those two u32.
+                    const fp: [8]u8 = .{
+                        @truncate(aux0), @truncate(aux0 >> 8), @truncate(aux0 >> 16), @truncate(aux0 >> 24),
+                        @truncate(aux1), @truncate(aux1 >> 8), @truncate(aux1 >> 16), @truncate(aux1 >> 24),
+                    };
+                    // db = d * (0.5 + exponent) * 0.25
+                    const db: f32 = dsuper * (0.5 + @as(f32, @floatFromInt(aux1 >> 28))) * 0.25;
+                    inline for (0..SUB_BLOCKS_PER_32) |l| {
+                        const grid64 = IQ2XXS_GRID[fp[l]];
+                        const signs = KSIGNS_IQ2XS[(aux1 >> @intCast(7 * l)) & 127];
+                        const w = grid8(grid64, signs) * @as(Vec, @splat(db));
+                        const koff = abase + ib32 * 32 + l * 8;
+                        inline for (0..MR) |r| {
+                            acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + koff), w, acc[r]);
+                        }
+                    }
+                }
+            }
+            inline for (0..MR) |r| c[(i + r) * ldc + j] = @reduce(.Add, acc[r]);
+        }
+
+        // Row tail (m % MR), one row at a time.
+        while (i < m) : (i += 1) {
+            var acc: Vec = @splat(0.0);
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                const dsuper = f16_to_f32(blk_ptr.d);
+                const abase = blk * QK_K;
+                for (0..N_GROUPS) |ib32| {
+                    const qs_base = ib32 * 4;
+                    const aux0: u32 = @as(u32, blk_ptr.qs[qs_base]) | (@as(u32, blk_ptr.qs[qs_base + 1]) << 16);
+                    const aux1: u32 = @as(u32, blk_ptr.qs[qs_base + 2]) | (@as(u32, blk_ptr.qs[qs_base + 3]) << 16);
+                    const fp: [8]u8 = .{
+                        @truncate(aux0), @truncate(aux0 >> 8), @truncate(aux0 >> 16), @truncate(aux0 >> 24),
+                        @truncate(aux1), @truncate(aux1 >> 8), @truncate(aux1 >> 16), @truncate(aux1 >> 24),
+                    };
+                    const db: f32 = dsuper * (0.5 + @as(f32, @floatFromInt(aux1 >> 28))) * 0.25;
+                    inline for (0..SUB_BLOCKS_PER_32) |l| {
+                        const grid64 = IQ2XXS_GRID[fp[l]];
+                        const signs = KSIGNS_IQ2XS[(aux1 >> @intCast(7 * l)) & 127];
+                        const koff = abase + ib32 * 32 + l * 8;
+                        acc = @mulAdd(Vec, widen8(a + i * lda + koff), grid8(grid64, signs) * @as(Vec, @splat(db)), acc);
+                    }
+                }
+            }
+            c[i * ldc + j] = @reduce(.Add, acc);
+        }
+    }
+}
 
 pub fn gemmIQ2_XXSScalar(
     a: [*]const amx.bf16, // [m, k] BF16 row-major

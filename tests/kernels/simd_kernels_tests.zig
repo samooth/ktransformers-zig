@@ -1761,6 +1761,304 @@ test "FP8 row scale is applied once, after the accumulation" {
     try testing.expect(got[0] != scal[0]);
 }
 
+test "IQ2_XXS AVX2 GEMM == the scalar oracle, across blocks and m tails" {
+    // The oracle is `gemmIQ2_XXSScalar` / `dequantizeRowIQ2_XXS`, NOT a
+    // clean-room reading of the GGUF layout. This format packs an exponent
+    // nibble into the same u32 as the four 7-bit sign indices, which is exactly
+    // the kind of detail a reimplementation gets wrong; the vector path has to
+    // reproduce the existing dequantizer exactly.
+    const g = kt.gemm_iq2_xxs;
+    var state: u64 = 0x1225_0001;
+
+    for ([_]usize{ 1, 2, 3 }) |blocks| {
+        const k = blocks * g.QK_K;
+        const nb = blocks;
+        try testing.expect(nb > 0); // a 0-block case would be vacuous
+        const m: usize = 5; // m % MR != 0, so the row tail runs
+        const n: usize = 3;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&state, 64, 2.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ2_XXS, n * nb);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = @bitCast(@as(f16, 0.05));
+            for (&blk.qs) |*q| {
+                state = state *% 6364136223846793005 +% 1442695040888963407;
+                q.* = @truncate(state >> 24);
+            }
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        g.gemmAvx2(a.ptr, w.ptr, c_avx.ptr, m, n, k, k, nb, n);
+        g.gemmIQ2_XXSScalar(a.ptr, w.ptr, c_ref.ptr, m, n, k, k, nb, n);
+
+        for (0..m * n) |i| {
+            const av = c_avx[i];
+            const rf = c_ref[i];
+            // The exponent nibble comes out of `aux1`'s top 4 bits and
+            // multiplies d, so a random u16 can legitimately give a huge or
+            // non-finite product. Agreement on WHICH outputs are non-finite is
+            // the assertion.
+            if (std.math.isNan(rf)) {
+                try testing.expect(std.math.isNan(av));
+            } else if (std.math.isInf(rf)) {
+                try testing.expectEqual(std.math.isInf(av), std.math.isInf(rf));
+            } else {
+                try testing.expect(std.math.isFinite(av));
+                const denom = @max(@abs(rf), 1e-2);
+                try testing.expect(@abs(av - rf) / denom < 1e-3);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// P1.3 — the activation's numerics, pinned (TODO Stream D)
+//
+// These three tests exist because the P1.3 performance investigation concluded
+// that NO arithmetic change to `expVec` is worth making (measured: cutting the
+// live-constant count from 5 to 4.5 `vbroadcastss` per 8 elements moved the
+// activation by 0%, inside a +-23% run-to-run noise band). The decision to
+// leave `expVec` alone is only safe if the properties that made it worth
+// leaving alone are actually pinned by tests, and at the time of writing three
+// of them were not:
+//
+//   * `expVec` was checked against `expScalar` but NEVER against `@exp`. Only
+//     the scalar path had a ULP bound, so the vector path -- the one every MoE
+//     and MLA activation actually runs -- had no accuracy test at all.
+//   * The 89% bit-identical-to-`@exp` rate was documented in prose and in
+//     AGENTS.md but asserted nowhere.
+//   * The activation's agreement with the C++ reference was only ever checked
+//     by `bench/cpp_vs_zig/compare.py`, i.e. by running the benchmark, not by
+//     `zig build test`.
+//
+// The thresholds below are the measured values, not round numbers. See the
+// Stream D entry in TODO.md for the measurements they came from.
+// ============================================================================
+
+/// `_mm256_cvtps2dq` is round-to-nearest-EVEN. Zig has no direct builtin for
+/// it: `@intFromFloat` truncates and `@round` is half-AWAY-from-zero, which
+/// disagrees on exact ties. The 1.5*2^23 magic add forces the same
+/// round-to-nearest-even the instruction performs.
+fn rneToInt(y: f32) i32 {
+    const magic: f32 = 12582912.0;
+    if (y >= 0.0) return @intFromFloat((y + magic) - magic);
+    return -@as(i32, @intFromFloat((-y + magic) - magic));
+}
+
+/// Transcribed from `kt-kernel/operators/avx2/avx2_bf16_utils.hpp:78`
+/// (`exp_avx2`) so the comparison is an independent oracle rather than a
+/// restatement of `amx.expVec`. Note this is a DIFFERENT algorithm from ours:
+/// the reference reduces in log2 space (`frac = y - j`) and so needs no
+/// LN2_HI/LN2_LO split, whereas `expVec` reduces in exp space and is ~1e-8
+/// accurate against the reference's ~1e-6. That difference is deliberate and is
+/// why this test allows a vanishingly small number of disagreements.
+const REF_LOG2E: f32 = 1.44269504089;
+const REF_EXP_CLAMP_HI: f32 = 88.0;
+const REF_POLY = [6]f32{
+    0.9999999995, 0.6931471805, 0.2402265069,
+    0.0555041087, 0.0096181291, 0.0013333558,
+};
+
+fn refExpAvx2(x: f32) f32 {
+    const y = x * REF_LOG2E;
+    const j: i32 = rneToInt(y);
+    const frac = y - @as(f32, @floatFromInt(j));
+    var p: f32 = REF_POLY[5];
+    p = @mulAdd(f32, p, frac, REF_POLY[4]);
+    p = @mulAdd(f32, p, frac, REF_POLY[3]);
+    p = @mulAdd(f32, p, frac, REF_POLY[2]);
+    p = @mulAdd(f32, p, frac, REF_POLY[1]);
+    p = @mulAdd(f32, p, frac, REF_POLY[0]);
+    const clamped: i32 = @max(@min(j, 127), -126);
+    const pow2: f32 = @bitCast(@as(u32, @bitCast(clamped +% 127)) << 23);
+    return pow2 * p;
+}
+
+/// `act_fn(gate, up)` — avx2_bf16_utils.hpp:118.
+fn refActFn(gate: f32, up: f32) f32 {
+    const neg = @min(@as(f32, 0.0) - gate, REF_EXP_CLAMP_HI);
+    return (gate / (1.0 + refExpAvx2(neg))) * up;
+}
+
+test "expVec is within 1 ULP of @exp and stays ~89% bit-identical" {
+    // The vector path had no accuracy test at all before this one: only
+    // expScalar was pinned against @exp, and expVec is what every MoE/MLA
+    // activation runs. Sampled strictly INSIDE the clamp, because outside
+    // [-87, 87] a large ULP distance is the CORRECT clamp rather than an
+    // accuracy failure (expVec saturates to exp(+-87)).
+    var max_ulp: u32 = 0;
+    var total: usize = 0;
+    var identical: usize = 0;
+    var x: f32 = -87.0;
+    while (x <= 87.0 - 0.119) : (x += 0.0031) {
+        var arr: [8]f32 = undefined;
+        for (0..8) |l| arr[l] = x + @as(f32, @floatFromInt(l)) * 0.017;
+        const v: amx.VecF32 = arr;
+        const got: [8]f32 = amx.expVec(v);
+        for (0..8) |l| {
+            const want: f32 = @floatCast(@exp(arr[l]));
+            try testing.expect(std.math.isFinite(got[l]));
+            const d = ulpDiff(got[l], want);
+            if (d > max_ulp) max_ulp = d;
+            if (@as(u32, @bitCast(got[l])) == @as(u32, @bitCast(want))) identical += 1;
+            total += 1;
+        }
+    }
+    try testing.expectEqual(@as(u32, 1), max_ulp);
+    // Measured 89.37%. The floor is 85% so the test tracks a real regression
+    // (a dropped or reordered Horner term) rather than the sampler.
+    const rate = 100.0 * @as(f64, @floatFromInt(identical)) / @as(f64, @floatFromInt(total));
+    try testing.expect(rate >= 85.0);
+}
+
+test "expVec == expScalar bit-for-bit through all three activation variants" {
+    // The existing variant test compares with a 1e-5 tolerance, which cannot see
+    // a lane permutation or a 1-ULP drift. expVec and expScalar must agree
+    // EXACTLY, including at both clamp ends and at the boundary values where
+    // the synthesised exponent field changes.
+    const ends = [_]f32{ -120.0, -90.0, -88.0, -87.5, -87.0, -1.0, -0.5, -0.0, 0.5, 1.0, 86.0, 87.0, 87.5, 88.0, 90.0, 120.0 };
+    for (ends) |base| {
+        var arr: [8]f32 = undefined;
+        for (0..8) |l| arr[l] = base + @as(f32, @floatFromInt(l)) * 0.11;
+        const v: amx.VecF32 = arr;
+        const ev: [8]f32 = amx.expVec(v);
+        for (0..8) |l| try testing.expectEqual(amx.expScalar(arr[l]), ev[l]);
+    }
+
+    // Same property, but observed through the entry points callers actually
+    // use: the exp inside each variant must match the scalar exp on the same
+    // clamped argument.
+    const lim: amx.VecF32 = @splat(0.5);
+    const alpha: amx.VecF32 = @splat(1.5);
+    for (ends) |base| {
+        var g: [8]f32 = undefined;
+        var u: [8]f32 = undefined;
+        var seed: u64 = 0xA5A5_1234;
+        for (0..8) |l| {
+            g[l] = base + rnd(&seed, 64, 0.02);
+            u[l] = rnd(&seed, 9, 0.8) - 0.4;
+        }
+        const gv: amx.VecF32 = g;
+        const uv: amx.VecF32 = u;
+
+        const plain: [8]f32 = amx.swigluVec(gv, uv);
+        for (0..8) |l| {
+            // silu(g)*u with the exp inlined, so the comparison is exact rather
+            // than tolerance-based: both sides call the same expScalar.
+            const s = g[l] / (1.0 + amx.expScalar(-g[l]));
+            try testing.expectEqual(s * u[l], plain[l]);
+        }
+
+        const clamped: [8]f32 = amx.swigluClampVec(gv, uv, lim);
+        for (0..8) |l| {
+            const gc = @min(g[l], 0.5);
+            const uc = @min(@max(u[l], -0.5), 0.5);
+            const s = gc / (1.0 + amx.expScalar(-gc));
+            try testing.expectEqual(s * uc, clamped[l]);
+        }
+
+        const oai: [8]f32 = amx.swigluOaiVec(gv, uv, alpha, lim);
+        for (0..8) |l| {
+            const gc = @min(@max(g[l], -0.5), 0.5);
+            const uc = @min(@max(u[l], -0.5), 0.5);
+            const s = gc * (1.0 / (1.0 + amx.expScalar(-gc * 1.5)));
+            try testing.expectEqual(s * (uc + 1.0), oai[l]);
+        }
+    }
+}
+
+test "activation matches the C++ reference act_fn after the bf16 round trip" {
+    // The strongest single check on this path, and the one that used to live
+    // only in bench/cpp_vs_zig/compare.py (i.e. only when someone ran the
+    // benchmark). bf16 in, bf16 out, exactly as the MoE forward does it.
+    //
+    // Why the disagreement budget is 1-in-100000 and not zero: our exp is
+    // ~1e-8 accurate and the reference's is ~1e-6, so on rare elements the two
+    // land on opposite sides of a bf16 rounding midpoint. Measured over 262144
+    // elements: 2 disagreements (7.6e-6), both exactly a midpoint straddle --
+    // e.g. gate=-1.609375 gives got=1.5507811 (bf16 0x3fc6) against
+    // want=1.5507815 (bf16 0x3fc7), where the midpoint is 1.55078125. The
+    // budget exists so that class of element does not fail the build; a real
+    // kernel bug (a wrong clamp, a transposed operand, a dropped FMA term)
+    // misses by far more than one bf16 ULP and is still caught.
+    const M: usize = 16;
+    const N: usize = 512;
+    const total = M * N;
+    var gate: [M * N]amx.bf16 = undefined;
+    var up: [M * N]amx.bf16 = undefined;
+    var seed: u64 = 0xC0FFEE;
+    for (0..total) |i| {
+        gate[i] = amx.f32_to_bf16(rnd(&seed, 4096, 0.011) - 22.0);
+        up[i] = amx.f32_to_bf16(rnd(&seed, 9, 0.6) - 0.3);
+    }
+
+    const limit: f32 = 0.5;
+    const alpha: f32 = 1.5;
+    const lim_v: amx.VecF32 = @splat(limit);
+    const alp_v: amx.VecF32 = @splat(alpha);
+
+    for ([_]struct { name: []const u8, kind: u8 }{
+        .{ .name = "plain", .kind = 0 },
+        .{ .name = "clamp", .kind = 1 },
+        .{ .name = "oai", .kind = 2 },
+    }) |variant| {
+        var differing: usize = 0;
+        for (0..M) |i| {
+            var j: usize = 0;
+            while (j + amx.VEC_LEN <= N) : (j += amx.VEC_LEN) {
+                var ga: [amx.VEC_LEN]f32 = undefined;
+                var ua: [amx.VEC_LEN]f32 = undefined;
+                for (0..amx.VEC_LEN) |k| {
+                    ga[k] = amx.bf16_to_f32(gate[i * N + j + k]);
+                    ua[k] = amx.bf16_to_f32(up[i * N + j + k]);
+                }
+                const gv: amx.VecF32 = ga;
+                const uv: amx.VecF32 = ua;
+                const res: amx.VecF32 = switch (variant.kind) {
+                    0 => amx.swigluVec(gv, uv),
+                    1 => amx.swigluClampVec(gv, uv, lim_v),
+                    else => amx.swigluOaiVec(gv, uv, alp_v, lim_v),
+                };
+                const ra: [amx.VEC_LEN]f32 = res;
+                for (0..amx.VEC_LEN) |k| {
+                    const want: f32 = switch (variant.kind) {
+                        0 => refActFn(ga[k], ua[k]),
+                        1 => blk: {
+                            const gc = @min(ga[k], limit);
+                            const uc = @min(@max(ua[k], -limit), limit);
+                            break :blk refActFn(gc, uc);
+                        },
+                        else => blk: {
+                            const gc = @min(@max(ga[k], -limit), limit);
+                            const uc = @min(@max(ua[k], -limit), limit);
+                            const neg = @min(@as(f32, 0.0) - gc * alpha, REF_EXP_CLAMP_HI);
+                            break :blk gc * (1.0 / (1.0 + refExpAvx2(neg))) * (uc + 1.0);
+                        },
+                    };
+                    const got_b = amx.f32_to_bf16(ra[k]);
+                    const want_b = amx.f32_to_bf16(want);
+                    if (got_b != want_b) {
+                        differing += 1;
+                        // A disagreement must be a single bf16 ULP, i.e. a
+                        // rounding-boundary straddle. Anything larger is a bug.
+                        const du: u32 = @abs(@as(i32, @as(i16, @bitCast(got_b))) - @as(i32, @as(i16, @bitCast(want_b))));
+                        try testing.expectEqual(@as(u32, 1), du);
+                    }
+                }
+            }
+        }
+        try testing.expect(differing * 100000 <= total);
+    }
+}
 
 test "FP8 E4M3 encode∘decode round trips every encoding; saturation is 448, not NaN" {
     const fp8 = kt.gemm_fp8;
