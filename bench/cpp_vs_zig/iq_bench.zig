@@ -1,6 +1,7 @@
 // bench/cpp_vs_zig/iq_bench.zig — all seven IQ formats, three predicted buckets.
 //
-// CLAIM: swiglu-regalloc — IQ format family bench — 2026-10-04
+// CLAIM: bench-harness — IQ format family bench (Stream O) — 2026-10-04
+// (was mislabelled `swiglu-regalloc`, a session that closed at 6a25820)
 // — holds bench/cpp_vs_zig/ until committed. Touches no build.zig step.
 //
 // WHY THREE BUCKETS AND NOT TWO
@@ -216,9 +217,23 @@ fn runOne(comptime F: type, alloc: std.mem.Allocator, src: []const f32, acts_m1:
     std.debug.print("GEMM|{s} [m=8,n={d},k={d}]|{d:.4}|{d:.3}\n", .{ F.name, N, K, ms8, bytes / (ms8 * 1e-3) / 1e9 });
     std.debug.print("SETUP|{s} [m=1,n={d},k={d}]|{d:.2}\n", .{ F.name, N, K, sm });
     std.debug.print("SETUP|{s} [m=8,n={d},k={d}]|{d:.2}\n", .{ F.name, N, K, sm });
+    // Precision, deliberately far more than the measurement needs.
+    //
+    // This line used to print rel-L2 as `{d:.2}`, and "0.00" was then reported as
+    // agreement "bit-exact". It is not: two decimals BOUNDS the error below
+    // 0.005. Reading a value at the edge of its display resolution as an exact
+    // one is the same error as "0 of 262144 elements differ" being a property of
+    // the inputs rather than of the code, and it survived here because 0.00 looks
+    // like a measurement of zero instead of a rounding of something smaller.
+    //
+    // Nine decimals resolves it either way: an exact tie prints 0.000000000, and a
+    // real 1-ULP difference prints something like 0.000000119. If the claim you
+    // want is element-wise exactness, that belongs in simd_kernels_tests.zig,
+    // where the comparison is over integers and can actually establish it — this
+    // bench's job is throughput, and its resolution is now honest about that.
     std.debug.print(
-        "  {s: <7} bucket={s: <8} block={d: >3}B bpw={d:.3}  setup={d:8.1} ms  setup:meas={d:.0}x  agree m=1 {d:.2} m=8 {d:.2}\n",
-        .{ F.name, F.bucket, @sizeOf(F.Block), bpw, sm, sm / ms1, rel1, rel8 },
+        "  {s: <7} bucket={s: <13} block={d: >3}B bpw={d:.3}  setup:meas={d:>6.0}x  rel-L2 m=1 {d:.9} m=8 {d:.9}\n",
+        .{ F.name, F.bucket, @sizeOf(F.Block), bpw, sm / ms1, rel1, rel8 },
     );
 }
 
