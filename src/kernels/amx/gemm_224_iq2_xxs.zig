@@ -247,20 +247,30 @@ inline fn widen8(p: [*]const amx.bf16) Vec {
 /// reference value divided by the group scale is 6.179741 / 0.14375 = 43.0.
 ///
 /// The sign needs no mask table: `KMASK_IQ2XS = {1,2,4,...,128}` means
-/// `signs & KMASK[j]` is exactly bit j of the byte. Register-only work, so
-/// `inline for` unrolls it to vector ops rather than 8 scalar memory
-/// round-trips.
+/// `signs & KMASK[j]` is exactly bit j of the byte.
+///
+/// WRITTEN WITH EXPLICIT VECTOR OPS, not `inline for` + array staging. The
+/// staged version measured **749 ps per call — 1.8x the cost of BOTH table
+/// lookups combined** (grid 249 ps, signs 184 ps) — because eight scalar 64-bit
+/// shifts are what the compiler had to work with, and AVX2 has no 64-bit
+/// integer shift. Reinterpreting the u64 as 8 bytes lets it emit
+/// `vpmovzxbd` + `vcvtdq2ps` instead.
+///
+/// The sign multiplier is `(bit << 1) - 1`, i.e. -1 for a clear bit and +1 for a
+/// set bit, so the sign is a shift/subtract/convert rather than a select.
 inline fn grid8(grid64: u64, signs: u8) Vec {
-    var mag: [8]f32 = undefined;
-    var sgn: [8]f32 = undefined;
-    inline for (0..8) |j| {
-        const m: u32 = @intCast((grid64 >> @intCast(8 * j)) & 0xFF);
-        mag[j] = @floatFromInt(m);
-        sgn[j] = if ((signs >> @intCast(j)) & 1 != 0) @as(f32, -1.0) else @as(f32, 1.0);
-    }
-    const mv: Vec = mag;
-    const sv: Vec = sgn;
-    return mv * sv;
+    const bytes: @Vector(8, u8) = @bitCast(grid64);
+    const mag: Vec = @floatFromInt(@as(@Vector(8, i32), @intCast(bytes)));
+
+    const sb: @Vector(8, u8) = @splat(signs);
+    const shifts: @Vector(8, u3) = @Vector(8, u3){ 0, 1, 2, 3, 4, 5, 6, 7 };
+    // i32 throughout, and the multiplier is `1 - bit*2`: the convention is
+    // bit SET => NEGATIVE (matching `signs & KMASK[j] != 0 -> -1`), so `bit*2-1`
+    // would be exactly inverted. The sink check in bench caught that: the
+    // checksum came out negated.
+    const bits: @Vector(8, i32) = @intCast((sb >> shifts) & @as(@Vector(8, u8), @splat(1)));
+    const mult: Vec = @floatFromInt(@as(@Vector(8, i32), @splat(1)) - bits * @as(@Vector(8, i32), @splat(2)));
+    return mag * mult;
 }
 
 /// AVX2 IQ2_XXS GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).

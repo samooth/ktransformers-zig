@@ -365,6 +365,13 @@ or a live-suite home, which this stream did not touch.
 
 **Stream D — SwiGLU activation, 0.57x. CLAIMED (swiglu-regalloc) since
 2026-10-04.**
+**RELEASED 2026-10-04 — `src/kernels/arch/amx.zig` is free again.** The claim
+covered `expVec`/`expScalar` plus append-only test lines. The `expVec` work
+concluded with no source change (see the negative result below); the only
+`amx.zig` edit that landed was the `pshufb16` aarch64 guard, committed alone as
+`fb258fa`. The three new tests were appended to
+`tests/kernels/simd_kernels_tests.zig` and are now in `HEAD`.
+
 **This claim edits `src/kernels/arch/amx.zig`** (`expVec`/`expScalar` only) plus
 append-only test lines in `tests/kernels/simd_kernels_tests.zig` and this
 section. The arch-layer hold is free: Stream J (`iq4xs-avx2`) committed its
@@ -399,6 +406,116 @@ staging in `applySwiGLU` with direct `*align(1)` vector loads and a vectorized
 RNE narrowing store. Measured back-to-back against the same binary six times:
 median **1.02x** (range 0.80-1.28x), and the .so grew by 29 instructions
 overall. The array staging was not the cause of the rematerialization.
+
+**The register-pressure diagnosis above is WRONG. Measured 2026-10-04
+(`swiglu-regalloc`): fix #1 does nothing, and this item is CLOSED as a measured
+negative result. `expVec` is unchanged.**
+
+First the counts, which are wrong in both directions. Disassembling the real
+specialized `applySwiGLU` (the bench calls it with limit=0 and alpha=0, so LLVM
+folds the variant branches away and the whole 3-variant source becomes one
+branchless 2x-unrolled loop) against the reference's `swiglu_ref`:
+
+| per 8 elements | Zig | C++ |
+|---|---|---|
+| instructions in the loop body | **47** | **35** |
+| `vbroadcastss` inside the body | 5 | 0 |
+| FMAs | 7 | 6 |
+
+So 47 vs 35, not "48 vs 40": the gap is 12 instructions, wider than recorded,
+and the broadcast count is 5, not 6. The C++ figure is the surprise — at 35 the
+reference is 8 instructions *tighter* than believed, which is most of the gap.
+
+Where the 12 go, from the two disassemblies side by side:
+
+- **6 `vbroadcastss`.** Real, and unique to us; GCC hoists all 8 of its
+  constants into the prologue.
+- **2 on the floor.** C++ gets `j` from one `vcvtps2dq`, because
+  round-to-nearest-even comes free there. We need `mul` + `add 0.5` +
+  `vroundps` + `vcvttps2dq`, because our split is in exp space and needs an
+  explicit floor rather than a nearest-integer conversion.
+- **3 on the LN2_HI/LN2_LO split** (`jf*HI`, `jf*LO`, the second subtract).
+  The same fact as the previous bullet from the other side: C++ reduces in log2
+  space and needs no split at all.
+- **1 on the clamp**: C++ clamps one end in f32 and the other in integer
+  (`vminps` + `vpminsd`/`vpmaxsd`); we clamp both ends in f32.
+
+**9 of the 12 are the price of reducing in exp space, which is exactly what
+makes us more accurate than the reference (1.0e-8 vs ~1e-6).** Only the 6
+broadcasts are register pressure, and they are the only part fix #1 addresses.
+
+Fix #1 was then implemented for real in `expVec` — phase 1 (clamp, split,
+floor, pow2) with its constants dead before phase 2 (the polynomial) — and
+measured against HEAD:
+
+| per 8 elements | HEAD | two-phase |
+|---|---|---|
+| instructions | 47 | **49** |
+| `vbroadcastss` | 5 | **5** |
+| FMAs | 7 | 7 |
+
+It moved the broadcasts **not at all** and made the body two instructions
+longer. Timing by interleaved A/B of the two built harnesses on one pinned
+core, minimum per side (the box is shared; interference only ever adds time, so
+the min is the robust statistic, and C++ alone swings 0.137-0.190 ms run to
+run):
+
+| | C++ | Zig | ratio |
+|---|---|---|---|
+| HEAD, load 3.96, min of 9 | 0.1386 ms | 0.2038 ms | 0.68x |
+| two-phase, load 4.47, min of 7 | 0.1367 ms | 0.2038 ms | 0.67x |
+
+The Zig side is unchanged to four significant figures. Reverted.
+
+Why is visible in a controlled probe (one structural property changed per
+variant, best-of-15, pinned, ns/element): removing the divide, removing the
+clamp, the two-phase restructure, and manual 2x/4x/8x unrolling are **all
+indistinguishable from baseline across five runs**. Only two things move the
+number, and both remove arithmetic rather than rearrange it:
+
+| variant | ns/elem |
+|---|---|
+| shipped | 0.89 - 1.17 |
+| all of the above | inside that same band |
+| deg-2 polynomial | 0.77 - 1.02 |
+| loads + bf16 store only, no math | 0.20 - 0.25 |
+
+The noise floor is the binding constraint here: one probe variant is a
+byte-identical copy of the baseline and still differs from it by 14-23%, which
+is larger than any effect worth chasing. **An activation micro-optimization
+measured on this host has to beat ~25% to be distinguishable from noise at
+all**, and the prescribed fix was worth 0%.
+
+**So this is not a register-allocation problem and never was.** The activation
+is bound by the bf16 widen plus the narrowing store plus FP vector throughput.
+Closing the rest of the gap means giving up the exp-space reduction — adopting
+the reference's ~1e-6 log2-space `exp_avx2` and the accuracy margin with it,
+which is the trade this stream was told not to make. **Closed, code left
+correct.** To reopen it, the honest framing is "replace our exp with the
+reference's", not "cut peak live constants": the second is measured not to
+work.
+
+**What did land** are the three tests the decision rests on, because leaving
+`expVec` alone is only safe if its properties are pinned and they were not:
+`expVec` had never been compared against `@exp` (only `expScalar` had a ULP
+bound, so the vector path every MoE/MLA activation runs had no accuracy test at
+all), the ~89% bit-identical rate existed only in prose, and agreement with the
+C++ reference was checked only by `bench/cpp_vs_zig/compare.py` — i.e. only by
+running the benchmark, never by `zig build test`. All three are in
+`tests/kernels/simd_kernels_tests.zig` now. Measured values they pin: **max 1
+ULP, 89.37% bit-identical** over 1.5M samples strictly inside the clamp. The
+bit-identity budget they use against the reference is 1-in-100000, not zero: on
+a different input distribution the plain variant differs on **2 of 262144**
+elements, both exact bf16 rounding-midpoint straddles (gate=-1.609375 gives
+1.5507811 vs 1.5507815, midpoint 1.55078125). "0 of 262144" is a property of the
+benchmark's inputs, not of the port — worth knowing before anyone writes it
+down as an invariant.
+
+**Kept as documentation:** the probe harness pattern is the transferable part
+— one structural property per variant, interleaved, pinned, minimum-of-N. Two
+items in this file were closed on it (this one, and the IQ4_XS "expected win
+worthless" result), and on both occasions the thing that moved the number was
+not the thing the diagnosis predicted.
 
 **Actually open:**
 
@@ -863,8 +980,57 @@ new `vpshufb` tests). `verify_abi.py` 112/112; avx2 and amx variants build.
 - The CI test step is now bounded (`timeout 2400 zig build test`), so the hang
   recorded above fails the job instead of stalling it.
 
-**Stream K — IQ2_XXS GEMM. PARTIAL/WEAK RESULT (1x at m=1, 4x at m=4/m=8).
-CLAIMED (iq2xs-avx2) since 2026-10-04.**
+**Stream K — IQ2_XXS GEMM. DONE. The earlier "weak result" entry was WRONG and
+is corrected below. CLAIMED (iq2xs-avx2) since 2026-10-04.**
+
+**RETRACTED: "this format is structurally unpack-bound and only worth 4x" was
+wrong.** The 1x/4x measurement was real, but the cause was my own `grid8`, not
+the format.
+
+`grid8` originally extracted the eight magnitude bytes with `inline for` +
+array staging, which meant eight **scalar 64-bit shifts** feeding eight scalar
+int-to-float conversions — and AVX2 has no 64-bit integer shift, so LLVM
+generated something terrible. Rewritten with explicit vector ops it reinterprets
+the u64 as 8 bytes and lets the compiler emit `vpmovzxbd` + `vcvtdq2ps`, with the
+sign as a `1 - bit*2` shift/subtract (KMASK makes sign bit j, and the convention
+is bit SET => negative).
+
+| m | scalar | grid8 with array staging | grid8 with vector ops |
+|---|---|---|---|
+| 1 | 272 ms | 283 ms (1x) | **3 ms (69x)** |
+| 4 | 1108 ms | 295 ms (4x) | **7 ms (151x)** |
+| 8 | 2217 ms | 604 ms (4x) | **13 ms (165x)** |
+
+Verified correct, not fast-but-wrong: both paths' checksums agree
+(275183.31 vs 275184.00 at m=1, 2201466.50 vs 2201472.00 at m=8 — f32 summation
+order).
+
+**Read the ratio with care.** 69-165x is inflated by a pathological scalar
+baseline (272 ms for 14.7M weights is ~55 cycles/weight, because the scalar path
+calls `dequantizeRow` per block per output element). The honest measure is the
+absolute: **3.78 MB in ~3 ms = 1.26 GB/s at m=1**, which puts IQ2_XXS in the same
+ballpark as IQ4_XS (~2.6 GB/s), MXFP4 (~2.6) and well below Q8_0 (7.8). So the
+format is not weak; the earlier number was my bug.
+
+**How the wrong conclusion was reached, because the method is the lesson.** The
+micro-benchmark that "showed" vector ops were slower (845 ps vs 760 ps per
+`grid8` call) was broken twice over: the loop accumulated into a single `f32`, so
+it measured latency rather than throughput, and the host was at load 13-51.
+`perf` is unavailable here (`perf_event_paranoid=4`), so the bisection never
+measured the right thing. The GEMM-level ratio — both paths in one binary, one
+after the other — was the only trustworthy signal, and it said 100x. **On a
+contended host, believe the end-to-end ratio and distrust micro-benchmarks.**
+
+**Coordinator point 3 — super-block indexing, verified by mutation rather than
+by inspection.** Dropping `blk * QK_K` from the activation index in the row-tail
+path makes the new equivalence test FAIL, and restoring it makes the suite pass
+again (48/48). So the test does cover multi-block shapes; it uses k = 256, 512
+and 768, and a block-0-only test would not have caught it.
+
+**Coordinator point 4 — table ownership.** `KSIGNS_IQ2XS` and `KMASK_IQ2XS` are
+used from `gemm_224_iq2_xxs.zig`, never re-declared. `gemm_224_iq2_xs.zig`
+already aliases them (`KMASK_IQ2XS = iq2xxs.KMASK_IQ2XS`), which is the pattern
+to follow.
 
 **This is a much weaker result than every other format in this session, and the
 reason is structural rather than a mistake.** Recorded as a negative result
