@@ -104,6 +104,37 @@ Background, measurements, per-item technique and acceptance rationale:
 
 ## P0.2 — Vectorize the FP8 GEMM (lowest risk)
 
+> **Status 2026-10-03 — read before starting.** Stream B is claimed and in
+> flight (`4f222ba`); the decoder half already landed in `1e8369a` (the 256-entry
+> LUT, which fixed subnormal decoding and the 0x7F NaN encoding). The prompt
+> below predates all of that and is kept for the GEMM half.
+>
+> **The encoder is still wrong and has no test.** `f32_to_fp8e4m3` in
+> `gemm_224_fp8.zig` is reachable from three call sites in `main.zig` (2020,
+> 2058, 2540), so it is live in the C ABI. Measured by encoding and decoding
+> again:
+>
+> | input | `gemm_224_fp8` | `gemm_224_mxfp8` (correct) |
+> |---|---|---|
+> | 500.0 | 0x7F → **0.0** | 0x7E → 448 |
+> | 3.875 | 0x40 → **2.0** | 0x48 → 4.0 |
+> | 0.0078125 | 0x00 → **0.0** | 0x04 → 0.0078125 |
+>
+> Three defects: saturation emits 0x7F/0xFF, which is the **NaN** encoding rather
+> than ±448; subnormals are flushed to zero, destroying the whole 2^-9…2^-6 band;
+> and the mantissa carry is masked away (`m3 + 1` then `& 0x7` without
+> incrementing the exponent), which is the 2x error. **The correct
+> implementation is already in this tree**, in `gemm_224_mxfp8.zig`, with the
+> carry case commented — copy it rather than writing a fourth one. It survived
+> because the only codec round-trip test (`simd_kernels_tests.zig`) exercises the
+> MXFP8 copy, so `gemm_fp8.f32_to_fp8e4m3` has no coverage at all.
+>
+> Two more corrections to the plan below: the reference's `fp8x8_to_fp32x8`
+> uses `_mm256_i32gather_ps` over a 256-entry table — a single `vpshufb` cannot
+> serve 256 entries, so do not wait for the arch-layer shuffle; and this port
+> keeps **one f32 scale per row of B**, not the reference's 128x128 block-wise
+> scales, so the scale folds in once per row rather than per block.
+
 > You are working in `/ai/repos/2026/ktransformers-zig`, a Zig 0.16 port of the
 > ktransformers CPU inference kernels. A C++ reference implementation lives at
 > `/ai/repos/2026/ktransformers` (kernels under
@@ -237,50 +268,163 @@ Background, measurements, per-item technique and acceptance rationale:
 
 ## P1.3 — SwiGLU activation (diagnosed; needs register-pressure work)
 
-> You are working in `/ai/repos/2026/ktransformers-zig`, a Zig 0.16 port of the
-> ktransformers CPU inference kernels. A C++ reference implementation lives at
-> `/ai/repos/2026/ktransformers`; compare against
-> `ktransformers/kt-kernel/operators/avx2/avx2_bf16_utils.hpp` (`act_fn`).
->
-> **BEFORE YOU EDIT ANYTHING**
-> - Read `AGENTS.md`, `docs/perf-roadmap.md` and `LESSONS_ZIG.md`.
-> - CLAIM this task in `TODO.md`.
-> - This task requires editing `src/kernels/arch/amx.zig`, which is normally off
->   limits. Your CLAIM must say so explicitly, and it must be the only task in
->   flight that touches that file.
->
-> **TASK**
-> `amx.expVec` in `src/kernels/arch/amx.zig` is the reason the SwiGLU activation
-> sits at 0.59x of the C++ reference. Instruction counts for the 8-element body
-> are **Zig 48, C++ 40**, and the gap is register allocation, not algorithm:
-> `expVec` needs ~13 simultaneously-live constants (7 polynomial coefficients +
-> `INV_LN2`, `LN2_HI`, `LN2_LO`, `0.5`, `1.0`, two clamp bounds) against 16
-> ymm registers, so LLVM emits **6 `vbroadcastss` inside the loop** to
-> rematerialize constants where the C++ hoists them all before it.
->
-> **Fix by cutting peak live constants, in this order:**
-> 1. Split `expVec` into two phases — argument split / floor / truncate /
->    exponent synthesis, *then* the polynomial — so the first group's constants
->    are dead before the second's are born.
-> 2. Hoist the clamp bounds out of the per-vector path (clamp once per call).
-> 3. Algebraically remove `0.5` / `1.0` from the live set.
->
-> **Two warnings.**
-> - Do **not** reduce the polynomial to degree 5 to save a register. Zig emits 8
->   FMAs to C++'s 6 **on purpose** (degree-6 truncation is 1.0e-8 relative vs
->   ~1e-6), and reverting that is an accuracy regression, not a fix.
-> - Do **not** retry the array-staging fix. Replacing the `[VEC_LEN]f32` staging
->   in `applySwiGLU` with direct `*align(1)` vector loads plus a vectorized RNE
->   narrowing store measured **1.02x median over six back-to-back runs** and made
->   the binary 29 instructions larger. It was tried and reverted.
->
-> **ACCEPTANCE**
-> - The existing exp tests still pass (`tests/kernels/simd_kernels_tests.zig`
->   pins <= 1 ULP and 8-lane `expVec == expScalar`).
-> - SwiGLU moves from 0.59x toward parity on `bench/cpp_vs_zig/run.sh`.
-> - The activation output stays **bit-identical** to the reference — it
->   currently is, 0 of 262144 elements differ. Do not regress that.
-> - Report instruction counts before/after alongside the time.
->
-> **GATES:** `zig build -Doptimize=ReleaseFast`, `zig build test`,
-> `python3 tools/verify_abi.py`.
+> Re-measured 2026-10-03: **0.68x**, not the 0.59x recorded below, and the line
+> numbers are current as of commit `2416b68`. Supersedes the earlier copy.
+
+You are working in `/ai/repos/2026/ktransformers-zig`, a Zig 0.16 port of the
+ktransformers CPU inference kernels. A C++ reference implementation lives at
+`/ai/repos/2026/ktransformers`; compare against
+`ktransformers/kt-kernel/operators/avx2/avx2_bf16_utils.hpp` (`act_fn` at :118).
+
+**BEFORE YOU EDIT ANYTHING**
+- Read `AGENTS.md`, `docs/perf-roadmap.md` (item P1.3) and `LESSONS_ZIG.md`. The
+  Zig 0.16 API gotchas in LESSONS_ZIG.md are real and will cost you an hour.
+- CLAIM this task in `TODO.md` **and** put a marker at the top of each file you
+  intend to edit — `src/kernels/arch/amx.zig` and possibly
+  `src/kernels/amx/gemm_224_bf16.zig`:
+  `// CLAIM: <handle> — SwiGLU activation — <date>`. Claims go in both places:
+  the moment one matters is when someone opens the file they are about to change.
+- `src/kernels/arch/amx.zig` is normally off limits and you must say in your
+  claim that you are touching it. It was held exclusively by the `vpshufb` work
+  (Stream J), which has now landed and released it — confirm it is still clean
+  (`git status src/kernels/arch/amx.zig`) before you start, and be the only
+  session in that file.
+- Do not edit `build.zig`, `tests/kernels/test_kernels.zig`, `src/root.zig`.
+  Append-only in `tests/kernels/simd_kernels_tests.zig` and your own TODO.md
+  section. Stage by filename when you commit — never `git add -A`; there is
+  uncommitted work from another session in this tree (Stream B, FP8).
+- Claim format is `CLAIMED (<handle>) since <date>`. No tool or model names in
+  claims, commits or commit trailers. Never push. Commit after each verified step.
+
+**WHAT IS IN THAT FILE NOW.** `2416b68` added `pshufb16` / `pshufbTable` and a
+shared `ByteVec = @Vector(32, u8)` at the top of `amx.zig`. It is additive and
+does not touch `expVec`, but it shifted every line below it, so use the anchors
+below rather than any older note. It also moved the file's constants **into the
+same arch layer** you are about to edit — if you add a helper there, expect it
+to be shared with everything.
+
+**THE TASK**
+`amx.expVec` (`src/kernels/arch/amx.zig:675`) is why the activation sits at
+**0.68x** of the C++ reference. The gap is register allocation, not algorithm:
+`expVec` needs about thirteen simultaneously-live constants against sixteen ymm
+registers — seven polynomial coefficients (`EXP_C0`..`EXP_C6`, lines 639-645),
+`EXP_INV_LN2`, `EXP_LN2_HI`, `EXP_LN2_LO`, 0.5, 1.0 and the two clamp bounds
+(`EXP_LO`/`EXP_HI`, lines 634-635) — so LLVM rematerializes constants with
+`vbroadcastss` inside the loop where the C++ hoists all of them before it. A
+session that measured this recorded **48 instructions in the Zig 8-element body
+against 40 in C++**, and six `vbroadcastss` where C++ has none. Treat those as a
+starting point and re-derive them (see MEASUREMENT — LLVM unrolls this loop
+heavily, so an unnormalized count is meaningless).
+
+Fix by cutting peak live constants, in this order, stopping as soon as you are
+at parity:
+1. Split `expVec` into two phases — clamp, argument split, floor, exponent
+   synthesis first, the polynomial second — so the first group's constants are
+   dead before the second's are born. Most likely to work; does not change the
+   arithmetic.
+2. Hoist the clamp bounds out of the per-vector path. They are loop-invariant
+   per call; clamp once per call.
+3. Fold 0.5 and 1.0 out of the live set algebraically.
+
+Last resort only, and only with a measured justification in your report: drop
+the polynomial from degree 6 to degree 5.
+
+**A WARNING WORTH READING TWICE, because the same shape of bug was just fixed in
+another kernel.** The IQ4_XS stream expected its win from `vpshufb` and got
+none; the actual bottleneck was `f16_to_f32(blk.d)` sitting *inside* a
+per-sub-block helper, so the conversion ran eight times per block at the head of
+a serial dependency chain with only four FMAs per sub-block to hide it at m=1.
+Hoisting it was the whole 3x → 17-19x. **So before you start optimizing
+constants, establish what the dependency chain actually is** at m=1: dump the
+loop and look at what feeds the first FMA. The lesson generalizes — a
+conversion that looks like it belongs to the inner loop may belong to the block.
+
+**TWO WARNINGS, BOTH FROM WORK ALREADY DONE HERE**
+- Do **not** drop to degree 5 to save a register. Zig emits 8 FMAs where C++ emits
+  6 on purpose: degree-6 truncation is 1.0e-8 relative against ~1e-6, and the
+  port is currently *more* accurate than the kernel it replaced. Reverting that
+  is an accuracy regression dressed as a speedup.
+- Do **not** retry the array-staging fix. Replacing the `[VEC_LEN]f32` staging in
+  `applySwiGLU` (`gemm_224_bf16.zig:240`) with direct `*align(1)` vector loads
+  plus a vectorized RNE narrowing store measured **1.02x median over six
+  back-to-back runs** (range 0.80-1.28x) and made the binary 29 instructions
+  larger. Tried, reverted, do not repeat.
+- Do **not** change `pub const VecF32 = @Vector(8, f32)` (now line 750) or
+  `VEC_LEN`. They are shared with the BF16 GEMM, MLA and every quantized kernel;
+  widening the vector is a different task with a much larger blast radius.
+
+**TESTS — `tests/kernels/simd_kernels_tests.zig`, never next to the code.** A
+`test` block inside a file that belongs to the `kt` module is never executed by
+`zig build test`; Zig collects tests from the root file's module only. Assert,
+for all three variants (`swigluVec` :764, `swigluClampVec` :778, `swigluOaiVec`
+:785):
+- `expVec` still within 1 ULP of `@exp`, and the 90% bit-identical rate is not
+  regressed;
+- `expVec == expScalar` lane for lane, including the clamp at both ends;
+- the activation output stays **bit-identical** to the reference. It currently
+  is: 0 of 262144 elements differ. A change that shows up only as a 1e-7 relative
+  wobble is a bug here.
+
+**MEASUREMENT.** The host is shared and absolute milliseconds move by up to 3x
+with the load — today another agent's inference job put it at load 31 on 16
+cores, and the same case measured 10x, 14x and 19x on three consecutive runs.
+Never compare against a remembered number.
+
+    KT_PIN=9 ./bench/cpp_vs_zig/run.sh
+
+The row you care about is `SwiGLU activation swiglu act [m=128,n=2048]`. Take
+the best of at least three runs and state the load average with the number.
+Baseline as of today, pinned, best of 3: C++ 0.2046 ms, Zig 0.3009 ms, 0.68x —
+re-measure it yourself, do not quote that.
+
+For instruction counts:
+
+    zig build-exe -OReleaseFast -mcpu=native -lc --dep kt \
+        -Mroot=bench/cpp_vs_zig/zig_bench.zig -Mkt=src/root.zig \
+        -femit-bin=/tmp/zb
+    nm /tmp/zb | grep applySwiGLU
+    objdump -d --start-address=0x<SYMBOL> /tmp/zb
+
+Count inside the loop body only, and normalize: the loop is heavily unrolled, so
+report both the raw count and the count per 8 elements processed. The number
+that must move is `vbroadcastss` inside the body.
+
+**ACCEPTANCE**
+- The existing exp and SwiGLU tests pass, and the activation remains
+  bit-identical to the reference.
+- The activation moves from 0.68x toward parity. Parity is the goal; anything
+  above 0.85x is a strong result.
+- `vbroadcastss` per 8 elements in the loop body strictly decreases, reported
+  next to the times.
+- If the register work does not pay off, say so with numbers and leave the code
+  correct. A measured negative result with a clear write-up is a useful outcome
+  here; a lucky micro-optimization with a regression hidden behind noise is not.
+
+**GATES, all of them:**
+    zig build -Doptimize=ReleaseFast
+    zig build test
+    python3 tools/verify_abi.py
+    python3 tools/audit_layout.py
+    zig build all-variants
+    zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu
+
+**REPORT BACK**
+- Before/after table: C++ ms, Zig ms, ratio, load average stated.
+- Instruction counts: raw and per-8-element, for the loop body.
+- What the dependency chain at m=1 actually was, and which of the three fixes
+  you applied — and why you stopped there.
+- Confirmation that the output is still bit-identical, with the element count.
+- Anything this prompt got wrong.
+
+**FOOTGUNS, all verified in this repo**
+- `@exp` on a vector does not vectorize: compiler-rt ships only scalar `expf` and
+  Zig does not target libmvec, so it becomes eight scalar libcalls with spills,
+  17x slower. Never reintroduce it in a vector loop.
+- Zig defaults `fp-contract` off, so `a*b+c` emits `vmulps`+`vaddps` instead of one
+  `vfmadd`. Use `@mulAdd` where you touch arithmetic.
+- `@splat` is one-argument in Zig 0.16 and the value must be typed:
+  `@as(VecF32, @splat(@as(f32, 0.5)))`.
+- A vector shift needs a vector of the shift-logic type, typed even for a
+  comptime count: `v >> @as(@Vector(8, u5), @splat(@as(u5, 23)))`.
+- Vector element access needs a comptime index; stage through an array.
+- Run `sentrux_rescan` then `sentrux_check_rules` after touching `amx.zig`.
