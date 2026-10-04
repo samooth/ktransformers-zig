@@ -75,6 +75,7 @@ comptime {
     _ = &gemm_q6_k.nearestInt;
     _ = &gemm_q6_k.quantizeRowQ6_K;
     _ = &gemm_q6_k.dequantizeRowQ6_K;
+    _ = &gemm_q6_k.dequantizeRowQ6_KVec;
     _ = &gemm_q6_k.dequantizeRowQ6_KToBF16;
     _ = &gemm_q6_k.gemmQ6_KScalar;
     _ = &gemm_q5_k.BlockQ5_K;

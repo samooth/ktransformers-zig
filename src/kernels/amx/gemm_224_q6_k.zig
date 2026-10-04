@@ -207,6 +207,75 @@ pub fn quantizeRowQ6_K(src: []const f32, dst: [*]BlockQ6_K, k: usize) void {
 }
 
 /// ggml-quants.c:1939 dequantize_row_q6_K. k must be a multiple of 256.
+const Dq6Vec: type = @Vector(8, f32);
+
+/// 16 weights' worth of 6-bit Q6_K values -> two `Dq6Vec`.
+///
+/// A Q6_K value is a 4-bit nibble from `ql` plus 2 bits from `qh` shifted up by
+/// 4, minus 32. `nib` selects the low (0) or high (4) nibble plane; `hshift`
+/// selects which 2-bit field of `qh` (0, 2, 4 or 6).
+///
+/// The scalar body's OR is really an ADD: the nibble is 4 bits and `h2 << 4`
+/// starts at bit 4, so the fields never overlap. Written as an add so the vector
+/// form is a plain widen + shift + add.
+inline fn q6_16(ql: *const u8, qh: *const u8, comptime nib: u4, comptime hshift: u3) [2]Dq6Vec {
+    const qb: @Vector(16, u8) = @as(*align(1) const @Vector(16, u8), @ptrCast(ql)).*;
+    const hb: @Vector(16, u8) = @as(*align(1) const @Vector(16, u8), @ptrCast(qh)).*;
+    const lo: @Vector(16, u8) = if (nib == 0)
+        qb & @as(@Vector(16, u8), @splat(0x0F))
+    else
+        qb >> @as(@Vector(16, u4), @splat(nib));
+    const h2: @Vector(16, u8) = (hb >> @as(@Vector(16, u4), @splat(hshift))) & @as(@Vector(16, u8), @splat(3));
+    const q6: @Vector(16, i32) = @as(@Vector(16, i32), @intCast(lo)) +
+        (@as(@Vector(16, i32), @intCast(h2)) << @as(@Vector(16, u5), @splat(4)));
+    const f: @Vector(16, f32) = @floatFromInt(q6 - @as(@Vector(16, i32), @splat(32)));
+    // Stage through an array: `f[0..8]` on a @Vector is not addressable.
+    const fa: [16]f32 = f;
+    return .{ fa[0..8].*, fa[8..16].* };
+}
+
+/// AVX2 Q6_K dequantize-to-F32. Bit-exact with `dequantizeRowQ6_K`.
+///
+/// The natural vector unit is 16 weights, not 8: each 16-value group has ONE
+/// scale, and in the scalar body's `l` loop that scale steps at `l == 16`
+/// (`is = l / 16`). Four ql planes x two halves = 8 units per 128-weight chunk.
+///
+/// THE TRAP, which cost a wrong answer first time: the **ql offset depends on
+/// the plane, not just the half**. Planes 1 and 3 read `ql[l + 32]`; planes 0 and
+/// 2 read `ql[l]`. qh is indexed by `l` for EVERY plane (only the 2-bit field
+/// moves), so its offset does NOT get the +32. Getting that wrong yields
+/// plausible magnitudes — it reads a valid neighbouring nibble — and the
+/// bit-exact test is what catches it.
+pub fn dequantizeRowQ6_KVec(src: [*]const BlockQ6_K, dst: []f32, k: usize) void {
+    std.debug.assert(k % QK_K == 0);
+    const nb = k / QK_K;
+    var out: usize = 0;
+    for (0..nb) |i| {
+        const blk = &src[i];
+        const d = f16_to_f32(blk.d);
+        var ql_off: usize = 0;
+        var qh_off: usize = 0;
+        var sc_off: usize = 0;
+        var j: usize = 0;
+        while (j < QK_K) : (j += 128) {
+            inline for (0..4) |plane| { // ql nibble plane x qh 2-bit field
+                inline for (0..2) |half| { // which 16 values of the 32-long l loop
+                    const qp = ql_off + half * 16 + (if (plane % 2 == 1) @as(usize, 32) else 0);
+                    const hp = qh_off + half * 16;
+                    const sv: Dq6Vec = @splat(d * @as(f32, @floatFromInt(blk.scales[sc_off + half + plane * 2])));
+                    const pair = q6_16(&blk.ql[qp], &blk.qh[hp], if (plane < 2) 0 else 4, plane * 2);
+                    dst[out + plane * 32 + half * 16 + 0 ..][0..8].* = sv * pair[0];
+                    dst[out + plane * 32 + half * 16 + 8 ..][0..8].* = sv * pair[1];
+                }
+            }
+            out += 128;
+            ql_off += 64;
+            qh_off += 32;
+            sc_off += 8;
+        }
+    }
+}
+
 pub fn dequantizeRowQ6_K(src: [*]const BlockQ6_K, dst: []f32, k: usize) void {
     std.debug.assert(k % QK_K == 0);
     const nb = k / QK_K;

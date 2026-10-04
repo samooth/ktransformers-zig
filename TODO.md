@@ -1576,10 +1576,36 @@ Two format facts worth writing down because they are copy-from-sibling traps:
   are separated by shifting the hi-bit mask left by 2 each time. Advancing `qh`
   per chunk would be the natural-looking bug.
 
-Still scalar in this path: **Q6_K, Q2_K, Q3_K** (6-bit, 2-bit and 3-bit payloads
-respectively — more unpacking per element than Q4/Q5's nibble, and Q2/Q3 need
-their shift-plane / k-map machinery). Also untouched: the `*ToBF16` wrappers,
-which still run a scalar f32->bf16 loop after the (now vectorized) dequant.
+**Q6_K DONE.** The natural vector unit is 16 weights, not 8: each 16-value group
+has ONE scale, and in the scalar body's `l` loop that scale steps at `l == 16`
+(`is = l / 16`). Four ql planes x two halves = 8 units per 128-weight chunk.
+Bit-exact against the scalar body with `d`, all 16 scale bytes (fuzzed over the
+full **i8** range so the sign is exercised), both ql planes and the qh fields all
+fuzzed. A uniform scale would let a wrong scale index pass, which is the failure
+mode that matters when the unit is "16 weights share one scale".
+
+**The trap, and it produced a wrong answer first time:** the **ql offset depends
+on the plane, not just the half**. Planes 1 and 3 read `ql[l + 32]`; planes 0 and
+2 read `ql[l]`. `qh` is indexed by `l` for every plane (only the 2-bit field
+moves), so its offset does NOT get the +32. Getting it wrong reads a valid
+neighbouring nibble, so the magnitudes stay plausible and only the bit-exact test
+catches it.
+
+**A process note, because it nearly cost more than the bug.** Restoring that from
+a bad patch meant running `s.index("while (j < QK_K)...")`, and
+`quantizeRowQ6_K` has a `while (j < QK_K)` loop too — the splice landed in the
+QUANTIZER and silently deleted `Dq6Vec`, `q6_16` and the whole new function.
+Caught by the compiler, not by review. Fixed with `git checkout --` on that one
+file and a single clean insertion, verified afterwards with
+`git diff --numstat` showing **69 additions and 0 deletions** — i.e. provably
+additive, quantizer untouched. Worth the habit: after editing inside a file that
+has several similar-looking loops, check the deletion count, not just that it
+compiles.
+
+**Still scalar in this path: Q2_K, Q3_K** (2-bit and 3-bit payloads, and their
+shift-plane / k-map machinery). Then the 13 `*ToBF16` wrappers that stage, all of
+which need only `f32_to_bf16_store` swapped in.
+
 
 **Stream K complete.** Next unclaimed work: roadmap P0.4's remaining INT4 families
 (raw-INT4 and GPTQ-INT4 kernels do not exist yet — another stream has claimed

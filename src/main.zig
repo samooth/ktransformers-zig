@@ -2671,7 +2671,7 @@ pub export fn kt_quantize_q6_k(src: [*]const f32, dst: *anyopaque, k: usize) voi
 }
 
 pub export fn kt_dequantize_q6_k(src: *const anyopaque, dst: [*]f32, k: usize) void {
-    gemm_q6_k.dequantizeRowQ6_K(@ptrCast(@alignCast(src)), dst[0..k], k);
+    gemm_q6_k.dequantizeRowQ6_KVec(@ptrCast(@alignCast(src)), dst[0..k], k);
 }
 
 pub export fn kt_quantize_q8_k(src: [*]const f32, dst: *anyopaque, k: usize) void {
@@ -2981,7 +2981,7 @@ fn toFloatDispatch(t: u32, src: [*]const u8, dst: [*]f32, n: usize) bool {
             return true;
         },
         18 => { // Q6_K
-            gemm_q6_k.dequantizeRowQ6_K(@as([*]const gemm_q6_k.BlockQ6_K, @ptrCast(@alignCast(src))), dst[0..n], n);
+            gemm_q6_k.dequantizeRowQ6_KVec(@as([*]const gemm_q6_k.BlockQ6_K, @ptrCast(@alignCast(src))), dst[0..n], n);
             return true;
         },
         19 => { // Q8_K

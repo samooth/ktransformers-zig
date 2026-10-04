@@ -3451,3 +3451,41 @@ test "Q4_K / Q5_K / Q8_K ToBF16 wrappers are BIT-EXACT vs their scalar forms" {
         for (0..k) |i| try testing.expectEqual(b[i], a[i]);
     }
 }
+
+test "Q6_K vectorized dequant == scalar dequant, bit-exactly" {
+    // Bit-exact: both sides compute d * scale * (q6 - 32) in the same order, so a
+    // tolerance here would hide a real bug. `d`, all 16 scale bytes (i8, so the
+    // sign is exercised), both ql planes and the qh 2-bit fields are fuzzed — a
+    // uniform scale would let a wrong scale index pass, which is the failure mode
+    // that matters here since the unit is "16 weights share ONE scale".
+    const q6 = kt.gemm_q6_k;
+    var st: u64 = 0x0DE0_0003;
+    for ([_]usize{ 1, 2 }) |blocks| {
+        const k = blocks * q6.QK_K;
+        try testing.expect(blocks > 0);
+        const w = try testing.allocator.alloc(q6.BlockQ6_K, blocks);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = q6.f32_to_f16(0.05);
+            for (&blk.scales) |*b| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @bitCast(@as(u8, @truncate(st >> 24))); // full i8 range
+            }
+            for (&blk.ql) |*b| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @truncate(st >> 24);
+            }
+            for (&blk.qh) |*b| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @truncate(st >> 24);
+            }
+        }
+        const got = try testing.allocator.alloc(f32, k);
+        defer testing.allocator.free(got);
+        const want = try testing.allocator.alloc(f32, k);
+        defer testing.allocator.free(want);
+        q6.dequantizeRowQ6_KVec(w.ptr, got, k);
+        q6.dequantizeRowQ6_K(w.ptr, want, k);
+        for (0..k) |i| try testing.expectEqual(want[i], got[i]);
+    }
+}
