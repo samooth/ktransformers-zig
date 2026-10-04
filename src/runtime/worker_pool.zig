@@ -192,17 +192,46 @@ pub const Subpool = struct {
                 _ = c.pthread_cond_wait(&self.work_cv, &self.mutex);
             }
             const sd = self.shutdown.load(.acquire);
+            // Snapshot the job's parameters WHILE STILL HOLDING THE MUTEX.
+            //
+            // Load-bearing, and this was a real bug. These two reads used to
+            // happen AFTER the unlock below. A worker could observe
+            // `active == true` for job N, be descheduled, and read them after
+            // job N had completed — by which point the dispatcher had set
+            // `work_fn = null`. The worker would then steal indices belonging to
+            // whatever job was current, skip every one because its `fn_ptr` was
+            // null, and STILL increment `done_count`, so the next dispatcher saw
+            // its job complete having executed none of the tasks.
+            //
+            // For a GEMM that is the worst failure available: plausible numbers
+            // computed from fewer terms, with no error anywhere. It surfaced in
+            // this repo's own stress test as "expected 6400, found 6391" — nine
+            // tasks silently skipped — and was written off as a load flake. It
+            // was not a flake.
+            //
+            // The dispatcher writes task_end, work_fn and active together under
+            // this same mutex, so observing active under the lock implies
+            // observing the matching parameters.
+            const end = self.task_end;
+            const fn_ptr = self.work_fn;
             _ = c.pthread_mutex_unlock(&self.mutex);
             if (sd) break;
 
             // Steal and execute tasks (no mutex held — atomic counter distributes work)
-            const end = self.task_end;
-            const fn_ptr = self.work_fn;
             while (true) {
                 const idx = self.task_curr.fetchAdd(1, .monotonic);
                 if (idx >= end) break;
-                if (fn_ptr) |f| f(idx);
-                _ = self.done_count.fetchAdd(1, .monotonic);
+                if (fn_ptr) |f| {
+                    f(idx);
+                    _ = self.done_count.fetchAdd(1, .monotonic);
+                } else {
+                    // Unreachable given the snapshot above. If it ever becomes
+                    // reachable, BREAK rather than fall through: incrementing
+                    // done_count without running the task is exactly how a whole
+                    // job gets skipped, and a hang here is a far better failure
+                    // than a silently short dot product.
+                    break;
+                }
             }
 
             // Signal completion (hold mutex to avoid missed wakeup).
