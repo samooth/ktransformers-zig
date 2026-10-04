@@ -133,13 +133,33 @@ pub fn dequantizeRowQ8_K(src: [*]const BlockQ8_K, dst: []f32, k: usize) void {
 }
 
 /// Dequantize Q8_K to BF16 (for BF16 GEMM tile paths).
-pub fn dequantizeRowQ8_KToBF16(src: [*]const BlockQ8_K, dst: [*]amx.bf16, k: usize) void {
+pub fn dequantizeRowQ8_KToBF16Scalar(src: [*]const BlockQ8_K, dst: [*]amx.bf16, k: usize) void {
     std.debug.assert(k % QK_K == 0);
     const nb = k / QK_K;
     var f: [QK_K]f32 = undefined;
     for (0..nb) |i| {
         dequantizeRowQ8_K(src + i, f[0..], QK_K);
         for (0..QK_K) |j| dst[i * QK_K + j] = amx.f32_to_bf16(f[j]);
+    }
+}
+
+/// AVX2 Q8_K dequantize-to-BF16. Uses the shared RNE narrowing store
+/// (`amx.f32_to_bf16_store`) rather than a per-element `f32_to_bf16` loop.
+///
+/// This is the END-TO-END path, and it is where the scalar version spent its
+/// time: the old body dequantized into a scratch array and then did 256 scalar
+/// conversions per block, so the row finished with a serial tail no matter how
+/// wide the dequant became. Vectorizing only the dequant is invisible to a caller
+/// while that tail exists — the Q4_K lesson.
+///
+/// `dequantizeRowQ8_KToBF16Scalar` is kept as the oracle the test diffs against.
+pub fn dequantizeRowQ8_KToBF16(src: [*]const BlockQ8_K, dst: [*]amx.bf16, k: usize) void {
+    std.debug.assert(k % QK_K == 0);
+    const nb = k / QK_K;
+    var f: [QK_K]f32 = undefined;
+    for (0..nb) |i| {
+        dequantizeRowQ8_KVec(src + i, f[0..], QK_K);
+        amx.f32_to_bf16_store(f[0..].ptr, dst + i * QK_K, QK_K);
     }
 }
 

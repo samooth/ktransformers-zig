@@ -3289,3 +3289,165 @@ test "Q8_K and Q5_K vectorized dequant == scalar, bit-exactly" {
         }
     }
 }
+
+test "f32_to_bf16_store: RNE ties go to the even neighbour, exhaustively" {
+    const a = amx;
+    const ties = try testing.allocator.alloc(f32, 2 * 32768);
+    defer testing.allocator.free(ties);
+    const want = try testing.allocator.alloc(u16, 2 * 32768);
+    defer testing.allocator.free(want);
+    var n: usize = 0;
+
+    var e: usize = 0;
+    while (e < 65536) : (e += 2) {
+        // halfway between e and e+1  -> ties to e (even)
+        ties[n] = @as(f32, @bitCast(@as(u32, @intCast(e)) << 16 | 0x8000));
+        want[n] = @intCast(e);
+        n += 1;
+        // halfway between e-1 and e  -> ties to e (even)
+        if (e > 0) {
+            ties[n] = @as(f32, @bitCast((@as(u32, @intCast(e)) << 16) -% 0x8000));
+            want[n] = @intCast(e);
+            n += 1;
+        }
+    }
+    const got = try testing.allocator.alloc(u16, n);
+    defer testing.allocator.free(got);
+    a.f32_to_bf16_store(ties.ptr, got.ptr, n);
+    for (0..n) |i| {
+        // Skip NaN/inf neighbourhoods, where "even neighbour" is not meaningful.
+        const x = ties[i];
+        if (std.math.isNan(x) or std.math.isInf(x)) continue;
+        try testing.expectEqual(want[i], got[i]);
+        // and it must agree with the scalar reference too
+        try testing.expectEqual(a.f32_to_bf16(x), got[i]);
+    }
+    try testing.expect(n > 60000); // the tie set must be substantial
+}
+
+test "f32_to_bf16_store: bit-exact on specials and every tail length" {
+    // Every length 0..17 so the 8-lane body, the scalar tail and the
+    // count<8 fallback are all exercised, with random bit patterns mixed with
+    // the specials that random bits essentially never produce.
+    const a = amx;
+    var st: u64 = 0xB16_16BAD;
+    for (0..18) |len| {
+        const rsrc = try testing.allocator.alloc(f32, len);
+        defer testing.allocator.free(rsrc);
+        const rgot = try testing.allocator.alloc(u16, len);
+        defer testing.allocator.free(rgot);
+        const rwant = try testing.allocator.alloc(u16, len);
+        defer testing.allocator.free(rwant);
+        for (0..len) |i| {
+            st = st *% 6364136223846793005 +% 1442695040888963407;
+            const bits: u32 = @truncate(st >> 32);
+            rsrc[i] = switch (i % 5) {
+                0 => @as(f32, @bitCast(@as(u32, 0x8000_0000))), // -0.0
+                1 => @as(f32, @bitCast(@as(u32, 0x7f80_0000))), // +inf
+                2 => @as(f32, @bitCast(@as(u32, 0xff80_0000))), // -inf
+                3 => @as(f32, @bitCast(@as(u32, 0x7fc0_0000))), // qNaN
+                else => @as(f32, @bitCast(bits)),
+            };
+            rwant[i] = a.f32_to_bf16(rsrc[i]);
+        }
+        a.f32_to_bf16_store(rsrc.ptr, rgot.ptr, len);
+        for (0..len) |i| {
+            if (std.math.isNan(rsrc[i])) {
+                try testing.expect(std.math.isNan(a.bf16_to_f32(rgot[i])));
+            } else {
+                try testing.expectEqual(rwant[i], rgot[i]);
+            }
+        }
+    }
+}
+
+test "f32_to_bf16_store: exhaustive bf16 -> f32 -> bf16 identity over all 65536 values" {
+    // Every bf16 is exactly representable in f32, so RNE narrowing it back must
+    // be the identity for all 65536 encodings. This is the sweep that covers -0,
+    // the subnormals and +-inf; NaN is compared by class since payloads may move.
+    // The tie test next door covers the rounding MODE, and the tail test covers
+    // the boundaries — this one covers the value space.
+    const a = amx;
+    var src = try testing.allocator.alloc(f32, 65536);
+    defer testing.allocator.free(src);
+    const got = try testing.allocator.alloc(u16, 65536);
+    defer testing.allocator.free(got);
+    for (0..65536) |i| src[i] = a.bf16_to_f32(@intCast(i));
+    a.f32_to_bf16_store(src.ptr, got.ptr, 65536);
+    var nan_seen: usize = 0;
+    for (0..65536) |i| {
+        if (std.math.isNan(src[i])) {
+            nan_seen += 1;
+            try testing.expect(std.math.isNan(a.bf16_to_f32(got[i])));
+        } else {
+            try testing.expectEqual(@as(u16, @intCast(i)), got[i]);
+        }
+    }
+    try testing.expect(nan_seen > 0); // the sweep must actually reach NaN
+}
+
+test "Q4_K / Q5_K / Q8_K ToBF16 wrappers are BIT-EXACT vs their scalar forms" {
+    // The wrappers are the END-TO-END path. Their old bodies dequantized into a
+    // scratch array and then ran 256 scalar `f32_to_bf16` calls per block, so a
+    // vectorized dequant alone was invisible to a caller while that serial tail
+    // remained. These now share `amx.f32_to_bf16_store`.
+    //
+    // Bit-exact, not tolerance-based: both sides perform the same RNE narrowing,
+    // so any difference is a bug in the store or in the dequant, never rounding.
+    var st: u64 = 0x7B16_0001;
+    const k: usize = 7168;
+
+    {
+        const q4 = kt.gemm_q4_k;
+        const w = try testing.allocator.alloc(q4.BlockQ4_K, k / q4.QK_K);
+        defer testing.allocator.free(w);
+        for (w) |*b| {
+            b.d = q4.f32_to_f16(0.05);
+            b.dmin = q4.f32_to_f16(0.01);
+            for (&b.scales) |*x| { st = st *% 6364136223846793005 +% 1442695040888963407; x.* = @truncate(st >> 24); }
+            for (&b.qs) |*x| { st = st *% 6364136223846793005 +% 1442695040888963407; x.* = @truncate(st >> 24); }
+        }
+        const a = try testing.allocator.alloc(u16, k);
+        defer testing.allocator.free(a);
+        const b = try testing.allocator.alloc(u16, k);
+        defer testing.allocator.free(b);
+        q4.dequantizeRowQ4_KToBF16(w.ptr, a.ptr, k);
+        q4.dequantizeRowQ4_KToBF16Scalar(w.ptr, b.ptr, k);
+        for (0..k) |i| try testing.expectEqual(b[i], a[i]);
+    }
+    {
+        const q5 = kt.gemm_q5_k;
+        const w = try testing.allocator.alloc(q5.BlockQ5_K, k / q5.QK_K);
+        defer testing.allocator.free(w);
+        for (w) |*b| {
+            b.d = q5.f32_to_f16(0.05);
+            b.dmin = q5.f32_to_f16(0.01);
+            for (&b.scales) |*x| { st = st *% 6364136223846793005 +% 1442695040888963407; x.* = @truncate(st >> 24); }
+            for (&b.qh) |*x| { st = st *% 6364136223846793005 +% 1442695040888963407; x.* = @truncate(st >> 24); }
+            for (&b.qs) |*x| { st = st *% 6364136223846793005 +% 1442695040888963407; x.* = @truncate(st >> 24); }
+        }
+        const a = try testing.allocator.alloc(u16, k);
+        defer testing.allocator.free(a);
+        const b = try testing.allocator.alloc(u16, k);
+        defer testing.allocator.free(b);
+        q5.dequantizeRowQ5_KToBF16(w.ptr, a.ptr, k);
+        q5.dequantizeRowQ5_KToBF16Scalar(w.ptr, b.ptr, k);
+        for (0..k) |i| try testing.expectEqual(b[i], a[i]);
+    }
+    {
+        const q8 = kt.gemm_q8_k;
+        const w = try testing.allocator.alloc(q8.BlockQ8_K, k / q8.QK_K);
+        defer testing.allocator.free(w);
+        for (w) |*b| {
+            b.d = 0.05;
+            for (&b.qs) |*x| { st = st *% 6364136223846793005 +% 1442695040888963407; x.* = @bitCast(@as(u8, @truncate(st >> 24))); }
+        }
+        const a = try testing.allocator.alloc(u16, k);
+        defer testing.allocator.free(a);
+        const b = try testing.allocator.alloc(u16, k);
+        defer testing.allocator.free(b);
+        q8.dequantizeRowQ8_KToBF16(w.ptr, a.ptr, k);
+        q8.dequantizeRowQ8_KToBF16Scalar(w.ptr, b.ptr, k);
+        for (0..k) |i| try testing.expectEqual(b[i], a[i]);
+    }
+}

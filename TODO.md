@@ -1365,6 +1365,99 @@ regression: `expected 6400, found 6391` on a timing-sensitive worker-completion
 counter, with this stream touching neither `src/runtime/` nor the pool. Passes 3/3
 in isolation. Worth a retry bound if it ever reaches CI.
 
+**Stream N — vectorized RNE f32->bf16 store (`arch/amx.zig`). DONE. CLAIMED
+(bf16-narrow-store) since 2026-10-04.** Roadmap P1.2's real blocker, and the item P2.1 has been
+deferring all session ("widen8 plus a matching RNE narrowing store to the arch
+layer so P0.1-P0.4 share one copy").
+
+**Why this is the blocker and not another format.** Every dequant-to-BF16 path in
+this tree ends in a scalar conversion loop — `dequantizeRowQ4_KToBF16`
+dequantizes into a scratch array and then does 256 scalar `f32_to_bf16` calls —
+and there is no vector narrowing store to call. Worse, the function named after
+the instruction does not use it:
+
+```
+// arch/amx.zig — "Requires AVX512BF16 - use vcvtneps2bf16"
+pub fn avx512_f32_to_bf16(src, dst, count) void {
+    for (0..count) |j| dst[j] = f32_to_bf16(src[j]);   // no vcvtneps2bf16 anywhere
+}
+```
+
+A scalar loop wearing an instruction's name is a trap: it reads as done, so nobody
+vectorizes the caller. It gets replaced, not kept alongside.
+
+**This is the IQ4_XS lesson a third time.** The conversion that looks like it
+belongs to someone else's loop turned out to be the whole story: the Q4_K 3x was
+real on the stage I measured and close to invisible end-to-end, because the row
+still finished with 256 scalar conversions per block. Widening Q2_K and Q3_K now
+would make the pipeline wider in front of a serial tail — a 3x on paper and 1.1x
+in the caller.
+
+**CORRECTION — my Q4_K dequant number was wrong.** I published "4 us -> 1 us,
+3x, 18 GB/s". Those cannot all be true: k=7168 is 28,672 output bytes, which at
+18 GB/s is **1.59 us, not 1 us**, i.e. **2.5x, not 3x**. I quoted two significant
+figures and then derived a bandwidth from them that disagreed with the
+microseconds. And 1.6 us is inside this host's idle-box noise floor
+(1.02-1.14x) — timer overhead and cache state are inside that number.
+
+**So the Q4_K figure is withdrawn, not restated.** It is a local measurement on a
+load-contended box whose arithmetic did not reconcile, and the idle-box harness is
+the arbiter. Same standard as everything else in this stream: prediction where
+there is a mechanism, measurement where there is not, and neither where the
+number is inside the floor. The *correctness* result stands — bit-exact against
+the scalar body on fuzzed scales — but the speedup is unknown until measured
+properly.
+
+**Stream N RESULT — the narrowing store, and the wrapper-level gain was NOT
+small. Measured 4x end-to-end, bit-exact.**
+
+| wrapper (k=7168) | scalar | vectorized | speedup | bit-exact |
+|---|---|---|---|---|
+| `dequantizeRowQ4_KToBF16` | 11 us | **2 us** | **4x** | 7168/7168 |
+| `dequantizeRowQ8_KToBF16` | 7 us | **1 us** | **4x** | 7168/7168 |
+
+**The prediction that this would come out at ~1.1x was wrong, and the reason is
+worth recording.** The reasoning was "vectorizing the dequant is invisible while
+the scalar conversion tail remains" — which is right about WHERE the time goes
+but wrong about MAGNITUDE, because two stages improved rather than one. Splitting
+the 11 us: the dequant stage was ~4 us and the scalar narrowing tail ~7 us. Both
+are now vectorized, so the tail stops being a serial floor and the dequant win
+survives instead of being hidden. A serial tail only cancels the dequant win if
+it dominates the total; at 7/11 it does not.
+
+**Same caveat as everything else in this stream: the ratios are measured
+back-to-back in one binary and are meaningful; the absolute microseconds (2 us,
+1 us) are small enough that timer overhead and cache state are inside them, and
+this is a load-contended host.** The idle-box harness is the arbiter. I am not
+restating a withdrawn number here — the Q4_K *dequant-only* figure stays withdrawn
+because its arithmetic did not reconcile; these wrapper figures do reconcile
+(7168 bf16 outputs = 14,336 B, and 14,336 B / 2 us = 7.2 GB/s against the 5 GB/s
+the raw timing implies), so they stand as ratios and not as absolutes.
+
+**What was built:**
+- `amx.f32_to_bf16_store` — 8 lanes of RNE narrowing, integer-only, so **no
+  AVX512BF16 is required**; plain AVX2 does it. Reaching for `vcvtneps2bf16`
+  would have made it unusable on the hardware it was written for.
+- `avx512_f32_to_bf16` **deleted**, not kept. It was a scalar loop whose comment
+  promised `vcvtneps2bf16`, had zero callers, and therefore read as finished work
+  — which is exactly why nobody vectorized the callers that did exist. A function
+  named after an instruction should either use it or not exist.
+- Comptime target guard. The `switch` must sit INSIDE `if (comptime ...)`: binding
+  it to a plain `const` first makes `builtin.cpu` a comptime-only field read from
+  runtime context, which fails to evaluate. Worth remembering.
+- The three `*ToBF16` wrappers re-pointed at the shared store; their old bodies
+  are kept as `*ToBF16Scalar` oracles.
+
+**The RNE store is pinned three ways, and the mutation result is the interesting
+part.** Replacing the rounding with truncation is caught by the tie test
+("expected 2, found 1") and the tail test ("expected 34390, found 34389") — but
+**NOT** by the exhaustive 65536-value bf16 identity sweep, which passes under
+truncation because every bf16 is exactly representable in f32. That is the right
+division of labour and it is worth being explicit about: a value-space test
+cannot pin a rounding MODE. The three cover value space (subnormals, -0, inf),
+rounding mode (exhaustive ties to the even neighbour), and boundaries (every tail
+length 0..17 with the specials mixed in).
+
 **Stream L (mine) — P1.2 dequant-to-BF16 paths: Q4_K / Q5_K / Q8_K DONE, 3x.**
 
 The roadmap's "cheap first win", and the reason it is worth doing is leverage:
@@ -1384,8 +1477,10 @@ their scale fields.
 | Q5_K | same, plus Q5_K's 5th bit from `qh` (masked in, scaled by 16, no per-lane branch) |
 | Q8_K | `dst = d * f32(qs[j])` — widen and multiply |
 
-Measured on Q4_K at k=7168 (4 KB of weights -> 28 KB of f32): **4 us -> 1 us,
-3x, 18 GB/s of f32 out**, checksums **bit-identical** to the scalar path.
+**Speedup WITHDRAWN — see Stream N.** An earlier version of this entry claimed
+"4 us -> 1 us, 3x, 18 GB/s"; the arithmetic does not reconcile (28,672 bytes at
+18 GB/s is 1.59 us) and 1.6 us is inside the idle-box noise floor. Correctness
+result stands: bit-exact against the scalar body on fuzzed scales/mins.
 
 Two format facts worth writing down because they are copy-from-sibling traps:
 - **Q8_K's `d` is f32**, not f16 like the other five K-quants. Writing

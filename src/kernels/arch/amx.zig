@@ -1,3 +1,6 @@
+// CLAIM: bf16-narrow-store — vectorized RNE f32->bf16 store + the
+// misleading avx512_f32_to_bf16 scalar loop — roadmap P1.2/P2.1 — 2026-10-04
+// Holds src/kernels/arch/amx.zig until committed.
 // AMX intrinsics and tile configuration for ktransformers-zig
 // Provides Zig-friendly wrapper around Intel AMX instructions
 
@@ -509,11 +512,57 @@ pub fn avx512_bf16_to_f32(src: [*]const bf16, dst: [*]f32, count: usize) void {
     }
 }
 
-pub fn avx512_f32_to_bf16(src: [*]const f32, dst: [*]bf16, count: usize) void {
-    // Requires AVX512BF16 - use vcvtneps2bf16
-    for (0..count) |j| {
-        dst[j] = f32_to_bf16(src[j]);
+/// Vectorized round-to-nearest-even f32 -> bf16 narrowing store.
+///
+/// REPLACES `avx512_f32_to_bf16`, which was a scalar loop wearing an
+/// instruction's name: its comment promised `vcvtneps2bf16` and its body did
+/// `for (j) dst[j] = f32_to_bf16(src[j])`. It had zero callers, so it read as
+/// done work and nobody vectorized the callers that DID exist — the three
+/// `*ToBF16` wrappers. That is the trap worth removing: a function named after an
+/// instruction should either use it or not exist.
+///
+/// **No AVX512BF16 is required, and deliberately so.** The narrowing is integer
+/// arithmetic on 32-bit lanes (add a rounding bias, shift down), which every
+/// AVX2 target can do. Reaching for `vcvtneps2bf16` would have made this
+/// unusable on exactly the hardware it was written for.
+///
+/// The rounding is the delicate part and must stay bit-identical to
+/// `f32_to_bf16`, which is RNE: add `0x7fff + lsb(upper half)`, then truncate.
+/// Truncation is NOT round-to-nearest, and a bf16 store that rounds down
+/// consistently biases every result in the model. Note the wrap-around add is
+/// deliberate and matches the scalar `@addWithOverflow`-free `+%` exactly —
+/// including what it does to NaN payloads, which are NOT special-cased here
+/// because matching the scalar function is the contract.
+///
+/// Comptime guard: the 8-lane path is only emitted when the target has 256-bit
+/// vector support. On a baseline target (or aarch64 without it) this falls back
+/// to the scalar loop rather than failing to compile — see LESSONS_ZIG.md on
+/// baseline x86 and `@Vector(32, u8)`.
+pub fn f32_to_bf16_store(src: [*]const f32, dst: [*]bf16, count: usize) void {
+    // Comptime target guard. The switch must sit INSIDE `if (comptime ...)`:
+    // binding it to a plain `const` first makes `builtin.cpu` a comptime-only
+    // field read from runtime context, which fails to evaluate. 256-bit integer
+    // vectors are what make the 8-lane body worthwhile.
+    if (comptime switch (builtin.cpu.arch) {
+        .x86_64, .x86 => !std.Target.x86.featureSetHas(builtin.cpu.features, .avx2),
+        else => true,
+    }) {
+        for (0..count) |j| dst[j] = f32_to_bf16(src[j]);
+        return;
     }
+    const VecU: type = @Vector(8, u32);
+    const shift16 = @as(@Vector(8, u5), @splat(16));
+    var i: usize = 0;
+    while (i + 8 <= count) : (i += 8) {
+        const v: VecU = @as(*align(1) const VecU, @ptrCast(src + i)).*;
+        // lsb of the upper 16 bits: the RNE tie-breaker.
+        const lsb: VecU = (v >> shift16) & @as(VecU, @splat(1));
+        const rounded: VecU = v +% @as(VecU, @splat(0x7fff)) +% lsb;
+        const narrowed: @Vector(8, u16) = @truncate(rounded >> shift16);
+        @as(*align(1) @Vector(8, u16), @ptrCast(dst + i)).* = narrowed;
+    }
+    // Tail, and the whole thing when count < 8.
+    while (i < count) : (i += 1) dst[i] = f32_to_bf16(src[i]);
 }
 
 // ============================================================================
