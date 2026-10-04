@@ -447,11 +447,45 @@ void kt_quantize_int4_gptq(const void* src, uint8_t* dst, float* scales, uint8_t
 void kt_dequantize_int4_gptq(const uint8_t* src, const float* scales, const uint8_t* zeros, void* dst, size_t rows, size_t cols, int group_size);
 void kt_quantize_fp8_e4m3(const void* src, uint8_t* dst, float* scales, size_t rows, size_t cols, int block_size);
 void kt_dequantize_fp8_e4m3(const uint8_t* src, const float* scales, void* dst, size_t rows, size_t cols, int block_size);
+void kt_quantize_fp8_e5m2(const void* src, uint8_t* dst, float* scales, size_t rows, size_t cols, int block_size);
+void kt_dequantize_fp8_e5m2(const uint8_t* src, const float* scales, void* dst, size_t rows, size_t cols, int block_size);
 ```
 
 BF16 in/out (the `void*` on the BF16 side). INT8: one scale per row. INT4 GPTQ:
-one scale/zero per `group_size` elements. FP8 E4M3: one scale per
-`block_size` elements (commonly 128, matching llama.cpp).
+one scale/zero per `group_size` elements. FP8 E4M3 and E5M2: one scale per
+`block_size` elements (commonly 128, matching llama.cpp), each derived from
+**that block's** maximum as `max / FORMAT_MAX`.
+
+### E4M3 and E5M2 are not interchangeable
+
+Same signature, same plumbing, different codec and a different range:
+
+| | E4M3 | E5M2 |
+|---|---|---|
+| exponent / mantissa bits | 4 / 3 | 5 / 2 |
+| bias | 7 | 15 |
+| largest finite | 448.0 (`0x7E`) | 57344.0 (`0x7B`) |
+| smallest normal | 2^-6 | 2^-14 |
+| smallest subnormal | 2^-9 | 2^-16 |
+| infinity | yes | **none** — all of exponent 31 is NaN |
+| half-ULP relative error | ~6% | ~12% |
+
+Two consequences worth knowing before choosing:
+
+- **E5M2 saturates to `0x7B`, never to a NaN byte.** Encoding an over-range
+  value must clip, because a NaN encoding decodes to 0 and would delete the
+  weight. An earlier E4M3 encoder returned the NaN byte `0x7F` here, which is
+  why the round trip is now pinned in tests at both the codec and API level.
+- **E5M2's range is 128x wider and its precision 2x coarser.** It trades
+  mantissa for exponent, which is what activations with outliers want; for
+  weights, E4M3 is usually the better choice. Because the scale is derived from
+  the block maximum, ordinary-magnitude data lands nearer the bottom of E5M2's
+  range, where its 2-bit mantissa shows.
+
+Saturation is unreachable through this entry point: the scale is derived as
+`block_max / FORMAT_MAX`, so a block's largest value always divides down to
+exactly the format's maximum. Clipping matters for callers supplying their own
+scale, such as the elementwise `kt_fp8_quantize` path.
 
 ---
 

@@ -14,7 +14,7 @@ const buffers = root.buffers;
 const gemm_bf16 = root.gemm_bf16;
 const gemm_int8 = root.gemm_int8;
 const gemm_int4 = root.gemm_int4;
-const gemm_fp8 = root.gemm_fp8;
+pub const gemm_fp8 = root.gemm_fp8;
 const gemm_mxfp4 = root.gemm_mxfp4;
 const gemm_mxfp8 = root.gemm_mxfp8;
 // GGML quant kernels: pub so C-API tests (rooted here) can reference the
@@ -2509,7 +2509,7 @@ export fn kt_dequantize_int4_gptq(
     }
 }
 
-export fn kt_quantize_fp8_e4m3(
+pub export fn kt_quantize_fp8_e4m3(
     src: [*]const amx.bf16,
     dst: [*]u8,
     scales: [*]f32,
@@ -2543,7 +2543,75 @@ export fn kt_quantize_fp8_e4m3(
     }
 }
 
-export fn kt_dequantize_fp8_e4m3(
+/// Quantize BF16 to FP8 E5M2, per-block scales derived from the block maximum.
+///
+/// Structurally identical to `kt_quantize_fp8_e4m3`; the only differences are
+/// the codec and the constant the scale is derived against. Note that E5M2's
+/// range is 128x wider than E4M3's (57344 against 448), so for a tensor of
+/// ordinary magnitude the scale lands the data much nearer the bottom of the
+/// format, where a 2-bit mantissa has less relative precision than E4M3's 3.
+/// That is inherent to E5M2 — it trades mantissa for exponent range — and the
+/// reason it exists is activations, not weights.
+pub export fn kt_quantize_fp8_e5m2(
+    src: [*]const amx.bf16,
+    dst: [*]u8,
+    scales: [*]f32,
+    rows: usize,
+    cols: usize,
+    block_size: c_int
+) void {
+    const bs = @as(usize, @intCast(block_size));
+    const blocks_per_row = (cols + bs - 1) / bs;
+
+    for (0..rows) |r| {
+        for (0..blocks_per_row) |blk| {
+            const c_start = blk * bs;
+            const c_end = @min(cols, c_start + bs);
+
+            var max_val: f32 = 0;
+            for (c_start..c_end) |c| {
+                const val = amx.bf16_to_f32(src[r * cols + c]);
+                const abs_val = if (val < 0) -val else val;
+                if (abs_val > max_val) max_val = abs_val;
+            }
+
+            const scale = if (max_val > 0) max_val / gemm_fp8.E5M2_MAX else 1.0;
+            scales[r * blocks_per_row + blk] = scale;
+            const inv_scale = 1.0 / scale;
+
+            for (c_start..c_end) |c| {
+                dst[r * cols + c] = gemm_fp8.f32_to_fp8e5m2(amx.bf16_to_f32(src[r * cols + c]) * inv_scale);
+            }
+        }
+    }
+}
+
+/// Dequantize FP8 E5M2 to BF16.
+pub export fn kt_dequantize_fp8_e5m2(
+    src: [*]const u8,
+    scales: [*]const f32,
+    dst: [*]amx.bf16,
+    rows: usize,
+    cols: usize,
+    block_size: c_int
+) void {
+    const bs = @as(usize, @intCast(block_size));
+    const blocks_per_row = (cols + bs - 1) / bs;
+
+    for (0..rows) |r| {
+        for (0..blocks_per_row) |blk| {
+            const scale = scales[r * blocks_per_row + blk];
+            const c_start = blk * bs;
+            const c_end = @min(cols, c_start + bs);
+
+            for (c_start..c_end) |c| {
+                dst[r * cols + c] = amx.f32_to_bf16(gemm_fp8.fp8e5m2_to_f32(src[r * cols + c]) * scale);
+            }
+        }
+    }
+}
+
+pub export fn kt_dequantize_fp8_e4m3(
     src: [*]const u8,
     scales: [*]const f32,
     dst: [*]amx.bf16,

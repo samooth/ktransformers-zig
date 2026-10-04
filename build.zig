@@ -169,6 +169,8 @@ pub fn build(b: *std.Build) void {
     RunTest.run(b, test_step, "tests/kernels/to_from_float_capi_tests.zig", "src/main.zig", target, optimize);
     // Suite 6e: math helpers (kt_apply_swiglu/rms_norm/rope + kt_softmax)
     RunTest.run(b, test_step, "tests/kernels/math_helpers_capi_tests.zig", "src/main.zig", target, optimize);
+    // Suite: FP8 quantize/dequantize C API (E4M3 and E5M2 block round trips).
+    RunTest.run(b, test_step, "tests/kernels/fp8_capi_tests.zig", "src/main.zig", target, optimize);
     // Suite 6f: SIMD primitives + GEMM micro-kernels (Cephes exp, RNE bf16
     // store, shared softmax, gemmExpert/gemmExpertAccum, gemmF32Bf16).
     RunTest.run(b, test_step, "tests/kernels/simd_kernels_tests.zig", "src/root.zig", target, optimize);

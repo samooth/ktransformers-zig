@@ -445,6 +445,17 @@ void kt_quantize_fp8_e4m3(const void* src, uint8_t* dst, float* scales, size_t r
 /// Dequantize FP8 E4M3 to BF16
 void kt_dequantize_fp8_e4m3(const uint8_t* src, const float* scales, void* dst, size_t rows, size_t cols, int block_size);
 
+/// Quantize BF16 to FP8 E5M2
+/// E5M2 is 1 sign / 5 exponent / 2 mantissa with bias 15 and NO infinities:
+/// the largest finite value is 57344.0 (0x7B) and the whole exponent-31 field
+/// is NaN. It trades mantissa precision for 128x the range of E4M3, which is
+/// what activations with outliers want; per-block scales are derived from the
+/// block maximum exactly as for E4M3.
+void kt_quantize_fp8_e5m2(const void* src, uint8_t* dst, float* scales, size_t rows, size_t cols, int block_size);
+
+/// Dequantize FP8 E5M2 to BF16
+void kt_dequantize_fp8_e5m2(const uint8_t* src, const float* scales, void* dst, size_t rows, size_t cols, int block_size);
+
 // ============================================================================
 // GGML Quantization Types (byte-exact vs llama.cpp ggml-common.h)
 // ============================================================================
