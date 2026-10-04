@@ -1177,10 +1177,50 @@ for an idle box, so no ratios are claimed here for these three. Absolute
 throughput will be ~1 GB/s at m=1 based on the IQ2_XXS/IQ2_XS results, but that is
 an estimate, not a measurement.
 
-**Remaining: IQ1_S and IQ1_M** — the two 1-bit formats, and the least tractable.
-Both need a grid lookup *plus* a delta / second-difference code across elements,
-which is inherently sequential rather than a per-element table. Expect these to
-need a different treatment from everything above, and budget accordingly.
+**IQ1_S and IQ1_M DONE. ALL NINE IQ FORMATS ARE NOW ON `gemmAvx2` — zero scalar
+`gemmQuant` arms remain.**
+
+Both turned out to be *simpler* than the "sequential delta code" warning above
+suggested. There is no per-element sign at all: the unpack is a grid lookup plus
+a group-wide delta, i.e. `dl * (q + delta)`, with `delta` one value per group
+whose sign comes from a bit of `qh`.
+
+**The catch, and it would have been a silent wrong answer: the 1-bit formats use
+SIGNED magnitude bytes.** Their `gridBytes` returns `[8]i8`, so 0xFF is -1, not
+255. Reusing the unsigned `grid8` would be off by 256 on every negative magnitude
+while the values stayed plausible. So `grid8s` was added beside `grid8` in the
+shared owner — both variants now live side by side, because the IQ2/IQ3 formats
+genuinely are unsigned. `@intCast` from `@Vector(8, i8)` to `@Vector(8, i32)`
+sign-extends, which is exactly the `vpmovsxbd` wanted.
+
+Bookkeeping traps, each named in a comment beside the code:
+
+- **IQ1_S** packs three scale fields into one u16 per group: 12 bits of
+  index-highs (3 each for l = 0..3), a 3-bit scale at bits 12..14, and the delta
+  sign at bit 15. Delta is added to the magnitude BEFORE the scale multiply.
+- **IQ1_M**'s hidden f16 global scale is *shuffled across the first four*
+  `scales` bytes (`extractScale`), so it is per BLOCK and cannot be hoisted per
+  group the way every other format's scale could. `qh` advances TWO bytes per
+  32-group with the first two sub-blocks reading `qh0` and the last two `qh1`,
+  and the per-group scale is two 3-bit fields at bit offsets `6*(ib32%2)` and
+  `6*(ib32%2)+3`, applying dl1 to the first two sub-blocks and dl2 to the last.
+
+Both passed their equivalence test first time (SIMD suite 52 -> 54). Their tests
+fill blocks through the **byte view** deliberately: IQ1_M's hidden f16 scale lives
+in the `scales` nibbles, so random bytes legitimately produce NaN weights, and the
+comparison is NaN-aware rather than `isFinite` — the same trap that cost time
+twice earlier today.
+
+**Not benchmarked**, per instruction: the host is contended and a full benchmark
+is scheduled for an idle box. No ratios are claimed for IQ2_S / IQ3_XXS / IQ3_S /
+IQ1_S / IQ1_M. The formats that have been measured (IQ2_XXS 1.26 GB/s at m=1,
+IQ2_XS 1.06) share the same unpack path, so these should land in the same range —
+an estimate, not a measurement.
+
+**Stream K complete.** Next unclaimed work: roadmap P0.4's remaining INT4 families
+(raw-INT4 and GPTQ-INT4 kernels do not exist yet — another stream has claimed
+`gemm_224_int4.zig`), P1.2's dequant-to-BF16 paths, and P2.1's primitive
+de-duplication (the E4M3 codec still exists in two files).
 
 
 `src/kernels/amx/gemm_224_{iq2_xxs,iq2_xs}.zig`. The next real DeepSeek formats;

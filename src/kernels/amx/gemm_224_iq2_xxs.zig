@@ -273,6 +273,24 @@ pub inline fn grid8(grid64: u64, signs: u8) Vec {
     return mag * mult;
 }
 
+/// 8 weights from one grid word as **SIGNED** magnitudes, no sign byte.
+///
+/// The 1-bit formats (IQ1_S, IQ1_M) need this variant rather than `grid8`:
+/// their `gridBytes` returns `[8]i8`, so a magnitude byte of 0xFF is -1, not
+/// 255. Reinterpreting as u8 would be off by 256 on every negative magnitude —
+/// a silent wrong answer, since the values stay plausible. The IQ2/IQ3 formats
+/// genuinely do use unsigned bytes, so both variants are needed and they live
+/// side by side here rather than one of them being "the" grid unpack.
+///
+/// There is no sign byte to apply: these formats add a group-wide `delta`
+/// instead, so the caller does `(this + delta) * scale`.
+pub inline fn grid8s(grid64: u64) Vec {
+    const bytes: @Vector(8, u8) = @bitCast(grid64);
+    // @intCast from @Vector(8, i8) to @Vector(8, i32) SIGN-EXTENDS, which is
+    // exactly the vpmovsxbd we want.
+    return @floatFromInt(@as(@Vector(8, i32), @intCast(@as(@Vector(8, i8), @bitCast(bytes)))));
+}
+
 /// AVX2 IQ2_XXS GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
 /// `k` must be a multiple of QK_K, as for the scalar version.
 pub fn gemmAvx2(

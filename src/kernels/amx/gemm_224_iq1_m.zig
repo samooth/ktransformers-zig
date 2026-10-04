@@ -29,6 +29,8 @@
 // the quantizer ends with a GLOBAL d refit over the quantized scales.
 
 const std = @import("std");
+// grid8s (SIGNED magnitudes) is owned by gemm_224_iq2_xxs.zig; import, never re-declare.
+const grid8s = @import("gemm_224_iq2_xxs.zig").grid8s;
 const amx = @import("../arch/amx.zig");
 
 // ============================================================================
@@ -157,6 +159,144 @@ pub fn dequantizeRowIQ1_MToBF16(x: [*]const BlockIQ1_M, y: [*]amx.bf16, k: usize
 // ============================================================================
 // Scalar GEMM (BF16 activations x IQ1_M weights -> F32)
 // ============================================================================
+
+// ============================================================================
+// AVX2 GEMM
+// ============================================================================
+//
+// Same four rules as everywhere else: n-outer so the weight block streams from
+// DRAM once, MR=4 so four activation rows share one unpacked weight vector,
+// explicit `@mulAdd` because FP contraction is off in this toolchain, and one
+// `@reduce` per output element.
+//
+// WRITE THE UNPACK WITH EXPLICIT VECTOR OPS FROM THE START. `iq2xxs.grid8`
+// originally used `inline for` + array staging, i.e. eight scalar 64-bit shifts
+// (AVX2 has none), and cost a factor of ~100 on IQ2_XXS. Every unpack here
+// delegates to it rather than re-deriving bytes.
+//
+// // Shares grid8s with IQ1_S — same signed magnitudes, same group-wide delta, no
+// per-element sign. What differs from IQ1_S is the bookkeeping, and all of it is a
+// silent-wrong-answer trap:
+
+//   - the global f16 scale is SHUFFLED across the first four `scales` bytes
+//     (`extractScale`), so it is per BLOCK and cannot be hoisted per group;
+//   - `qh` advances **two** bytes per 32-group, and the first two 8-weight
+//     sub-blocks read `qh0` while the last two read `qh1`;
+//   - the per-group scale is two 3-bit fields inside a 16-bit `scales` window at
+//     bit offsets 6*(ib32%2) and 6*(ib32%2)+3, applying dl1 to the first two
+//     sub-blocks and dl2 to the last two;
+//   - the delta sign bits are 0x08 and 0x80 of the respective qh byte.
+
+// The 4 scales + 2 qh + 32 qs layout is byte-audited by a comptime guard.
+
+const MR: usize = 4;
+const Vec: type = @Vector(8, f32);
+
+/// 8 bf16 -> 8 f32, unaligned.
+inline fn widen8(p: [*]const amx.bf16) Vec {
+    const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+    return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+}
+
+/// AVX2 GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
+/// `k` must be a multiple of QK_K, as for the scalar version.
+pub fn gemmAvx2(
+    a: [*]const amx.bf16,
+    b: [*]const BlockIQ1_M,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    const nb = k / QK_K;
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        const brow = b + j * ldb;
+        var i: usize = 0;
+        while (i + MR <= m) : (i += MR) {
+            var acc = [_]Vec{@splat(0.0)} ** MR;
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                // Per-BLOCK: the hidden f16 global scale is shuffled across the
+                // first four scales bytes, so it is NOT per group.
+                const d = f16_to_f32(extractScale(blk_ptr.scales[0..]));
+                const abase = blk * QK_K;
+                for (0..QK_K / 32) |ib32| {
+                    const scw = sc16(blk_ptr.scales[0..], ib32 / 2);
+                    const dl1 = d * (2.0 * @as(f32, @floatFromInt((scw >> @intCast(6 * (ib32 % 2) + 0)) & 0x7)) + 1.0);
+                    const dl2 = d * (2.0 * @as(f32, @floatFromInt((scw >> @intCast(6 * (ib32 % 2) + 3)) & 0x7)) + 1.0);
+                    // qh advances TWO bytes per 32-group; the first two
+                    // sub-blocks read qh0, the last two read qh1.
+                    const qh0 = blk_ptr.qh[2 * ib32 + 0];
+                    const qh1 = blk_ptr.qh[2 * ib32 + 1];
+                    const idx = [4]usize{
+                        blk_ptr.qs[ib32 * 4 + 0] | ((@as(usize, qh0) << 8) & 0x700),
+                        blk_ptr.qs[ib32 * 4 + 1] | ((@as(usize, qh0) << 4) & 0x700),
+                        blk_ptr.qs[ib32 * 4 + 2] | ((@as(usize, qh1) << 8) & 0x700),
+                        blk_ptr.qs[ib32 * 4 + 3] | ((@as(usize, qh1) << 4) & 0x700),
+                    };
+                    const delta = [4]f32{
+                        if ((qh0 & 0x08) != 0) -IQ1S_DELTA else IQ1S_DELTA,
+                        if ((qh0 & 0x80) != 0) -IQ1S_DELTA else IQ1S_DELTA,
+                        if ((qh1 & 0x08) != 0) -IQ1S_DELTA else IQ1S_DELTA,
+                        if ((qh1 & 0x80) != 0) -IQ1S_DELTA else IQ1S_DELTA,
+                    };
+                    inline for (0..4) |sb| {
+                        const dl: f32 = if (sb < 2) dl1 else dl2;
+                        const w = (grid8s(IQ1S_GRID[idx[sb]]) + @as(Vec, @splat(delta[sb]))) * @as(Vec, @splat(dl));
+                        const koff = abase + ib32 * 32 + sb * 8;
+                        inline for (0..MR) |r| {
+                            acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + koff), w, acc[r]);
+                        }
+                    }
+                }
+            }
+            inline for (0..MR) |r| c[(i + r) * ldc + j] = @reduce(.Add, acc[r]);
+        }
+        // Row tail (m % MR), one row at a time.
+        while (i < m) : (i += 1) {
+            var acc: Vec = @splat(0.0);
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                // Per-BLOCK: the hidden f16 global scale is shuffled across the
+                // first four scales bytes, so it is NOT per group.
+                const d = f16_to_f32(extractScale(blk_ptr.scales[0..]));
+                const abase = blk * QK_K;
+                for (0..QK_K / 32) |ib32| {
+                    const scw = sc16(blk_ptr.scales[0..], ib32 / 2);
+                    const dl1 = d * (2.0 * @as(f32, @floatFromInt((scw >> @intCast(6 * (ib32 % 2) + 0)) & 0x7)) + 1.0);
+                    const dl2 = d * (2.0 * @as(f32, @floatFromInt((scw >> @intCast(6 * (ib32 % 2) + 3)) & 0x7)) + 1.0);
+                    // qh advances TWO bytes per 32-group; the first two
+                    // sub-blocks read qh0, the last two read qh1.
+                    const qh0 = blk_ptr.qh[2 * ib32 + 0];
+                    const qh1 = blk_ptr.qh[2 * ib32 + 1];
+                    const idx = [4]usize{
+                        blk_ptr.qs[ib32 * 4 + 0] | ((@as(usize, qh0) << 8) & 0x700),
+                        blk_ptr.qs[ib32 * 4 + 1] | ((@as(usize, qh0) << 4) & 0x700),
+                        blk_ptr.qs[ib32 * 4 + 2] | ((@as(usize, qh1) << 8) & 0x700),
+                        blk_ptr.qs[ib32 * 4 + 3] | ((@as(usize, qh1) << 4) & 0x700),
+                    };
+                    const delta = [4]f32{
+                        if ((qh0 & 0x08) != 0) -IQ1S_DELTA else IQ1S_DELTA,
+                        if ((qh0 & 0x80) != 0) -IQ1S_DELTA else IQ1S_DELTA,
+                        if ((qh1 & 0x08) != 0) -IQ1S_DELTA else IQ1S_DELTA,
+                        if ((qh1 & 0x80) != 0) -IQ1S_DELTA else IQ1S_DELTA,
+                    };
+                    inline for (0..4) |sb| {
+                        const dl: f32 = if (sb < 2) dl1 else dl2;
+                        const w = (grid8s(IQ1S_GRID[idx[sb]]) + @as(Vec, @splat(delta[sb]))) * @as(Vec, @splat(dl));
+                        const koff = abase + ib32 * 32 + sb * 8;
+                        acc = @mulAdd(Vec, widen8(a + i * lda + koff), w, acc);
+                    }
+                }
+            }
+            c[i * ldc + j] = @reduce(.Add, acc);
+        }
+    }
+}
 
 pub fn gemmIQ1_MScalar(
     a: [*]const amx.bf16,

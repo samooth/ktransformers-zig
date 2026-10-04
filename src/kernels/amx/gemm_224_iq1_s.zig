@@ -33,6 +33,8 @@
 //   to an exhaustive 2048-entry scan if the kneighbors list is empty).
 
 const std = @import("std");
+// grid8s (SIGNED magnitudes) is owned by gemm_224_iq2_xxs.zig; import, never re-declare.
+const grid8s = @import("gemm_224_iq2_xxs.zig").grid8s;
 const amx = @import("../arch/amx.zig");
 
 // ============================================================================
@@ -646,6 +648,117 @@ pub fn dequantizeRowIQ1_SToBF16(x: [*]const BlockIQ1_S, y: [*]amx.bf16, k: usize
 // ============================================================================
 // Scalar GEMM (BF16 activations x IQ1_S weights -> F32)
 // ============================================================================
+
+// ============================================================================
+// AVX2 GEMM
+// ============================================================================
+//
+// Same four rules as everywhere else: n-outer so the weight block streams from
+// DRAM once, MR=4 so four activation rows share one unpacked weight vector,
+// explicit `@mulAdd` because FP contraction is off in this toolchain, and one
+// `@reduce` per output element.
+//
+// WRITE THE UNPACK WITH EXPLICIT VECTOR OPS FROM THE START. `iq2xxs.grid8`
+// originally used `inline for` + array staging, i.e. eight scalar 64-bit shifts
+// (AVX2 has none), and cost a factor of ~100 on IQ2_XXS. Every unpack here
+// delegates to it rather than re-deriving bytes.
+//
+// // The 1-bit formats are simpler than they look: there is NO per-element sign at
+// all. `dequantizeRowIQ1_S` computes `dl * (q + delta)` where `delta` is one
+// group-wide value (its sign from bit 15 of `qh[ib]`), so the unpack is a table
+// lookup plus an add and a multiply.
+
+// Two things that are easy to get wrong and both are silent:
+
+//   - the grid magnitudes are **signed** bytes (`gridBytes` returns `[8]i8`), so
+//     this uses `grid8s`, not the unsigned `grid8` the IQ2/IQ3 formats use. As u8,
+//     a magnitude of -1 would read as 255 — wrong by 256, and still plausible.
+//   - `delta` is added to the magnitude BEFORE the scale multiply, not after.
+
+// The three scale fields are packed into one u16 per group: 12 bits of index-highs
+// (bits 0..11, three bits each for l = 0..3), a 3-bit scale at bits 12..14, and the
+// delta sign at bit 15.
+
+const MR: usize = 4;
+const Vec: type = @Vector(8, f32);
+
+/// 8 bf16 -> 8 f32, unaligned.
+inline fn widen8(p: [*]const amx.bf16) Vec {
+    const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+    return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+}
+
+/// AVX2 GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
+/// `k` must be a multiple of QK_K, as for the scalar version.
+pub fn gemmAvx2(
+    a: [*]const amx.bf16,
+    b: [*]const BlockIQ1_S,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    const nb = k / QK_K;
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        const brow = b + j * ldb;
+        var i: usize = 0;
+        while (i + MR <= m) : (i += MR) {
+            var acc = [_]Vec{@splat(0.0)} ** MR;
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                const dsuper = f16_to_f32(blk_ptr.d); // per BLOCK, hoisted
+                const abase = blk * QK_K;
+                for (0..QK_K / 32) |ib| {
+                    const word: u16 = blk_ptr.qh[ib];
+                    const dl: f32 = dsuper * (2.0 * @as(f32, @floatFromInt((word >> 12) & 7)) + 1.0);
+                    const delta: f32 = if ((word & 0x8000) != 0) -IQ1S_DELTA else IQ1S_DELTA;
+                    const dv: Vec = @splat(delta);
+                    inline for (0..4) |l| {
+                        const lo: usize = blk_ptr.qs[4 * ib + l];
+                        const hi: usize = @as(usize, (word >> @intCast(3 * l)) & 7) << 8;
+                        // grid8s, not grid8: these magnitudes are SIGNED bytes,
+                        // and there is no sign byte - delta is added to all 8.
+                        const w = (grid8s(IQ1S_GRID[lo | hi]) + dv) * @as(Vec, @splat(dl));
+                        const koff = abase + ib * 32 + l * 8;
+                        inline for (0..MR) |r| {
+                            acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + koff), w, acc[r]);
+                        }
+                    }
+                }
+            }
+            inline for (0..MR) |r| c[(i + r) * ldc + j] = @reduce(.Add, acc[r]);
+        }
+        // Row tail (m % MR), one row at a time.
+        while (i < m) : (i += 1) {
+            var acc: Vec = @splat(0.0);
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                const dsuper = f16_to_f32(blk_ptr.d); // per BLOCK, hoisted
+                const abase = blk * QK_K;
+                for (0..QK_K / 32) |ib| {
+                    const word: u16 = blk_ptr.qh[ib];
+                    const dl: f32 = dsuper * (2.0 * @as(f32, @floatFromInt((word >> 12) & 7)) + 1.0);
+                    const delta: f32 = if ((word & 0x8000) != 0) -IQ1S_DELTA else IQ1S_DELTA;
+                    const dv: Vec = @splat(delta);
+                    inline for (0..4) |l| {
+                        const lo: usize = blk_ptr.qs[4 * ib + l];
+                        const hi: usize = @as(usize, (word >> @intCast(3 * l)) & 7) << 8;
+                        // grid8s, not grid8: these magnitudes are SIGNED bytes,
+                        // and there is no sign byte - delta is added to all 8.
+                        const w = (grid8s(IQ1S_GRID[lo | hi]) + dv) * @as(Vec, @splat(dl));
+                        const koff = abase + ib * 32 + l * 8;
+                        acc = @mulAdd(Vec, widen8(a + i * lda + koff), w, acc);
+                    }
+                }
+            }
+            c[i * ldc + j] = @reduce(.Add, acc);
+        }
+    }
+}
 
 pub fn gemmIQ1_SScalar(
     a: [*]const amx.bf16,
