@@ -129,6 +129,8 @@ const Row = struct {
     hi: [ARM_COUNT]f64,
     /// Setup reported by the bench for this row, if any. See SETUP_DOMINATED.
     setup_ms: ?f64 = null,
+    /// Arena for formatting the setup cell; owned by the caller.
+    arena: std.mem.Allocator,
     /// The Zig harness's own rate for this row, carried through untouched.
     rate: f64 = 0,
     /// ABSOLUTE MODE: the C++ harness never reported this label, so there is no
@@ -322,6 +324,8 @@ pub fn main(init: std.process.Init) !void {
             .hi = @splat(0),
             .rate = slot.rate[@intFromEnum(Arm.zig)],
             .absolute = no_cpp_arm,
+            .setup_ms = slot.setup_ms,
+            .arena = arena,
         };
         // Only the arms this row actually has; the rest stay 0 and are never
         // read, because `report` branches on `absolute` before touching `cpp`.
@@ -402,6 +406,88 @@ fn absoluteBand(row: Row) f64 {
     return @max(sideDev(row, .zig, .ctl), 1.0);
 }
 
+/// Above this setup:measurement ratio the floor is ours, not the host's.
+///
+/// Measured on the IQ anchors: 5.1 s of quantization plus 249 ms of grid init
+/// against a ~4 ms GEMM, i.e. ~1300x. The first control-armed pass on those rows
+/// reported floors of 2.9x-15.8x, which is not host noise -- it is the floor
+/// measuring the setup.
+///
+/// It has to be reported by the bench rather than inferred from the child's wall
+/// time, because wall time also contains every rep: 62 reps of a 4.5 ms kernel is
+/// ~280 ms and would be indistinguishable from real setup. A bench that does not
+/// print `SETUP|label|ms` gets "not reported", not an assumed 1x.
+const SETUP_DOMINATED: f64 = 3.0;
+
+/// Band width at which the instrument can no longer see a sub-`x` effect, and
+/// the summary says so out loud. Set just under 2.0 because a 2x band already
+/// hides the 1.2x class of claim this repo publishes; a tool that refuses should
+/// also be loud about being unable to see.
+const INSTRUMENT_BLIND: f64 = 1.9;
+
+/// Why a row is unresolvable, and whether that is anybody's fault.
+///
+/// The distinction matters because the two have opposite remedies. A
+/// host-dominated floor is the weather: re-run on a quieter box. A
+/// setup-dominated floor is ours: the bench builds inputs that cost far more
+/// than the thing it times, so every process-level sample carries the setup's
+/// cache and frequency state into the measurement, and the fix is to hoist the
+/// setup or to sample in-process instead of spawning a process per arm.
+///
+/// A floor that is too wide costs power; a floor that is too narrow manufactures
+/// findings. Only the first is acceptable in a tool whose job is to refuse -- but
+/// "always says unresolvable" is its own failure mode, because a setup-dominated
+/// floor will hide a real effect indefinitely and look like rigour while doing
+/// it. Hence: say which kind it is.
+const Domination = enum {
+    /// Setup dominates: fixable in software.
+    setup,
+    /// The host dominates: not fixable here.
+    host,
+    /// The bench did not report a setup cost, so this cannot be told.
+    unknown,
+
+    fn label(self: Domination) []const u8 {
+        return switch (self) {
+            .setup => "setup-dominated (fixable: hoist the setup, or sample in-process)",
+            .host => "host-dominated (not fixable in software; re-run quieter)",
+            .unknown => "setup unreported (cannot tell host from setup)",
+        };
+    }
+
+    /// Whether process-per-arm is the right sampling strategy for this row.
+    ///
+    /// Spawning a process per arm is what isolates the arms, so it is correct for
+    /// a bench with trivial setup. For a bench whose setup is orders of magnitude
+    /// larger than its measurement it is simply the wrong tool, because the arm
+    /// boundary and the setup boundary coincide.
+    fn sampler(self: Domination) []const u8 {
+        return switch (self) {
+            .setup => "process-per-arm is the WRONG sampler here; the setup is the measurement",
+            .host => "process-per-arm is appropriate; the host is the limit",
+            .unknown => "sampler choice undetermined without a reported setup cost",
+        };
+    }
+};
+
+/// The setup:measurement cell. Written inline because it needs `arena`.
+fn setupCell(row: Row) []const u8 {
+    const r = setupRatio(row) orelse return "not reported";
+    return std.fmt.allocPrint(row.arena, "{d:.0}x", .{r}) catch "err";
+}
+
+fn setupRatio(row: Row) ?f64 {
+    const setup = row.setup_ms orelse return null;
+    const m = row.best[@intFromEnum(Arm.zig)];
+    if (m <= 0 or setup <= 0) return null;
+    return setup / m;
+}
+
+fn classify(row: Row) Domination {
+    const r = setupRatio(row) orelse return .unknown;
+    return if (r >= SETUP_DOMINATED) .setup else .host;
+}
+
 const Verdict = enum { faster, slower, unmeasurable };
 
 fn verdictFor(ratio: f64, floor: f64) Verdict {
@@ -451,10 +537,10 @@ fn report(
         std.debug.print("`floor` is the multiplicative noise band this pass measured for that row. A ratio is\n", .{});
         std.debug.print("printed ONLY when it falls outside it; otherwise the row reads UNMEASURABLE and no\n", .{});
         std.debug.print("number is offered. Ratio is C++ ms / Zig ms, so >1 means the Zig port is faster.\n\n", .{});
-        std.debug.print("| row | C++ ms | Zig ms | floor | ratio | verdict |\n", .{});
-        std.debug.print("|---|---|---|---|---|---|\n", .{});
+        std.debug.print("| row | C++ ms | Zig ms | setup:meas | floor | ratio | verdict |\n", .{});
+        std.debug.print("|---|---|---|---|---|---|---|\n", .{});
     } else {
-        std.debug.print("row\tcpp_ms\tzig_ms\tfloor\tratio\tverdict\n", .{});
+        std.debug.print("row\tcpp_ms\tzig_ms\tsetup:meas\tfloor\tratio\tverdict\n", .{});
     }
 
     // ABSOLUTE rows are collected and printed as their own table, AFTER the
@@ -481,18 +567,27 @@ fn report(
                 unresolved += 1;
                 // Deliberately no ratio printed: an unresolved delta is a
                 // number that invites a decision the measurement cannot support.
+                const dom = classify(row);
                 if (raw) {
-                    std.debug.print("{s}\t{d:.4}\t{d:.4}\t{d:.3}\t-\tUNMEASURABLE\n", .{ row.label, cpp, zig, floor });
+                    std.debug.print("{s}\t{d:.4}\t{d:.4}\t{s}\t{d:.3}\t-\tUNMEASURABLE:{s}\n", .{
+                        row.label, cpp, zig, setupCell(row), floor, @tagName(dom),
+                    });
                 } else {
-                    std.debug.print("| {s} | {d:.4} | {d:.4} | {d:.3}x | — | **UNMEASURABLE** (below floor) |\n", .{ row.label, cpp, zig, floor });
+                    std.debug.print("| {s} | {d:.4} | {d:.4} | {s} | {d:.3}x | — | **UNMEASURABLE** — {s} |\n", .{
+                        row.label, cpp, zig, setupCell(row), floor, dom.label(),
+                    });
                 }
             },
             .faster, .slower => {
                 resolved += 1;
                 if (raw) {
-                    std.debug.print("{s}\t{d:.4}\t{d:.4}\t{d:.3}\t{d:.3}\t{s}\n", .{ row.label, cpp, zig, floor, ratio, @tagName(v) });
+                    std.debug.print("{s}\t{d:.4}\t{d:.4}\t{s}\t{d:.3}\t{d:.3}\t{s}\n", .{
+                        row.label, cpp, zig, setupCell(row), floor, ratio, @tagName(v),
+                    });
                 } else {
-                    std.debug.print("| {s} | {d:.4} | {d:.4} | {d:.3}x | **{d:.2}x** | {s} |\n", .{ row.label, cpp, zig, floor, ratio, @tagName(v) });
+                    std.debug.print("| {s} | {d:.4} | {d:.4} | {s} | {d:.3}x | **{d:.2}x** | {s} |\n", .{
+                        row.label, cpp, zig, setupCell(row), floor, ratio, @tagName(v),
+                    });
                 }
             },
         }
@@ -510,18 +605,23 @@ fn report(
             std.debug.print("which is the whole error budget of a single measurement: one code path, sampled\n", .{});
             std.debug.print("`iters` times. It is NOT the ratio floor, which additionally carries the C++ side's\n", .{});
             std.debug.print("spread because a ratio divides two measurements.\n\n", .{});
+            std.debug.print("`setup:meas` is the bench's own input-building time over the reported ms. A\n", .{});
+            std.debug.print("high value means this process-per-arm sampler is mostly measuring the SETUP, not\n", .{});
+            std.debug.print("the kernel — which is ours to fix (hoist the setup, or sample in-process), not the\n", .{});
+            std.debug.print("host's to wait out. See the `why` column.\n\n", .{});
             if (self_test) {
                 std.debug.print("**SELF-TEST: the figure column is withheld.** Both arms are the same binary, so\n", .{});
                 std.debug.print("nothing here has been validated against an independent implementation. The band\n", .{});
                 std.debug.print("is printed because the band is the part that must survive the self-test.\n\n", .{});
             }
-            std.debug.print("| row | Zig ms | band | figure | note |\n", .{});
-            std.debug.print("|---|---|---|---|---|\n", .{});
+            std.debug.print("| row | Zig ms | setup:meas | band | figure | why | note |\n", .{});
+            std.debug.print("|---|---|---|---|---|---|---|\n", .{});
         }
         for (rows) |row| {
             if (!row.absolute) continue;
             const zig = row.best[@intFromEnum(Arm.zig)];
             const band = absoluteBand(row);
+            const dom = classify(row);
             const figure = if (self_test)
                 "withheld (self-test)"
             else if (row.rate > 0)
@@ -529,14 +629,44 @@ fn report(
             else
                 "not reported by the harness";
             if (raw) {
-                std.debug.print("{s}\t{d:.4}\t{d:.3}\t{s}\tno C++ arm\n", .{ row.label, zig, band, figure });
+                std.debug.print("{s}\t{d:.4}\t{s}\t{d:.3}\t{s}\t{s}\tno C++ arm\n", .{
+                    row.label, zig, setupCell(row), band, figure, @tagName(dom),
+                });
             } else {
-                std.debug.print("| {s} | {d:.4} | +-{d:.1}% | {s} | no C++ arm |\n", .{
-                    row.label, zig, (band - 1.0) * 100.0, figure,
+                std.debug.print("| {s} | {d:.4} | {s} | +-{d:.1}% | {s} | {s} | no C++ arm |\n", .{
+                    row.label, zig, setupCell(row), (band - 1.0) * 100.0, figure, dom.label(),
                 });
             }
         }
     }
+
+    // A floor that has widened far enough to hide the effect being looked for is
+    // a BROKEN INSTRUMENT, not a null result, and it has to be able to read that
+    // way. Printing the widest band beside the summary is the whole of it: a
+    // reader who sees "+-120%" next to a 1.2x claim should not have to work out
+    // that the claim was never testable.
+    var widest: f64 = 1.0;
+    var widest_label: []const u8 = "";
+    for (rows) |row| {
+        const band = if (row.absolute) absoluteBand(row) else floorFor(row);
+        if (band > widest) {
+            widest = band;
+            widest_label = row.label;
+        }
+    }
+    std.debug.print("\nwidest band this pass: +-{d:.0}% ({s})", .{
+        (widest - 1.0) * 100.0, if (widest_label.len == 0) "no rows" else widest_label,
+    });
+    if (widest >= INSTRUMENT_BLIND) {
+        std.debug.print(
+            "\n**THE INSTRUMENT IS BLIND at this width.** Nothing below ~{d:.1}x is measurable in this\n" ++
+                "pass, so a claim inside that range is not a null result — it is untested. Either the\n" ++
+                "box is too busy or the bench's own setup dominates its measurement (read the\n" ++
+                "`setup:meas` and `why` columns). Do not quote a ratio from this pass either way.",
+            .{widest},
+        );
+    }
+    std.debug.print("\n", .{});
 
     const ratio_rows = rows.len - absolute_rows;
     std.debug.print("\n{d} of {d} comparison rows resolved above the control's noise floor", .{ resolved, ratio_rows });
@@ -547,10 +677,36 @@ fn report(
     if (unresolved > 0) {
         std.debug.print(
             "The unresolved rows are not ties. They are rows where this pass could not\n" ++
-                "distinguish the two implementations. Re-run with more --iters on a quieter\n" ++
-                "box before concluding anything about them; do not quote a number for them.\n",
+                "distinguish the two implementations, and the verdict says which kind that is:\n",
             .{},
         );
+        var saw_setup = false;
+        var saw_host = false;
+        for (rows) |row| {
+            switch (classify(row)) {
+                .setup => saw_setup = true,
+                .host => saw_host = true,
+                .unknown => {},
+            }
+        }
+        if (saw_setup) {
+            std.debug.print(
+                "\n  setup-dominated: the bench builds more than it measures, so the setup's\n" ++
+                    "  cache and frequency state land inside every sample. More --iters will not\n" ++
+                    "  help. Hoist the setup out of the process, or sample in-process instead of\n" ++
+                    "  spawning a process per arm. See SETUP_DOMINATED in this file.\n",
+                .{},
+            );
+        }
+        if (saw_host) {
+            std.debug.print(
+                "\n  host-dominated: the measurement is fine and the box is not. No amount of\n" ++
+                    "  software changes this; re-run when load is low. Treat any floor above\n" ++
+                    "  ~1.15x as evidence that we are the load.\n",
+                .{},
+            );
+        }
+        std.debug.print("\nDo not quote a number for any unresolved row.\n", .{});
     }
 }
 
@@ -619,7 +775,7 @@ fn parseInto(
             const slabel = parts.next() orelse continue;
             const sms = parts.next() orelse continue;
             const v = std.fmt.parseFloat(f64, sms) catch continue;
-            try setup_out.?.append(arena, .{ .label = try arena.dupe(u8, slabel), .ms = v });
+            try setup_out.?.append(arena, .{ .label = try arena.dupe(u8, slabel), .ms = v, .rate = 0 });
             continue;
         }
         if (!std.mem.eql(u8, kind, "GEMM") and !std.mem.eql(u8, kind, "ACT")) continue;

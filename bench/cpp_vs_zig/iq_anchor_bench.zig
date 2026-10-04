@@ -148,8 +148,11 @@ pub fn main(init: std.process.Init) !void {
     // IQ2_XXS uses the 256-entry grid, IQ2_XS the 512-entry one. Same function
     // name pattern, different grid — initIq2XsData512 is NOT interchangeable
     // with initIq2XsData.
+    // Per-format setup timing. Timing both formats together and attributing the
+    // total to each is wrong and inflates every ratio by ~2x — which is exactly
+    // what the first version of this did.
+    const t_xxs0 = nowNs();
     const d_xxs = root.iq2xs_init.initIq2XsData(alloc);
-    const d_xs = root.iq2xs_init.initIq2XsData512(alloc);
 
     var rng: u64 = 0xABCD_0001;
     const rowbuf = try alloc.alloc(f32, K);
@@ -157,8 +160,13 @@ pub fn main(init: std.process.Init) !void {
 
     const b_xxs = try alloc.alloc(root.gemm_iq2_xxs.BlockIQ2_XXS, N * NB);
     for (0..N) |j| root.iq2_quantize.quantizeRowIQ2_XXS_WithInit(d_xxs, rowbuf, @ptrCast(&b_xxs[j * NB]), K, null);
+    const setup_xxs = nowNs() - t_xxs0;
+
+    const t_xs0 = nowNs();
+    const d_xs = root.iq2xs_init.initIq2XsData512(alloc);
     const b_xs = try alloc.alloc(root.gemm_iq2_xs.BlockIQ2_XS, N * NB);
     for (0..N) |j| root.gemm_iq2_xs.quantizeRowIQ2_XS_WithInit(d_xs, rowbuf, @ptrCast(&b_xs[j * NB]), K, null);
+    const setup_xs = nowNs() - t_xs0;
 
     // ---- IQ2_XXS --------------------------------------------------------
     {
@@ -179,6 +187,10 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("GEMM|IQ2_XXS [m=1,n={d},k={d}]|{d:.4}|{d:.3}\n", .{ N, K, ms1, bytes / (ms1 * 1e-3) / 1e9 });
         std.debug.print("GEMM|IQ2_XXS [m=8,n={d},k={d}]|{d:.4}|{d:.3}\n", .{ N, K, ms8, bytes / (ms8 * 1e-3) / 1e9 });
         std.debug.print("  IQ2_XXS agreement vs scalar: m=1 rel-L2 {d:.2}  m=8 rel-L2 {d:.2}\n", .{ rel1, rel8 });
+        // Setup is per-format, not per-m, so both rows get the same figure.
+        const sm = @as(f64, @floatFromInt(setup_xxs)) / 1e6;
+        std.debug.print("SETUP|IQ2_XXS [m=1,n={d},k={d}]|{d:.2}\n", .{ N, K, sm });
+        std.debug.print("SETUP|IQ2_XXS [m=8,n={d},k={d}]|{d:.2}\n", .{ N, K, sm });
     }
 
     // ---- IQ2_XS ---------------------------------------------------------
@@ -198,5 +210,8 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("GEMM|IQ2_XS [m=1,n={d},k={d}]|{d:.4}|{d:.3}\n", .{ N, K, ms1, bytes / (ms1 * 1e-3) / 1e9 });
         std.debug.print("GEMM|IQ2_XS [m=8,n={d},k={d}]|{d:.4}|{d:.3}\n", .{ N, K, ms8, bytes / (ms8 * 1e-3) / 1e9 });
         std.debug.print("  IQ2_XS agreement vs scalar: m=1 rel-L2 {d:.2}  m=8 rel-L2 {d:.2}\n", .{ rel1, rel8 });
+        const sm = @as(f64, @floatFromInt(setup_xs)) / 1e6;
+        std.debug.print("SETUP|IQ2_XS [m=1,n={d},k={d}]|{d:.2}\n", .{ N, K, sm });
+        std.debug.print("SETUP|IQ2_XS [m=8,n={d},k={d}]|{d:.2}\n", .{ N, K, sm });
     }
 }
