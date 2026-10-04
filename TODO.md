@@ -1103,7 +1103,12 @@ order).
 **Read the ratio with care.** 69-165x is inflated by a pathological scalar
 baseline (272 ms for 14.7M weights is ~55 cycles/weight, because the scalar path
 calls `dequantizeRow` per block per output element). The honest measure is the
-absolute: **3.78 MB in ~3 ms = 1.26 GB/s at m=1**, which puts IQ2_XXS in the same
+> **SUPERSEDED 2026-10-04 by the control-armed re-measure below.** The 1.26 and
+> 1.06 GB/s figures were taken on a host at load 13-51 from "~3 ms" and "4 ms"
+> readings. Re-measured with a control arm per side, the two anchors are
+> **0.93 GB/s each — 1.01x apart, a tie**, against a floor of 1.17-1.52x. The
+> 1.19x spread between them is not a property of the formats. Absolute, and
+> unchanged: **3.78 MB in ~3 ms = 1.26 GB/s at m=1**, which puts IQ2_XXS in the same
 ballpark as IQ4_XS (~2.6 GB/s), MXFP4 (~2.6) and well below Q8_0 (7.8). So the
 format is not weak; the earlier number was my bug.
 
@@ -1272,9 +1277,15 @@ twice earlier today.
 
 **Not benchmarked**, per instruction: the host is contended and a full benchmark
 is scheduled for an idle box. No ratios are claimed for IQ2_S / IQ3_XXS / IQ3_S /
-IQ1_S / IQ1_M. The formats that have been measured (IQ2_XXS 1.26 GB/s at m=1,
-IQ2_XS 1.06) share the same unpack path, so these should land in the same range —
-an estimate, not a measurement.
+IQ1_S / IQ1_M. The formats that have been measured share the same unpack path, so
+these should land in the same range — an estimate, not a measurement.
+
+> **The range does not exist (2026-10-04).** Re-measured control-armed, the two
+> anchors are a **tie at ~0.93 GB/s** (1.01x apart, floor 1.17-1.52x), so
+> "1.06-1.26 GB/s" was two contended-host readings of one value. The shared unpack
+> path predicts equal throughput, which is what the re-measure shows — the
+> intuition was right and the arithmetic turned a tie into a band. **Reframed
+> question: do the five land at ~0.93 GB/s?** One point, one floor, well posed.
 
 **Format-anchored tests for `grid8s` — the signedness trap is now pinned, not
 just self-consistent.** The IQ1 equivalence tests only prove `gemmAvx2` and

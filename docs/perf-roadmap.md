@@ -496,6 +496,63 @@ staging is not the cause.
 
 ---
 
+### P0.6 — IQ anchor re-measure: the prediction band does not exist
+
+Stream K's estimate for the unmeasured grid formats (IQ2_S, IQ3_XXS, IQ3_S,
+IQ1_S, IQ1_M) was "they share the same unpack path, so these should land in the
+same range" as IQ2_XXS (1.26 GB/s at m=1) and IQ2_XS (1.06). That implies a band
+of **1.06–1.26 GB/s**. It was never measured, and it does not survive contact
+with a control arm.
+
+`bench/cpp_vs_zig/iq_anchor_bench.zig` re-measures the two anchors at
+n=2048, k=7168 (57344 blocks), blocks quantized from real data with each format's
+own `_WithInit` quantizer, agreement against the scalar reference **bit-exact
+(rel-L2 0.00)** at m=1 and m=8 for both:
+
+| format | bytes | GB/s (3 direct runs) | spread |
+|---|---|---|---|
+| IQ2_XXS | 3.78 MB (66 B/block, 2.063 bpw) | 0.925 / 0.961 / 0.935 | ~4% |
+| IQ2_XS | 4.24 MB (74 B/block, 2.313 bpw) | 0.934 / 0.927 / 0.900 | ~4% |
+
+**In GB/s the two anchors are 1.01x apart — a tie.** In raw ms they are 1.15x
+apart, but that is entirely IQ2_XS moving 12% more bytes, which is why GB/s is
+the only meaningful unit for a cross-format comparison. Stream K's two figures
+differ by 1.19x in that same unit, each taken on a host at load 13–51 from a
+"~3 ms" and a "4 ms" reading. A control-armed pass puts the floor for these rows
+at **1.17x–1.52x** (load 16), wider than the 1.01x difference, so the difference
+is unresolvable: there is no band, and "do the five land in 1.06–1.26?" is a
+question with no answer.
+
+**His intuition was right and his arithmetic was not.** Equal throughput is
+exactly what "same unpack path" predicts; he read a tie as a spread and then
+widened it into a range.
+
+What replaces the band is a better question: **do the five land at ~0.93 GB/s?**
+One measured point against one measured floor, which is well posed.
+
+### The bench that measures the harness — third instance, same shape
+
+Setup for these formats is ~1300x the measurement:
+
+    initIq2XsData512          249 ms   once per process
+    quantize all IQ2_XXS     5147 ms   once per process
+    gemmAvx2 at m=1          ~4 ms     the thing being measured
+
+Hoisting setup out of the timed region is necessary and not sufficient. Each
+child process spends 11–16 s quantizing and then times a 4–6 ms kernel, so the
+measurement inherits the frequency and cache state the quantizer left behind. The
+first control-armed pass reported floors of **2.9x–15.8x** — not host noise. A
+200 ms settle after setup plus 60 reps instead of 9 took the direct spread to ~4%.
+
+Worth stating as a rule, because the fix is not obvious from the symptom: **a
+bench whose per-process setup cost is large relative to what it times will report
+a floor dominated by the setup.** The harness's floor is the widest spread over
+all samples of identical code, which is an upper bound — correct, but pessimistic
+here (1.17–1.52x) because it is taken across only 3 process-level samples that
+each carry the whole setup. For such a bench the in-process min-of-N is the
+better estimator. The verdict direction is unaffected: a pessimistic floor can
+only make "unresolvable" easier to reach, and "unresolvable" is what we claim.
+
 ### P2.1 — Promote shared primitives into the arch layer
 
 `widen8` lives in `gemm_224_bf16.zig` but every quant kernel needs the same
