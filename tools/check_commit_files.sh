@@ -22,6 +22,20 @@
 # for attribution that survives: a commit which lists its files records who was
 # holding what.
 #
+# KNOWN LIMITATION, demonstrated on this file. Naming a staged file proves only
+# that the file is MENTIONED, not that its CONTENT is yours. This gate passed a
+# commit whose staged `check_commit_files.sh` contained another session's fix
+# rather than the author's — the author staged by filename, the file was named in
+# the message, and the gate said OK. The author did not notice because the other
+# session's edit was correct and the author's own edit had silently failed an
+# assertion before writing.
+#
+# So this check closes the accidental sweep, not the content sweep. The
+# mechanical remedy for the second is to review the staged diff itself rather than
+# the file list: `git diff --cached` before every commit, or `git diff --cached
+# --stat` when the volume is the thing you are unsure about. There is no hook that
+# can tell whose fingers are on the content.
+#
 # USAGE
 #   tools/check_commit_files.sh [--message-file PATH]
 #
