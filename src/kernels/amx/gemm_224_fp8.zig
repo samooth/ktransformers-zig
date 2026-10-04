@@ -47,18 +47,56 @@ pub fn f32_to_fp8e4m3(x: f32) fp8_e4m3 {
     return if (sign == 1) result | @as(u8, 0x80) else result;
 }
 
-/// Convert FP8 E4M3 to f32
+/// FP8 E4M3 -> F32 lookup table, built at comptime.
+///
+/// This is the exact table the C++ reference builds at startup in
+/// `operators/avx2/fp8_dequant.hpp` (`FP8LUT::init`), which gathers from it
+/// with `_mm256_i32gather_ps`. Matching it bit-for-bit is the point: it is
+/// what makes a cross-implementation accuracy diff meaningful.
+///
+/// It replaces a pure bit-reconstruction decoder that was wrong twice over:
+///   - subnormals (exponent field 0, mantissa 1-7) were decoded as NORMAL,
+///     yielding ~1.0-2.0 instead of `man/8 * 2^-6` (2^-9 .. 7*2^-9);
+///   - 0x7F, the single NaN encoding in E4M3, decoded to 480.0, which is
+///     above E4M3_MAX=448 and therefore not even representable.
+///
+/// 0x7F maps to 0.0 here, matching the reference: "Only 0x7F is NaN in E4M3.
+/// Treat as 0 to avoid propagation." Exponent 15 with mantissa 0-6 are real
+/// finite values (256..448) and decode normally.
+pub const FP8_E4M3_LUT: [256]f32 = blk: {
+    var t: [256]f32 = undefined;
+    for (0..256) |i| {
+        const bits: u8 = @intCast(i);
+        const sign: u1 = @intCast((i >> 7) & 1);
+        const exp: i32 = @intCast((i >> 3) & 0xF);
+        const man: u32 = @intCast(bits & 0x7);
+
+        var v: f32 = undefined;
+        if (exp == 0 and man == 0) {
+            v = 0.0;
+        } else if (exp == 0) {
+            v = @as(f32, @floatFromInt(man)) * (1.0 / 8.0) * 0.015625; // man/8 * 2^-6
+        } else if (exp == 15 and man == 7) {
+            v = 0.0; // the one NaN encoding; see above
+        } else {
+            // 2^(exp-7) * (1 + man/8), built straight into the f32 exponent
+            // field. NOT std.math.scalbn/ldexp: those take a
+            // `comptime_float`/f32 union and cannot be evaluated at comptime
+            // in Zig 0.16 ("access of union field 'float' while field
+            // 'comptime_float' is active", plus a branch-quota overflow), so
+            // this table failed to build. exponent = exp + 120 is exactly
+            // (exp - 7) + 127, and man << 20 is exactly the 3-bit mantissa.
+            v = @bitCast((@as(u32, @as(u32, exp) + 120) << 23) | (@as(u32, man) << 20));
+        }
+        t[i] = if (sign == 1) -v else v;
+    }
+    break :blk t;
+};
+
+/// Convert FP8 E4M3 to f32. One L1-resident table load; see
+/// `FP8_E4M3_LUT` for why this is a lookup and not bit arithmetic.
 pub fn fp8e4m3_to_f32(x: fp8_e4m3) f32 {
-    const sign = (x >> 7) & 1;
-    const exp = @as(i32, @intCast((x >> 3) & 0x0F)) - 7;
-    const mant = @as(u32, x & 0x07);
-
-    // Reconstruct f32
-    const f32_exp = @as(u32, @intCast(exp + 127)) << 23;
-    const f32_mant = mant << 20;
-    const f32_sign = @as(u32, sign) << 31;
-
-    return @bitCast(f32_sign | f32_exp | f32_mant);
+    return FP8_E4M3_LUT[x];
 }
 
 /// Convert FP8 E4M3 to BF16
