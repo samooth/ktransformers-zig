@@ -99,6 +99,21 @@
 // `_WithInit` quantizer; a zeroed or randomly-byte-filled block would leave the
 // unpack on a path real weights never take.
 //
+// WHAT THE AGREEMENT COLUMN IS NOT, since "verified" reads wider than it is.
+// Both arms consume the SAME blocks, produced by the SAME quantizer, one call
+// outside the timed region. So this comparison is evidence about the two GEMM
+// paths and about nothing else: a defect in `makeQPQuants` cancels out of it
+// completely, because both arms are fed its output. That is not hypothetical —
+// a clamp that only bounded from above in `iq2_quantize` (`new_l` could go
+// negative, fixed 2026-10-04) survived here and had to be found by inspection.
+//
+// The consequence for reading this table: a small rel-L2 says the vector and
+// scalar GEMMs agree, and says NOTHING about whether the blocks they were fed
+// are the blocks the format should have produced. Only a round-trip or
+// independent-oracle test covers the input, and per format that is the SIMD
+// suite's job, not this bench's. Treat a green agreement column as "the
+// arithmetic matches", never as "the format is right".
+//
 // Run the floor with the control arms (both arms the same binary, so every row
 // must read UNMEASURABLE — that run is the band, not a speedup):
 //
