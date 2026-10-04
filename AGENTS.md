@@ -36,6 +36,10 @@ zig test src/mla/mla_tests.zig             # standalone MLA suite
 zig build -Doptimize=ReleaseFast bench     # GEMM micro-benchmark (B2)
 python3 tools/verify_abi.py                 # ABI double gate: exports + arity
 python3 tools/audit_layout.py               # ABI layout gate (pybind11 shim)
+python3 tools/verify_workflow.py            # CI-workflow gate: duplicate mapping
+                          # keys, and every step carrying run:/uses:
+tools/orphan_tests.sh [log]                 # orphaned test binaries from an
+                          # aborted `zig build test` (see below)
 sentrux check .                            # architecture rules gate (see below)
 ```
 
@@ -46,6 +50,7 @@ Caveats (verified the hard way — see LESSONS_ZIG.md for details):
 - If a build error survives a no-op rebuild, suspect stale `.zig-cache`: `rm -rf .zig-cache zig-out`.
 - Benchmark timings in Debug are meaningless — always `-Doptimize=ReleaseFast`.
 - `verify_abi.py` is the ABI gate: it FAILs if any header prototype lacks a matching Zig export (or arity diverges). Run it after touching `include/kt_kernel.h` or any `export fn`.
+- **`verify_workflow.py` is a gate, and it is in this list rather than in the workflow on purpose: a gate only one session runs is not a gate.** It does the two things a YAML parser cannot — a loader that RAISES on a duplicate mapping key instead of keeping the last, and a check that every `- name:` step actually carries a `run:` or `uses:`. A duplicate `run:` in `.github/workflows/wheels.yml` shipped a step whose body was silently discarded *and* stripped the command from the step above it, while `yaml.safe_load` reported the file as valid on that exact file after the edit that broke it. Parsing is not validation. Run it after ANY `.github/workflows/*.yml` edit.
 
 ## Code Structure
 
