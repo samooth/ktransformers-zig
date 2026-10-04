@@ -409,13 +409,32 @@ rules.toml edit, that's what happened.
 to ask. Claim a file before editing it, and release the marker in the same
 commit that lands the work, so the two never disagree.
 
-**`TODO.md` and `tests/kernels/simd_kernels_tests.zig` are CLAIMABLE like any
-other file.** That is not a technicality — it is the fix for a failure that
-happened twice here. `git add <file>` stages the file's *entire* working state,
-so two sessions with uncommitted edits in one file will always sweep each other's
-work into whichever commit lands first. It happened to a test suite and to a
-`TODO.md` write-up before this rule existed. "Stage by filename" does not prevent
-it; it is the wrong instinct, not a solution.
+**Every shared file is CLAIMABLE, and a claim is enforced by a script, not by
+good intentions.** `TODO.md`, `tests/kernels/simd_kernels_tests.zig`,
+`docs/*.md` and `bench/cpp_vs_zig/` have all been swept by another session's
+commit. `git add <file>` stages the file's **entire working state**, so two
+sessions with uncommitted edits in one file always cross-contaminate whichever
+lands first — and `bench/cpp_vs_zig/measure.zig` has now been swept three times,
+**twice leaving HEAD not compiling**, because a staged commit took another
+session's half-finished edits with it.
+
+**Do not "stage by filename". It is the wrong instinct and it is what caused all
+of the above.** Three options, in order of preference:
+
+1. **Stage only your own hunks** (`git add -p`, or `git diff | git apply
+   --cached` on a filtered diff).
+2. **Wait** for the session holding the file.
+3. **If their work genuinely belongs in your commit**, say so — and that is
+   checkable:
+
+       tools/check_staged_claims.sh
+
+   Run it before committing. It collects the claim handles in every staged file
+   and requires each to be declared in your message as `Handles: <handle>`, so a
+   commit that sweeps someone else's work cannot land silently. A marker documents
+   intent; this enforces it. (Not installed as a git hook — `.git/hooks/` is shared
+   by every session on this clone, so a blocking hook would break sessions
+   mid-flight. Wire it into your own workflow.)
 
 If a shared file is held and you cannot wait: put your write-up in your own notes
 file and hand the text to the coordinator to fold in. If you are the coordinator,
