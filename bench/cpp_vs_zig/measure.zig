@@ -112,6 +112,10 @@ const DEFAULT_ITERS: usize = 5;
 
 pub fn main(init: std.process.Init) !void {
     var arena_state = std.heap.ArenaAllocator.init(init.gpa);
+    // Without this the arena's doubling blocks are reported as leaks by the
+    // Debug allocator, which is how a real leak in this file once hid behind six
+    // large ones.
+    defer arena_state.deinit();
     const arena = arena_state.allocator();
     const args = try init.minimal.args.toSlice(arena);
 
@@ -191,7 +195,7 @@ pub fn main(init: std.process.Init) !void {
     while (it < iters) : (it += 1) {
         // Interleaved: one invocation of each arm per iteration, in a fixed
         // rotation, so no arm systematically owns a quieter slice of the pass.
-        inline for (.{ Arm.cpp, Arm.cppctl, Arm.zig, Arm.ctl }) |arm| {
+        for (std.enums.values(Arm)) |arm| {
             const path = switch (arm) {
                 .cpp => cpp_path,
                 .cppctl => cpp_path, // same-code control for the C++ side
@@ -220,7 +224,7 @@ pub fn main(init: std.process.Init) !void {
     defer rows.deinit(arena);
     for (table.items) |slot| {
         var complete = true;
-        inline for (.{ Arm.cpp, Arm.zig, Arm.ctl }) |arm| {
+        for (std.enums.values(Arm)) |arm| {
             if (slot.seen[@intFromEnum(arm)] != iters) complete = false;
         }
         if (!complete) {
@@ -233,8 +237,8 @@ pub fn main(init: std.process.Init) !void {
             );
             continue;
         }
-        var row = Row{ .label = slot.label, .best = undefined, .lo = undefined, .mid = undefined, .hi = undefined };
-        inline for (.{ Arm.cpp, Arm.zig, Arm.ctl }) |arm| {
+        var row = Row{ .label = slot.label, .best = @splat(0), .lo = @splat(0), .mid = @splat(0), .hi = @splat(0) };
+        for (std.enums.values(Arm)) |arm| {
             const idx: usize = @intFromEnum(arm);
             const s = slot.ms[idx].items;
             std.mem.sort(f64, s, {}, std.sort.asc(f64));
@@ -246,7 +250,7 @@ pub fn main(init: std.process.Init) !void {
         try rows.append(arena, row);
     }
 
-    try report(arena, rows.items, iters, pin, loadavg, raw, self_test, gitHead(init.gpa, io));
+    try report(arena, rows.items, iters, pin, loadavg, raw, self_test, gitHead(init.gpa, arena, io));
 }
 
 /// Noise band for one row, as a multiplicative factor >= 1.
@@ -455,7 +459,7 @@ fn parseInto(
 /// measured. Without this a table is not reproducible: the whole reason to
 /// re-measure on demand is that the kernels move, and a ratio whose commit is
 /// unknown cannot be checked against anything.
-fn gitHead(gpa: std.mem.Allocator, io: std.Io) []const u8 {
+fn gitHead(gpa: std.mem.Allocator, arena: std.mem.Allocator, io: std.Io) []const u8 {
     const argv = [_][]const u8{ "git", "rev-parse", "--short", "HEAD" };
     const res = std.process.run(gpa, io, .{ .argv = &argv }) catch return "unknown";
     defer gpa.free(res.stdout);
@@ -465,7 +469,7 @@ fn gitHead(gpa: std.mem.Allocator, io: std.Io) []const u8 {
             if (code != 0) return "unknown";
             const trimmed = std.mem.trim(u8, res.stdout, " \t\n");
             if (trimmed.len == 0) return "unknown";
-            return gpa.dupe(u8, trimmed) catch "unknown";
+            return arena.dupe(u8, trimmed) catch "unknown";
         },
         else => return "unknown",
     }
