@@ -269,6 +269,83 @@ pub fn quantizeRowQ3_K(src: []const f32, dst: [*]BlockQ3_K, k: usize) void {
 }
 
 /// ggml-quants.c:1305 dequantize_row_q3_K. k must be a multiple of 256.
+const Dq3Vec: type = @Vector(8, f32);
+
+/// 16 weights' worth of Q3_K values -> two `Dq3Vec`.
+///
+/// Q3_K is Q2_K plus a sign plane: the value is the 2-bit field MINUS 4 when the
+/// corresponding `hmask` bit is CLEAR. The test is `!= 0`, NOT "bit 0" — see the
+/// note below, which is a bug this got wrong first.
+///
+/// `m` is a RUNTIME mask: it advances one bit per plane across all 8 planes of the
+/// super-block (2 chunks x 4 planes), which is why it cannot be a comptime
+/// parameter here even though the shift can.
+inline fn q3_16(qp: *const u8, hp: *const u8, m: u8, comptime shift: u4) [2]Dq3Vec {
+    const qb: @Vector(16, u8) = @as(*align(1) const @Vector(16, u8), @ptrCast(qp)).*;
+    const hb: @Vector(16, u8) = @as(*align(1) const @Vector(16, u8), @ptrCast(hp)).*;
+    const qv: @Vector(16, i32) = @intCast((qb >> @as(@Vector(16, u4), @splat(shift))) & @as(@Vector(16, u8), @splat(3)));
+    // Sign bit set -> value is just q_val; clear -> subtract 4.
+    //
+    // The obvious `(hmask & m) & 1` is WRONG, and silently so: `m` is a single bit,
+    // so masking yields that bit's VALUE (2, 4, 8, ... 128), and `& 1` collapses
+    // every one of them except m==1 back to 0 — inverting the sign plane on 7 of
+    // the 8 planes. It presented as an exact negation (q_val - 4 vs q_val + 4)
+    // because that is precisely what a flipped hb4 does.
+    //
+    // So test the masked value against zero, which is what the scalar body does.
+    const hit: @Vector(16, bool) = (hb & @as(@Vector(16, u8), @splat(m))) != @as(@Vector(16, u8), @splat(0));
+    const hb4: @Vector(16, i32) = @select(i32, hit, @as(@Vector(16, i32), @splat(0)), @as(@Vector(16, i32), @splat(4)));
+    const f: @Vector(16, f32) = @floatFromInt(qv - hb4);
+    // Stage through an array: `f[0..8]` on a @Vector is not addressable.
+    const fa: [16]f32 = f;
+    return .{ fa[0..8].*, fa[8..16].* };
+}
+
+/// AVX2 Q3_K dequantize-to-F32. Bit-exact with `dequantizeRowQ3_K`.
+///
+/// Unit is 16 weights: one 3-bit value + one sign-plane bit + ONE scale per
+/// sub-block (Q3_K has no separate min, unlike Q2_K). Per 128-weight chunk that is
+/// 4 shift planes x 2 halves = 8 units.
+///
+/// Two counters are re-derived rather than carried, because `plane` and `half` are
+/// comptime and incrementing a runtime counter inside a comptime-unrolled loop is
+/// where the ordering gets lost:
+///   - `scales` index: `is + plane * 2 + half`, matching the scalar body's
+///     plane-A-then-plane-B walk, 8 per chunk;
+///   - the sign mask: `m = 1 << (chunk * 4 + plane)`, because the scalar body
+///     shifts it once per plane and never resets it across the super-block, so
+///     chunk 1 starts at bit 4, not bit 0.
+pub fn dequantizeRowQ3_KVec(src: [*]const BlockQ3_K, dst: []f32, k: usize) void {
+    std.debug.assert(k % QK_K == 0);
+    const nb = k / QK_K;
+    var out: usize = 0;
+    for (0..nb) |i| {
+        const blk = &src[i];
+        const d_all = f16_to_f32(blk.d);
+        var sc: [N_SUB]i8 = undefined;
+        unpackScales(&blk.scales, &sc);
+
+        var is: usize = 0;
+        var q_off: usize = 0;
+        var n: usize = 0;
+        while (n < QK_K) : (n += 128) {
+            const chunk = n / 128;
+            inline for (0..4) |plane| {
+                const m: u8 = @truncate(@as(u16, 1) << @intCast(chunk * 4 + plane));
+                inline for (0..2) |half| {
+                    const dl: Dq3Vec = @splat(d_all * @as(f32, @floatFromInt(sc[is + plane * 2 + half] - 32)));
+                    const pair = q3_16(&blk.qs[q_off + half * 16], &blk.hmask[half * 16], m, plane * 2);
+                    dst[out + plane * 32 + half * 16 + 0 ..][0..8].* = dl * pair[0];
+                    dst[out + plane * 32 + half * 16 + 8 ..][0..8].* = dl * pair[1];
+                }
+            }
+            out += 128;
+            q_off += 32;
+            is += 8;
+        }
+    }
+}
+
 pub fn dequantizeRowQ3_K(src: [*]const BlockQ3_K, dst: []f32, k: usize) void {
     std.debug.assert(k % QK_K == 0);
     const nb = k / QK_K;
@@ -314,13 +391,23 @@ pub fn dequantizeRowQ3_K(src: [*]const BlockQ3_K, dst: []f32, k: usize) void {
 }
 
 /// Dequantize Q3_K to BF16.
-pub fn dequantizeRowQ3_KToBF16(src: [*]const BlockQ3_K, dst: [*]amx.bf16, k: usize) void {
+pub fn dequantizeRowQ3_KToBF16Scalar(src: [*]const BlockQ3_K, dst: [*]amx.bf16, k: usize) void {
     std.debug.assert(k % QK_K == 0);
     const nb = k / QK_K;
     var f: [QK_K]f32 = undefined;
     for (0..nb) |i| {
         dequantizeRowQ3_K(src + i, f[0..], QK_K);
         for (0..QK_K) |j| dst[i * QK_K + j] = amx.f32_to_bf16(f[j]);
+    }
+}
+
+pub fn dequantizeRowQ3_KToBF16(src: [*]const BlockQ3_K, dst: [*]amx.bf16, k: usize) void {
+    std.debug.assert(k % QK_K == 0);
+    const nb = k / QK_K;
+    var f: [QK_K]f32 = undefined;
+    for (0..nb) |i| {
+        dequantizeRowQ3_KVec(src + i, f[0..], QK_K);
+        amx.f32_to_bf16_store(f[0..].ptr, dst + i * QK_K, QK_K);
     }
 }
 

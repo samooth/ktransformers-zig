@@ -234,6 +234,62 @@ pub fn quantizeRowQ2_K(src: []const f32, dst: [*]BlockQ2_K, k: usize) void {
 }
 
 /// ggml-quants.c:961 dequantize_row_q2_K. k must be a multiple of 256.
+const Dq2Vec: type = @Vector(8, f32);
+
+/// 16 weights' worth of 2-bit Q2_K values -> two `Dq2Vec`.
+///
+/// Q2_K packs four 2-bit values per byte in four shift planes (0, 2, 4, 6); a
+/// sub-block reads ONE plane across all 16 of its bytes, so the whole plane is
+/// `shift` + mask + widen. No table and no cross-lane work.
+inline fn q2_16(p: *const u8, comptime shift: u4) [2]Dq2Vec {
+    const b: @Vector(16, u8) = @as(*align(1) const @Vector(16, u8), @ptrCast(p)).*;
+    const v: @Vector(16, u8) = (b >> @as(@Vector(16, u4), @splat(shift))) & @as(@Vector(16, u8), @splat(3));
+    const f: @Vector(16, f32) = @floatFromInt(@as(@Vector(16, i32), @intCast(v)));
+    // Stage through an array: `f[0..8]` on a @Vector is not addressable.
+    const fa: [16]f32 = f;
+    return .{ fa[0..8].*, fa[8..16].* };
+}
+
+/// AVX2 Q2_K dequantize-to-F32. Bit-exact with `dequantizeRowQ2_K`.
+///
+/// The natural unit is 16 weights: each sub-block is 16 bytes sharing ONE
+/// (scale, min) pair, so the unit is `dl * v - ml` with two broadcasts. Per
+/// 128-weight chunk that is 4 shift planes x 2 halves = 8 units.
+///
+/// The `scales` index is derived as `is + plane * 2 + half` rather than
+/// incremented inside the loops, because `plane` and `half` are comptime and an
+/// increment inside a comptime-unrolled loop is where the ordering gets lost.
+/// The order is preserved exactly: plane 0 half A, plane 0 half B, plane 1
+/// half A, ... which is what the scalar body does with its running `is`.
+pub fn dequantizeRowQ2_KVec(src: [*]const BlockQ2_K, dst: []f32, k: usize) void {
+    std.debug.assert(k % QK_K == 0);
+    const nb = k / QK_K;
+    var out: usize = 0;
+    for (0..nb) |i| {
+        const blk = &src[i];
+        const d = f16_to_f32(blk.d);
+        const min = f16_to_f32(blk.dmin);
+        var is: usize = 0;
+        var q_off: usize = 0;
+        var n: usize = 0;
+        while (n < QK_K) : (n += 128) {
+            inline for (0..4) |plane| {
+                inline for (0..2) |half| {
+                    const sc = blk.scales[is + plane * 2 + half];
+                    const dl: Dq2Vec = @splat(d * @as(f32, @floatFromInt(sc & 0xF)));
+                    const ml: Dq2Vec = @splat(min * @as(f32, @floatFromInt(sc >> 4)));
+                    const pair = q2_16(&blk.qs[q_off + half * 16], plane * 2);
+                    dst[out + plane * 32 + half * 16 + 0 ..][0..8].* = dl * pair[0] - ml;
+                    dst[out + plane * 32 + half * 16 + 8 ..][0..8].* = dl * pair[1] - ml;
+                }
+            }
+            out += 128;
+            q_off += 32;
+            is += 8;
+        }
+    }
+}
+
 pub fn dequantizeRowQ2_K(src: [*]const BlockQ2_K, dst: []f32, k: usize) void {
     std.debug.assert(k % QK_K == 0);
     const nb = k / QK_K;
@@ -278,13 +334,23 @@ pub fn dequantizeRowQ2_K(src: [*]const BlockQ2_K, dst: []f32, k: usize) void {
 }
 
 /// Dequantize Q2_K to BF16 (for BF16 GEMM tile paths).
-pub fn dequantizeRowQ2_KToBF16(src: [*]const BlockQ2_K, dst: [*]amx.bf16, k: usize) void {
+pub fn dequantizeRowQ2_KToBF16Scalar(src: [*]const BlockQ2_K, dst: [*]amx.bf16, k: usize) void {
     std.debug.assert(k % QK_K == 0);
     const nb = k / QK_K;
     var f: [QK_K]f32 = undefined;
     for (0..nb) |i| {
         dequantizeRowQ2_K(src + i, f[0..], QK_K);
         for (0..QK_K) |j| dst[i * QK_K + j] = amx.f32_to_bf16(f[j]);
+    }
+}
+
+pub fn dequantizeRowQ2_KToBF16(src: [*]const BlockQ2_K, dst: [*]amx.bf16, k: usize) void {
+    std.debug.assert(k % QK_K == 0);
+    const nb = k / QK_K;
+    var f: [QK_K]f32 = undefined;
+    for (0..nb) |i| {
+        dequantizeRowQ2_KVec(src + i, f[0..], QK_K);
+        amx.f32_to_bf16_store(f[0..].ptr, dst + i * QK_K, QK_K);
     }
 }
 

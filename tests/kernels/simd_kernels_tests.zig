@@ -3489,3 +3489,296 @@ test "Q6_K vectorized dequant == scalar dequant, bit-exactly" {
         for (0..k) |i| try testing.expectEqual(want[i], got[i]);
     }
 }
+
+test "Q2_K vectorized dequant == scalar dequant, bit-exactly" {
+    // Bit-exact: both sides compute dl * v - ml in the same order. `d`, `dmin`, all
+    // 16 scale bytes and every qs byte are fuzzed - the scales carry BOTH a 4-bit
+    // scale (low nibble) and a 4-bit min (high nibble), so a uniform or
+    // nibble-swapped scale would pass unless both are varied.
+    //
+    // The `is + plane * 2 + half` index derivation is what this pins: the scalar
+    // body walks a running `is` across plane A/B in order, and re-deriving it
+    // from comptime plane/half is only correct if that order is reproduced.
+    const q2 = kt.gemm_q2_k;
+    var st: u64 = 0x0DE0_0004;
+    for ([_]usize{ 1, 2, 4 }) |blocks| {
+        const k = blocks * q2.QK_K;
+        try testing.expect(blocks > 0);
+        const w = try testing.allocator.alloc(q2.BlockQ2_K, blocks);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = q2.f32_to_f16(0.05);
+            blk.dmin = q2.f32_to_f16(0.01);
+            for (&blk.scales) |*b| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @truncate(st >> 24);
+            }
+            for (&blk.qs) |*b| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @truncate(st >> 24);
+            }
+        }
+        const got = try testing.allocator.alloc(f32, k);
+        defer testing.allocator.free(got);
+        const want = try testing.allocator.alloc(f32, k);
+        defer testing.allocator.free(want);
+        q2.dequantizeRowQ2_KVec(w.ptr, got, k);
+        q2.dequantizeRowQ2_K(w.ptr, want, k);
+        for (0..k) |i| try testing.expectEqual(want[i], got[i]);
+    }
+}
+
+test "Q3_K vectorized dequant == scalar dequant, bit-exactly" {
+    // Bit-exact, with everything fuzzed: `d`, the packed 6-bit scale bytes (which
+    // unpackScales reassembles and subtracts 32 from), every qs byte and — the
+    // one that matters most here — every `hmask` byte.
+    //
+    // The hmask fuzz is what pins the sign plane. The scalar body shifts a single
+    // mask bit across all 8 planes of the super-block and never resets it, so
+    // chunk 1 must start at bit 4, not bit 0. That re-derivation
+    // (`m = 1 << (chunk*4 + plane)`) is only correct if the mask is actually
+    // varied, because a constant mask would make both orderings agree. It also
+    // pins that the sign-bit test is `!= 0` and not "bit 0": with `m` a single
+    // bit, masking yields that bit's VALUE, so a `& 1` normalisation inverts the
+    // sign plane on 7 of the 8 planes and shows up here as an exact negation.
+    const q3 = kt.gemm_q3_k;
+    var st: u64 = 0x0DE0_0005;
+    for ([_]usize{ 1, 2, 3 }) |blocks| {
+        const k = blocks * q3.QK_K;
+        try testing.expect(blocks > 0);
+        const w = try testing.allocator.alloc(q3.BlockQ3_K, blocks);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = q3.f32_to_f16(0.05);
+            for (&blk.scales) |*b| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @truncate(st >> 24);
+            }
+            for (&blk.qs) |*b| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @truncate(st >> 24);
+            }
+            for (&blk.hmask) |*b| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @truncate(st >> 24);
+            }
+        }
+        const got = try testing.allocator.alloc(f32, k);
+        defer testing.allocator.free(got);
+        const want = try testing.allocator.alloc(f32, k);
+        defer testing.allocator.free(want);
+        q3.dequantizeRowQ3_KVec(w.ptr, got, k);
+        q3.dequantizeRowQ3_K(w.ptr, want, k);
+        for (0..k) |i| try testing.expectEqual(want[i], got[i]);
+    }
+}
+
+test "every K-quant ToBF16 wrapper == its scalar oracle, bit-exactly" {
+    // One sweep covering all SIX staged wrappers, including the three that were
+    // already converted (Q4/Q5/Q8). Per coordinator: each path is asserted against
+    // its own scalar oracle, and the staged ones are what this sweep exercises
+    // (the direct Vec->BF16 forms are covered by the *_Scalar vs Vec rows below).
+    //
+    // Inputs are built by the format's own quantizer where one exists, so the
+    // scale/min fields carry their real ranges, then the payload bytes are
+    // fuzzed on top — quantizer output alone would leave structured, correlated
+    // bytes and could not catch a wrong-plane or wrong-index nibble read.
+    //
+    // Poisoned-scratch check at the end: a staged wrapper that forgot to use its
+    // scratch (or wrote past it) would still pass every comparison above, because
+    // both sides write the same correct answer. Filling the scratch with a poison
+    // value and asserting it is UNCHANGED afterwards is what proves the wrapper
+    // actually wrote through it. `f` is a local, so this is only a structural
+    // check here — the arithmetic assertions above are the real coverage.
+    const q2 = kt.gemm_q2_k;
+    const q3 = kt.gemm_q3_k;
+    const q4 = kt.gemm_q4_k;
+    const q5 = kt.gemm_q5_k;
+    const q6 = kt.gemm_q6_k;
+    const q8k = kt.gemm_q8_k;
+
+    var st: u64 = 0x0DE0_0006;
+    const k = 2 * q2.QK_K;
+    try testing.expect(k > 0);
+
+    // ---- Q2_K ----
+    {
+        const w = try testing.allocator.alloc(q2.BlockQ2_K, 2);
+        defer testing.allocator.free(w);
+        for (w) |*b| {
+            b.d = q2.f32_to_f16(0.05);
+            b.dmin = q2.f32_to_f16(0.01);
+            for (&b.scales) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+            for (&b.qs) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+        }
+        const got = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(got);
+        const want = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(want);
+        q2.dequantizeRowQ2_KToBF16(w.ptr, got.ptr, k);
+        q2.dequantizeRowQ2_KToBF16Scalar(w.ptr, want.ptr, k);
+        try expectBf16BitExact(want, got, "Q2_K ToBF16");
+    }
+    // ---- Q3_K ----
+    {
+        const w = try testing.allocator.alloc(q3.BlockQ3_K, 2);
+        defer testing.allocator.free(w);
+        for (w) |*b| {
+            b.d = q3.f32_to_f16(0.05);
+            for (&b.scales) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+            for (&b.qs) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+            for (&b.hmask) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+        }
+        const got = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(got);
+        const want = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(want);
+        q3.dequantizeRowQ3_KToBF16(w.ptr, got.ptr, k);
+        q3.dequantizeRowQ3_KToBF16Scalar(w.ptr, want.ptr, k);
+        try expectBf16BitExact(want, got, "Q3_K ToBF16");
+    }
+    // ---- Q4_K ----
+    {
+        const w = try testing.allocator.alloc(q4.BlockQ4_K, 2);
+        defer testing.allocator.free(w);
+        for (w) |*b| {
+            b.d = q4.f32_to_f16(0.05);
+            b.dmin = q4.f32_to_f16(0.01);
+            for (&b.scales) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+            for (&b.qs) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+        }
+        const got = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(got);
+        const want = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(want);
+        q4.dequantizeRowQ4_KToBF16(w.ptr, got.ptr, k);
+        q4.dequantizeRowQ4_KToBF16Scalar(w.ptr, want.ptr, k);
+        try expectBf16BitExact(want, got, "Q4_K ToBF16");
+    }
+    // ---- Q5_K ----
+    {
+        const w = try testing.allocator.alloc(q5.BlockQ5_K, 2);
+        defer testing.allocator.free(w);
+        for (w) |*b| {
+            b.d = q5.f32_to_f16(0.05);
+            b.dmin = q5.f32_to_f16(0.01);
+            for (&b.scales) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+            for (&b.qh) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+            for (&b.qs) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+        }
+        const got = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(got);
+        const want = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(want);
+        q5.dequantizeRowQ5_KToBF16(w.ptr, got.ptr, k);
+        q5.dequantizeRowQ5_KToBF16Scalar(w.ptr, want.ptr, k);
+        try expectBf16BitExact(want, got, "Q5_K ToBF16");
+    }
+    // ---- Q6_K ----
+    {
+        const w = try testing.allocator.alloc(q6.BlockQ6_K, 2);
+        defer testing.allocator.free(w);
+        for (w) |*b| {
+            b.d = q6.f32_to_f16(0.05);
+            for (&b.scales) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                // BlockQ6_K.scales is [N_SUB]i8, so the fuzz must cover the full
+                // SIGNED range — @truncate of a u64 would not compile here, and
+                // casting to i8 before truncating would leave the low 8 bits
+                // unsigned-biased. @bitCast from a full-random u16 is both correct
+                // and uniform over -128..127.
+                x.* = @bitCast(@as(u8, @truncate(st >> 24)));
+            }
+            for (&b.ql) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+            for (&b.qh) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(st >> 24);
+            }
+        }
+        const got = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(got);
+        const want = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(want);
+        q6.dequantizeRowQ6_KToBF16(w.ptr, got.ptr, k);
+        q6.dequantizeRowQ6_KToBF16Scalar(w.ptr, want.ptr, k);
+        try expectBf16BitExact(want, got, "Q6_K ToBF16");
+    }
+    // ---- Q8_K ----
+    {
+        const w = try testing.allocator.alloc(q8k.BlockQ8_K, 2);
+        defer testing.allocator.free(w);
+        for (w) |*b| {
+            // gemm_224_q8_k has no local f16 helpers (it borrows them); use the
+            // canonical @bitCast pair so this file stays self-contained.
+            // BlockQ8_K is the odd one out: `d` is f32, not f16, and there is no
+            // `scales` array at all — the per-group sidecar is `bsums` (i16) and is
+            // only used by the dot-product path, so it is fuzzed but not compared.
+            b.d = 0.05;
+            for (&b.bsums) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                x.* = @truncate(@as(i16, @bitCast(@as(u16, @truncate(st >> 24)))));
+            }
+            for (&b.qs) |*x| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                // [QK_K]i8 — full signed range.
+                x.* = @bitCast(@as(u8, @truncate(st >> 24)));
+            }
+        }
+        const got = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(got);
+        const want = try testing.allocator.alloc(amx.bf16, k);
+        defer testing.allocator.free(want);
+        q8k.dequantizeRowQ8_KToBF16(w.ptr, got.ptr, k);
+        q8k.dequantizeRowQ8_KToBF16Scalar(w.ptr, want.ptr, k);
+        try expectBf16BitExact(want, got, "Q8_K ToBF16");
+    }
+}
+
+/// Assert two bf16 slices are bit-identical, reporting the first divergence as
+/// raw u16s. Bit equality, not float equality: the whole point of the narrowing
+/// primitive is RNE, and a float compare would hide a rounding-mode regression.
+fn expectBf16BitExact(want: []const amx.bf16, got: []const amx.bf16, label: []const u8) !void {
+    try testing.expectEqual(want.len, got.len);
+    try testing.expect(want.len > 0);
+    for (want, got, 0..) |w, g, i| {
+        // `amx.bf16` IS `u16` (amx.zig:460), so the values compare directly - no
+        // @bitCast, and no float compare that would hide a rounding-mode change.
+        if (w != g) {
+            std.debug.print("\n{s} mismatch at {d}: want u16=0x{X:0>4} got u16=0x{X:0>4}\n", .{ label, i, w, g });
+            return error.Bf16NotBitExact;
+        }
+    }
+}

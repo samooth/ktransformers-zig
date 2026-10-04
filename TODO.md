@@ -1602,9 +1602,42 @@ additive, quantizer untouched. Worth the habit: after editing inside a file that
 has several similar-looking loops, check the deletion count, not just that it
 compiles.
 
-**Still scalar in this path: Q2_K, Q3_K** (2-bit and 3-bit payloads, and their
-shift-plane / k-map machinery). Then the 13 `*ToBF16` wrappers that stage, all of
-which need only `f32_to_bf16_store` swapped in.
+**P1.2 COMPLETE: all six K-quants vectorized, all 18 wrappers asserted.**
+Q2_K and Q3_K both landed first-attempt bit-exact; Q2_K is Q4_K's shape (unit = 16
+weights, one scale AND one min per sub-block, `dl * v - ml`), and Q3_K is Q2_K plus
+a sign plane from `hmask` with a RUNTIME bit mask that advances across all 8 planes
+of the super-block.
+
+**The Q3_K bug, which is the one worth remembering.** The obvious way to test the
+sign bit is `(hmask & m) & 1`. That is **wrong, and silently so**: `m` is a single
+bit, so masking yields that bit's VALUE (2, 4, ... 128), and `& 1` collapses every
+one of them except `m == 1` back to 0 — inverting the sign plane on **7 of the 8
+planes**. It presented as an exact negation (`q_val - 4` vs `q_val + 4`) because
+that is exactly what a flipped `hb4` does, so it looked like a sign bug rather than
+a mask-normalization bug. The fix is to test the masked value against zero, which is
+what the scalar body actually does. The test comment records this because the
+fuzzed `hmask` is what catches it: a constant mask would make both orderings agree.
+
+Re-deriving runtime counters from comptime loop indices also needed care. In both
+Q2_K and Q3_K the `scales` index is computed as `is + plane * 2 + half` rather than
+incremented inside a comptime-unrolled loop, and Q3_K additionally re-derives the
+mask as `m = 1 << (chunk * 4 + plane)` because the scalar body never resets it
+across the super-block, so chunk 1 must start at bit 4.
+
+**All 18 `*ToBF16` wrappers are now asserted against their scalar oracles** in one
+sweep (`every K-quant ToBF16 wrapper == its scalar oracle, bit-exactly`), covering
+Q2/Q3/Q4/Q5/Q6/Q8_K. Bit equality on raw `u16`, not float equality — `amx.bf16` IS
+`u16` (amx.zig:460), so the values compare directly with no `@bitCast`, and a float
+compare would have hidden a rounding-mode regression. Block-field oddities the sweep
+had to accommodate, all of which are format facts rather than test scaffolding:
+Q8_K's `d` is **f32** not f16 and it has no `scales` array at all (its `bsums` i16
+sidecar is for the dot-product path only); Q6_K's `scales` is `[N_SUB]i8` and must
+be fuzzed over the full **signed** range or the sign is never exercised.
+
+Both new formats pass mutation checks (inverting Q3_K's sign plane, swapping Q2_K's
+scale/min nibbles) — so the tests are genuinely load-bearing rather than
+vacuously equal. Remaining scalar work in this path: none.
+
 
 
 **Stream K complete.** Next unclaimed work: roadmap P0.4's remaining INT4 families

@@ -77,6 +77,7 @@ comptime {
     _ = &gemm_q6_k.dequantizeRowQ6_K;
     _ = &gemm_q6_k.dequantizeRowQ6_KVec;
     _ = &gemm_q6_k.dequantizeRowQ6_KToBF16;
+    _ = &gemm_q6_k.dequantizeRowQ6_KToBF16Scalar;
     _ = &gemm_q6_k.gemmQ6_KScalar;
     _ = &gemm_q5_k.BlockQ5_K;
     _ = &gemm_q5_k.f32_to_f16;
@@ -87,6 +88,7 @@ comptime {
     _ = &gemm_q5_k.dequantizeRowQ5_K;
     _ = &gemm_q5_k.dequantizeRowQ5_KVec;
     _ = &gemm_q5_k.dequantizeRowQ5_KToBF16;
+    _ = &gemm_q5_k.dequantizeRowQ5_KToBF16Scalar;
     _ = &gemm_q5_k.gemmQ5_KScalar;
     _ = &gemm_q8_k.BlockQ8_K;
     _ = &gemm_q8_k.nearestInt;
@@ -94,6 +96,7 @@ comptime {
     _ = &gemm_q8_k.dequantizeRowQ8_K;
     _ = &gemm_q8_k.dequantizeRowQ8_KVec;
     _ = &gemm_q8_k.dequantizeRowQ8_KToBF16;
+    _ = &gemm_q8_k.dequantizeRowQ8_KToBF16Scalar;
     _ = &gemm_q8_k.gemmQ8_KScalar;
     _ = &gemm_q2_k.BlockQ2_K;
     _ = &gemm_q2_k.f32_to_f16;
@@ -102,6 +105,7 @@ comptime {
     _ = &gemm_q2_k.quantizeRowQ2_K;
     _ = &gemm_q2_k.dequantizeRowQ2_K;
     _ = &gemm_q2_k.dequantizeRowQ2_KToBF16;
+    _ = &gemm_q2_k.dequantizeRowQ2_KToBF16Scalar;
     _ = &gemm_q2_k.gemmQ2_KScalar;
     _ = &gemm_q3_k.BlockQ3_K;
     _ = &gemm_q3_k.f32_to_f16;
@@ -110,6 +114,7 @@ comptime {
     _ = &gemm_q3_k.quantizeRowQ3_K;
     _ = &gemm_q3_k.dequantizeRowQ3_K;
     _ = &gemm_q3_k.dequantizeRowQ3_KToBF16;
+    _ = &gemm_q3_k.dequantizeRowQ3_KToBF16Scalar;
     _ = &gemm_q3_k.gemmQ3_KScalar;
     _ = &gemm_iq4_xs.BlockIQ4_XS;
     _ = &gemm_iq4_xs.KVALUES_IQ4NL;

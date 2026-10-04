@@ -308,13 +308,23 @@ pub fn dequantizeRowQ6_K(src: [*]const BlockQ6_K, dst: []f32, k: usize) void {
 }
 
 /// Dequantize Q6_K to BF16 (for BF16 GEMM tile paths).
-pub fn dequantizeRowQ6_KToBF16(src: [*]const BlockQ6_K, dst: [*]amx.bf16, k: usize) void {
+pub fn dequantizeRowQ6_KToBF16Scalar(src: [*]const BlockQ6_K, dst: [*]amx.bf16, k: usize) void {
     std.debug.assert(k % QK_K == 0);
     const nb = k / QK_K;
     var f: [QK_K]f32 = undefined;
     for (0..nb) |i| {
         dequantizeRowQ6_K(src + i, f[0..], QK_K);
         for (0..QK_K) |j| dst[i * QK_K + j] = amx.f32_to_bf16(f[j]);
+    }
+}
+
+pub fn dequantizeRowQ6_KToBF16(src: [*]const BlockQ6_K, dst: [*]amx.bf16, k: usize) void {
+    std.debug.assert(k % QK_K == 0);
+    const nb = k / QK_K;
+    var f: [QK_K]f32 = undefined;
+    for (0..nb) |i| {
+        dequantizeRowQ6_KVec(src + i, f[0..], QK_K);
+        amx.f32_to_bf16_store(f[0..].ptr, dst + i * QK_K, QK_K);
     }
 }
 
