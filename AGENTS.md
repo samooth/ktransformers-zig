@@ -30,6 +30,8 @@ zig build                 # default AVX2 -> zig-out/lib/libkt_kernel_ext.so
 zig build -Dvariant=amx   # avx2|avx512_base|avx512_vnni|avx512_vbmi|avx512_bf16|amx|neon
 zig build all-variants    # all 6 x86 variants as libkt_kernel_ext_{variant}.so
 zig build test            # runs ALL suites — tests EXECUTE via addRunArtifact
+zig build test-aarch64    # cross-builds the ARM suites and RUNS them under
+                          # qemu-aarch64-static (needs qemu-user-static)
 zig test src/mla/mla_tests.zig             # standalone MLA suite
 zig build -Doptimize=ReleaseFast bench     # GEMM micro-benchmark (B2)
 python3 tools/verify_abi.py                 # ABI double gate: exports + arity

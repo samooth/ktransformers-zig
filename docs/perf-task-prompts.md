@@ -1,430 +1,396 @@
-# Performance task prompts
+# AGENTS.md - ktransformers-zig
 
-Copy-paste one of these into a fresh agent session. Each is self-contained: an
-agent with no prior context on this repo should be able to execute it.
+Guidance for AI agents working on this repo. **Read `LESSONS_ZIG.md` before
+writing any Zig code** — this toolchain (0.16.0-dev) differs significantly
+from what you likely remember, and the lessons file contains dozens of
+verified gotchas.
 
-Background, measurements, per-item technique and acceptance rationale:
-`docs/perf-roadmap.md`. These are the same items, pre-packaged for handoff.
+## Project Context
 
-**Status: all UNCLAIMED.** Each dev must CLAIM in `TODO.md` before editing
-(protocol at the top of that file).
+Port of ktransformers CPU kernels (C++/AMX/AVX2/AVX512) to Zig, as a drop-in
+replacement for `kt_kernel_ext.so` (C API in `include/kt_kernel.h`, loaded
+from Python via pybind11).
 
----
+- **Zig version**: 0.16.0-dev.2535+ (APIs verified against this build; see LESSONS_ZIG.md)
+- **C++ reference**: `/ai/repos/2026/ktransformers/ktransformers/kt-kernel/`
+  - `operators/amx/la/amx_kernels.hpp` — GemmKernel224 BF16/INT8/INT4
+  - `operators/amx/moe_base.hpp`, `operators/amx/moe.hpp` — AMX MoE
+  - `operators/moe-tp.hpp` — TP_MOE_Common (monolithic forward)
+  - `operators/llamafile/mla.hpp`, `operators/mla-tp.hpp` — MLA attention
+  - `operators/rope.hpp` — RoPE/YaRN reference
+  - `cpu_backend/worker_pool.h`, `ext_bindings.cpp`
+- **External kernels** (optional, from `/home/t0m4s/repos/2026/zig-ai`):
+  `src/moe/cpu_gemv.zig` (quantized GEMV), `src/moe/cpu_executor.zig` — add to
+  `build.zig.zon` when needed.
 
-## P0.1 — Vectorize the K-quant GEMMs (start with Q8_K)
+## Build & Test
 
-> You are working in `/ai/repos/2026/ktransformers-zig`, a Zig 0.16 port of the
-> ktransformers CPU inference kernels. A C++ reference implementation lives at
-> `/ai/repos/2026/ktransformers` (kernels under
-> `ktransformers/kt-kernel/operators/`).
->
-> **BEFORE YOU EDIT ANYTHING**
-> - Read `AGENTS.md`, `docs/perf-roadmap.md` and `LESSONS_ZIG.md`.
->   `LESSONS_ZIG.md` has the Zig 0.16 API gotchas that will otherwise cost you
->   an hour.
-> - CLAIM this task in `TODO.md`.
-> - Do **NOT** edit `build.zig`, `tests/kernels/test_kernels.zig`,
->   `src/root.zig`, or `src/kernels/arch/amx.zig`. Those four files are shared
->   across parallel work streams. Everything else you need is yours alone.
->
-> **TASK**
-> Give the K-quant GEMMs an AVX2 path. Right now `gemmQ8_KScalar`,
-> `gemmQ6_KScalar`, `gemmQ5_KScalar`, `gemmQ3_KScalar` and `gemmQ2_KScalar` in
-> `src/kernels/amx/gemm_224_*.zig` are pure scalar, and on a non-AMX host they
-> are the only code that runs (the AMX tile path is gated on
-> `AmxFeatures.available`, which is false here).
->
-> Measured at m=1, n=2048, k=7168 — one LlamaMoe-shaped expert projection:
->
-> | path | time | bandwidth | % of ceiling |
-> |---|---|---|---|
-> | Q8_K scalar | 22.24 ms | 0.75 GB/s | 10% |
-> | Q6_K scalar | 38.69 ms | 0.31 GB/s | 4% |
-> | ceiling (vectorized BF16, same host + shape) | 3.70 ms | 7.9 GB/s | 100% |
->
-> These paths are dequant/arithmetic-bound, not bandwidth-bound, so block sizes
-> and prefetching will not help you. Only SIMD will.
->
-> **START WITH `gemm_224_q8_k.zig` ONLY.** `BlockQ8_K` is the easiest of the
-> five: `d` is f32 and `qs` is 256 signed bytes, so the dot product is a
-> sign-extend plus an integer dot (`vpmovsxbd` + `vpmaddwd`-style, or widen to
-> f32 and use `vfmadd`). Get that landed, then pick up Q6_K in the same session
-> if there is time. The other three share the pattern once you have one.
->
-> **MODEL YOUR IMPLEMENTATION ON `gemmQ4KxQ8_0` in
-> `src/kernels/amx/gemm_224_q4_k.zig`** — it is the finished AVX2 version of
-> exactly this shape and it already documents the two things that will bite you:
->
-> - **The unaligned-load idiom.** These blocks are 2-aligned `extern struct`s
->   packed at non-multiple-of-16 strides, so `BlockQ8_K.qs` is 16-aligned on
->   even blocks and 2-aligned on odd ones. A plain vector load is a segfault
->   waiting to happen. Use:
->   `@as(*align(1) const @Vector(16, i8), @ptrCast(ptr)).*`
-> - **n-outer / m-inner loop order.**
->
-> **RULES THAT ACTUALLY MATTER (each measured, not folklore)**
-> - n-outer / m-inner so the weight matrix streams from DRAM once, not once per
->   token row. Worth 3.4-4.0x — more than everything else combined.
-> - Register-tile M (MR=4) so each converted chunk feeds several accumulators.
->   This is why we currently beat the C++ reference on BF16.
-> - Explicit `@mulAdd`. Zig defaults `fp-contract` to off, so plain `a*b+c` emits
->   `vmulps` + `vaddps` instead of one `vfmadd`.
-> - Never `@exp` in a vector loop. There is no vector lowering; you get one libm
->   call per lane. Use `amx.expScalar` / `amx.expVec`.
-> - Build with `-Doptimize=ReleaseFast` for anything you measure. Plain
->   `zig build` defaults to Debug and all your numbers will be meaningless.
->
-> **ACCEPTANCE — this is the part people get wrong, so read it twice**
-> Add a test asserting `vectorizedGEMM == dequantizeRowQ8_K + F32 dot` at 2e-5
-> relative tolerance, over several blocks with deliberately varied scale
-> structure — **and** make the fixture such that a swapped nibble interleave or
-> a wrong scale index **cannot** pass. Two Q4_K tests passed for a week while the
-> kernel had a 128-byte out-of-bounds read, because the fixture filled `qs` with
-> `0x11`: equal nibbles hide the bug. Also assert the vectorized path agrees
-> with the existing scalar path.
->
-> The existing per-format tests (`block layout byte-exact`,
-> `quantize/dequant round trip`, `all-zero`, `scalar GEMM`) must keep passing
-> unmodified.
->
-> **GATES**
-> - `zig build -Doptimize=ReleaseFast` — must build clean
-> - `zig build test` — must stay green
-> - `python3 tools/verify_abi.py` — 112 symbols + arity
->
-> **REPORT BACK**
-> - before/after time and bandwidth for the same shape
-> - the new test names
-> - confirmation the gates are green
-> - if you cannot beat the scalar path, say so and stop. Do not land a neutral
->   change; "it was 1.02x" is a useful result and the repo has a precedent of
->   recording one.
+```bash
+zig build                 # default AVX2 -> zig-out/lib/libkt_kernel_ext.so
+zig build -Dvariant=amx   # avx2|avx512_base|avx512_vnni|avx512_vbmi|avx512_bf16|amx|neon
+zig build all-variants    # all 6 x86 variants as libkt_kernel_ext_{variant}.so
+zig build test            # runs ALL suites — tests EXECUTE via addRunArtifact
+zig build test-aarch64    # cross-builds the ARM suites and RUNS them under
+                          # qemu-aarch64-static (needs qemu-user-static)
+zig test src/mla/mla_tests.zig             # standalone MLA suite
+zig build -Doptimize=ReleaseFast bench     # GEMM micro-benchmark (B2)
+python3 tools/verify_abi.py                 # ABI double gate: exports + arity
+python3 tools/audit_layout.py               # ABI layout gate (pybind11 shim)
+sentrux check .                            # architecture rules gate (see below)
+```
 
----
+Caveats (verified the hard way — see LESSONS_ZIG.md for details):
+- `zig build` installs the DEFAULT variant as `libkt_kernel_ext.so`; `all-variants` installs per-variant names.
+- Tests only run because build.zig uses `addRunArtifact`; `test_step.dependOn(&test_obj.step)` alone only compiles.
+- The test runner is `tools/test_runner.zig` in simple mode — the default `--listen=-` IPC handshake fails in this Zig 0.16.0-dev environment.
+- If a build error survives a no-op rebuild, suspect stale `.zig-cache`: `rm -rf .zig-cache zig-out`.
+- Benchmark timings in Debug are meaningless — always `-Doptimize=ReleaseFast`.
+- `verify_abi.py` is the ABI gate: it FAILs if any header prototype lacks a matching Zig export (or arity diverges). Run it after touching `include/kt_kernel.h` or any `export fn`.
 
-## P0.2 — Vectorize the FP8 GEMM (lowest risk)
+## Code Structure
 
-> **Status 2026-10-03 — read before starting.** Stream B is claimed and in
-> flight (`4f222ba`); the decoder half already landed in `1e8369a` (the 256-entry
-> LUT, which fixed subnormal decoding and the 0x7F NaN encoding). The prompt
-> below predates all of that and is kept for the GEMM half.
->
-> **The encoder is still wrong and has no test.** `f32_to_fp8e4m3` in
-> `gemm_224_fp8.zig` is reachable from three call sites in `main.zig` (2020,
-> 2058, 2540), so it is live in the C ABI. Measured by encoding and decoding
-> again:
->
-> | input | `gemm_224_fp8` | `gemm_224_mxfp8` (correct) |
-> |---|---|---|
-> | 500.0 | 0x7F → **0.0** | 0x7E → 448 |
-> | 3.875 | 0x40 → **2.0** | 0x48 → 4.0 |
-> | 0.0078125 | 0x00 → **0.0** | 0x04 → 0.0078125 |
->
-> Three defects: saturation emits 0x7F/0xFF, which is the **NaN** encoding rather
-> than ±448; subnormals are flushed to zero, destroying the whole 2^-9…2^-6 band;
-> and the mantissa carry is masked away (`m3 + 1` then `& 0x7` without
-> incrementing the exponent), which is the 2x error. **The correct
-> implementation is already in this tree**, in `gemm_224_mxfp8.zig`, with the
-> carry case commented — copy it rather than writing a fourth one. It survived
-> because the only codec round-trip test (`simd_kernels_tests.zig`) exercises the
-> MXFP8 copy, so `gemm_fp8.f32_to_fp8e4m3` has no coverage at all.
->
-> Two more corrections to the plan below: the reference's `fp8x8_to_fp32x8`
-> uses `_mm256_i32gather_ps` over a 256-entry table — a single `vpshufb` cannot
-> serve 256 entries, so do not wait for the arch-layer shuffle; and this port
-> keeps **one f32 scale per row of B**, not the reference's 128x128 block-wise
-> scales, so the scale folds in once per row rather than per block.
+Imported (reachable from `src/root.zig`, compiled into the .so):
+```
+src/
+├── root.zig                    # module re-exports + comptime fn-refs forcing analysis
+├── main.zig                    # C API exports (kt_*) — mirrors include/kt_kernel.h
+├── runtime/{memory,worker_pool,task_queue,cpu_detect}.zig
+│     # worker_pool: work-stealing + sched_setaffinity pinning (A3) + waitIdle (B3)
+│     # cpu_detect: L1/L2/L3 sysfs detection + selectTileParams (A4)
+│     # memory: NumaAllocator with real mbind (A3)
+├── numa/                       # NUMA syscalls; select helpers forced into the .so
+│                               # via root.zig comptime fn-refs (setThreadAffinity,
+│                               # bindMemory, NumaAllocator, ...). NOTE: some unused
+│                               # helpers still have Zig 0.16 API rot (std.fs.cwd,
+│                               # std.mem.page_size, alignedAlloc signature) — they
+│                               # only compile once referenced; fix on first use.
+├── kernels/
+│   ├── arch/amx.zig            # AMX inline asm + detectAmxSupport runtime guard (A2)
+│   │                           # + VecF32 helpers (swigluVec, reduceAddFp32)
+│   ├── arch/neon.zig           # ARM NEON comptime gate (aarch64 cross-build)
+│   ├── amx/{buffers,kquant_simd,gemm_224_{bf16,int8,int4,fp8,q8_0,q4_k,q5_k,q6_k,q8_k,
+│          mxfp4,mxfp8,q2_k,q3_k,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,iq4_xs,iq4_nl,
+│          iq1_s,iq1_m}}.zig
+│   │                          # + iq2xs_init/iq3xs_init (kmap/kneighbors, histogram+cached)
+│   └── moe/{moe,llamafile_moe}.zig
+│                               # TpMoe: routing (legacy + DeepSeek-V3 group-top2, D4),
+│                               # loadWeights (all 3 projections), vectorized gemmExpert (A1)
+│                               # LlamaMoe: GGML-quantized MoE for GGUF checkpoints —
+│                               # gemmQuant 16-format dispatch (comptime @sizeOf-audited;
+│                               # KT_TYPE values ABI-test-pinned vs main.zig's enum)
+└── mla/                        # MLA attention (DeepSeek-V2/V3): config/cache/core
 
-> You are working in `/ai/repos/2026/ktransformers-zig`, a Zig 0.16 port of the
-> ktransformers CPU inference kernels. A C++ reference implementation lives at
-> `/ai/repos/2026/ktransformers` (kernels under
-> `ktransformers/kt-kernel/operators/`).
->
-> **BEFORE YOU EDIT ANYTHING**
-> - Read `AGENTS.md`, `docs/perf-roadmap.md` and `LESSONS_ZIG.md`.
-> - CLAIM this task in `TODO.md`.
-> - Do **NOT** edit `build.zig`, `tests/kernels/test_kernels.zig`,
->   `src/root.zig`, or `src/kernels/arch/amx.zig`.
->
-> **TASK**
-> `gemmFullTileScalar` in `src/kernels/amx/gemm_224_fp8.zig` is scalar; give it an
-> AVX2 path. On a non-AMX host it is the only FP8 code that runs, and FP8 backs
-> `kt_dsv3_*` and the FP8 layerwise-transport path.
->
-> **This is a direct port — use the reference.**
-> `ktransformers/kt-kernel/operators/avx2/fp8-moe.hpp` (12 `_mm256` uses) and
-> `fp8_dequant.hpp` (4) implement exactly this for AVX2. Diff against them; you
-> have no design risk here, only translation.
->
-> E4M3 decode is shift + mask + exponent-bias fixup, 8 lanes at a time, with
-> the scale applied by one `vmulps`. E5M2 adds the sign bit. If the reference
-> applies scales per-16 or per-32 group, unroll to that group size and
-> accumulate per-group before scaling — that is what the group layout is for.
->
-> Model the loop structure on `gemmQ4KxQ8_0` in
-> `src/kernels/amx/gemm_224_q4_k.zig` for the `*align(1)` unaligned-load idiom
-> and the n-outer/m-inner ordering. Use explicit `@mulAdd` (Zig's `fp-contract`
-> is off).
->
-> **ACCEPTANCE**
-> - Existing FP8 tests keep passing.
-> - A new test pins the vectorized path against `gemmFullTileScalar` to f32
->   rounding on random blocks.
-> - The dequant round-trip stays byte-exact.
->
-> **GATES:** `zig build -Doptimize=ReleaseFast`, `zig build test`,
-> `python3 tools/verify_abi.py`.
->
-> **REPORT BACK:** before/after time and bandwidth against the vectorized BF16
-> kernel (the ceiling) at the same shape, new test names, gate status.
+bench/gemm_bench.zig            # B2: gemmExpert vs scalar ref at DeepSeek-V3 shapes
+bindings/kt_kernel_pybind.cpp   # Tier-1 pybind11 drop-in (module name kt_kernel_ext)
+tools/{verify_abi,audit_arity,audit_layout}.py  # ABI gates (export + arity + layout)
+```
 
----
+NOT imported (dead code — excluded by Zig's lazy analysis; don't assume they compile):
+`kernels/amx/gemm_224_{bf16,int8,int4,fp8}_avx512.zig` (also imports a
+nonexistent `arch/amx_intrinsics.zig`). Also: `main.zig.backup*` are
+stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
 
-## P0.3 — Vectorize MXFP4 / MXFP8
+## Status (see TODO.md for details)
 
-> You are working in `/ai/repos/2026/ktransformers-zig`, a Zig 0.16 port of the
-> ktransformers CPU inference kernels. A C++ reference implementation lives at
-> `/ai/repos/2026/ktransformers`.
->
-> **BEFORE YOU EDIT ANYTHING**
-> - Read `AGENTS.md`, `docs/perf-roadmap.md` and `LESSONS_ZIG.md`.
-> - CLAIM this task in `TODO.md`.
-> - Do **NOT** edit `build.zig`, `tests/kernels/test_kernels.zig`,
->   `src/root.zig`, or `src/kernels/arch/amx.zig`.
->
-> **TASK**
-> `src/kernels/amx/gemm_224_mxfp4.zig` and `gemm_224_mxfp8.zig` are scalar on
-> non-AMX hosts. The C++ reference vectorizes these more heavily than any other
-> family — `kt-kernel/operators/avx2/mxfp4-moe.hpp` has **42** `_mm256` intrinsic
-> uses (`mxfp8-moe.hpp` has 18). Start by reading them: whatever they are doing
-> to justify 42 intrinsics is the win.
->
-> MXFP4 is 4-bit weights with a **shared exponent per 32 elements**; MXFP8 is
-> 8-bit with a shared scale per 32. So the inner loop is 32 weights -> 1 scale.
-> Accumulate 32-element groups separately and apply the group scale before
-> adding into the total. For the 4-bit unpack prefer a `vpshufb` lookup table
-> over the packed bytes (one LUT maps all 16 nibble values to f32) rather than
-> shifts and masks.
->
-> Use `gemmQ4KxQ8_0` in `src/kernels/amx/gemm_224_q4_k.zig` for the `*align(1)`
-> unaligned-load idiom and the n-outer/m-inner loop order. Explicit `@mulAdd`.
->
-> **ACCEPTANCE**
-> - The two existing exact-value MXFP tests keep passing.
-> - Add a GEMM-vs-`dequantizeRow` test with varied per-32 group scales at ~2e-5
->   relative tolerance, using fixture data that cannot pass with a swapped
->   unpack order.
->
-> **GATES:** `zig build -Doptimize=ReleaseFast`, `zig build test`,
-> `python3 tools/verify_abi.py`.
->
-> **REPORT BACK:** before/after time and bandwidth against the vectorized BF16
-> ceiling, new test names, gate status.
+- Build: working; 6 x86 variants **and** the aarch64 neon cross-build
+  (`zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu`), which is now
+  green. It was broken from `2416b68` until `amx.pshufb16` got the comptime
+  target guard it needed: `asm` is not lazily analysed, so its `"x"`
+  constraint had no register class on aarch64 and the build died with
+  "couldn't allocate output register for constraint 'x'" while all six x86
+  variants and the whole test suite passed. The guard keeps the instruction on
+  x86 and falls back to a lane-exact scalar lookup elsewhere, so the asm path
+  is unchanged and the round-trip test covers both. **No CI job built aarch64
+  at all** while this was broken — the matrix is six x86 variants and
+  `zig build all-variants` is x86-only — which is how it reached `main` green.
+  `09660de` added an aarch64 leg to the abi-gate job so the next one fails.
+ - C API: **112 symbols** gated by `verify_abi.py` triple gate (exports +
+  arity + layout via audit_layout.py). All operator families implemented:
+  MoE (incl. SFT/LoRA forward+backward), MLA, Gate (DeepSeek-V3
+  group-top2 routing), Linear, MLP, FP8 transport, math helpers,
+  `kt_set_default_allocator` (injectable allocator, B1),
+  `kt_dsv3_*` (DeepseekV3 model-orchestration),
+  `kt_qwen3moe_*` (Qwen3 model-orchestration), and
+  `kt_llama_moe_*` (LlamaMoe for GGUF checkpoints, all 16 GGML
+  weight formats per projection), `kt_to_float`/`kt_from_float`/
+  `kt_type_row_bytes` (generic block↔F32 dispatch). User docs:
+  `docs/api.md` covers every symbol (112/112, comm-audited).
+- GGML: **15/15 — every kt_type_t format complete** — Q8_0 + the 7
+  K-quants (Q2_K..Q8_K), IQ4_XS + IQ4_NL (non-linear 4-bit),
+  IQ2_XXS/IQ2_XS/IQ2_S (2-bit grid family, full kmap/kneighbors
+  quantize), IQ3_XXS/IQ3_S (3-bit grid family), IQ1_S/IQ1_M (1-bit +
+  delta code). Each has quantize + dequantize + scalar GEMM + tests.
+  The kmap init is histogram-based (22x faster than the qsort port,
+  d0b0211) and process-cached. Commits: 7d10033..d0b0211.
+- MoE: `loadWeights` packs all 3 projections; `forwardGateUp`/
+  `forwardDown` are real; `gemmExpert` is vectorized (`@Vector(8,f32)`
+  K-loop, A1, ~5.2x on decode shapes); D1/D2/D3 buffer-overflow/index
+  bugs fixed with regression tests (qlen>1, tp>1). Routing
+  (routeExperts / routeExpertsDeepSeek) threads a captured
+  `std.mem.Allocator` for its scratch buffers (B1 closure).
+- MLA: complete in `src/mla/`; `kt_mla_*` C API fully implemented
+  (new/load_weights/forward/prefill/decode/update_kv_cache/free).
+  `kt_mla_forward` supports qlen_count==1 (legacy sequential) AND
+  qlen_count>1 (paged/batched via per-sequence page_tables; matches
+  the C++ mla-tp.hpp:84 forward(qlens, page_tables, kv_lens,
+  input, output) contract exactly). MlaKvCache has save/load
+  (binary file) for context resume (kvcache_load_dump.cpp mirror).
+- DeepseekV3 Orchestration: `DeepseekV3DecoderLayer` +
+  `DeepseekV3Model` + `DeepseekV3ForCausalLM` (Zig-native, in
+  `src/kernels/moe/`) with C-API (`kt_dsv3_*`) and pybind11 shim.
+- Qwen3 Orchestration: `Qwen3MoeDecoderLayer` + `Qwen3MoeModel` +
+  `Qwen3MoeForCausalLM` (Zig-native, in `src/kernels/qwen3/`) with
+  C-API (`kt_qwen3moe_*`, 9 symbols). RMSNorm → MHA → residual,
+  RMSNorm → gate+MoE → residual (standard MHA, no MLA).
+- LlamaMoe (reconciled 2026-09-03): `LlamaMoe` in
+  `src/kernels/moe/llamafile_moe.zig` — GGML-quantized MoE for GGUF
+  checkpoints, ALL 16 weight formats per projection via `gemmQuant`
+  (three kernel signature conventions mapped per family), gpu_experts_mask,
+  C-API `kt_llama_moe_*`. LESSON: the 16-format extension once shipped
+  11 invented KT_TYPE values + 9 wrong block sizes (eec0c22) — now
+  guarded by comptime `@sizeOf` audit + KT_TYPE ABI test + 16-arm
+  dispatch test. Never hand-copy enum values; import or pin them.
+- Vanilla MHA: `MhaEngine` in `src/kernels/attn/mha.zig` (matmulQKV,
+  softmax, matmulO). Companion to MLA; same `*Engine.init/deinit/
+  forward/decode` API shape. Standalone `matmulF32` / `rmsNormInline` /
+  `softmaxInPlace` for callers that don't need a full engine.
+- GGUF parser: `src/io/gguf.zig` — GGUF v3 header + tensor table. Used
+  by the Qwen3 test suite to fabricate minimal GGUF blobs in memory;
+  reusable for real `.gguf` file loading (future work).
+- AMX: `detectAmxSupport()` runtime CPUID + arch_prctl guard (A2 fix —
+  the old `@hasField` comptime check was ALWAYS false, silently
+  no-op'ing every AMX intrinsic even on AMX hardware).
+- NUMA: `sched_setaffinity` pinning wired into Subpool worker spawn;
+  `mbind` wired into runtime NumaAllocator (A3); `src/numa/` module
+  fully revived (NumaTopology.detect + allocNuma + getThreadAffinity
+  work byte-exact; getThreadAffinity bug fixed in route — kernel
+  returns bytes-copied, not errno).
+- Tests: **268 across 18 suites, 0 leaks** (148 in the kernels suite
+  incl. all 15 GGML formats + the 16-arm gemmQuant dispatch sweep; 40
+  SIMD/suite-6f incl. the 6 K-quant AVX2 GEMM equivalence tests, the MXFP8,
+  MXFP4, Q8_0, IQ4_NL and IQ4_XS AVX2 GEMMs, the MX block-layout / ue8m0 / E4M3 codec
+  audits, and the IQ scalar-GEMM block-offset regression tests; 11
+  MLA + 4+3 MLA C-API + 2 FP8 + 9 GGML C API + 7 aarch64 + NEON +
+  allocator + Qwen3 + Qwen3 C-API + GGUF e2e + to/from_float + 3
+  LlamaMoe C-API incl. the KT_TYPE ABI audit + K_BLOCK runtime + 6 math-helpers (swiglu 3 variants/rms_norm/rope/softmax, numerics-pinned)). Bench:
+  `zig build bench` (2.8-9.3x measured speedup A1) + `moe_bench.zig`
+  (end-to-end MoE forward with tile-param tuning: -20.3% on prefill
+  8×4 at K=448 vs the 1792 default on this Ryzen 512K-L2 — validates
+  the A4 wiring empirically) + `kquant_bench.zig` (per-format K-quant
+  scalar-vs-AVX2).
+- IMPROVE.md documents a verified external-dev-feedback audit: all
+  P0-P3 items resolved (see its Parte E table for the commit map).
 
----
+## Key Patterns
 
-## P0.4 — INT4 families (GPTQ-INT4 + raw-INT4)
+### Zig 0.16 quick rules (full list in LESSONS_ZIG.md)
+- `std.ArrayList(T)` is UNMANAGED: `.empty` init, `list.append(allocator, x)`, `list.deinit(allocator)`.
+- `allocator.alignedAlloc(T, .@"64", n)` — alignment is a comptime enum, `n` is ELEMENT count.
+- Unused params are errors (`_ = param;` or rename `_param`); `&&`→`and`; no `@intToFloat`; `std.mem.eql` for strings.
+- Vector element writes need comptime index — stage through an array (`const v: Vec16 = arr;` coerces both ways).
+- Test/entrypoint signatures: `test "x" {}` unchanged; `pub fn main(init: std.process.Init) !void`.
 
-> You are working in `/ai/repos/2026/ktransformers-zig`, a Zig 0.16 port of the
-> ktransformers CPU inference kernels. A C++ reference implementation lives at
-> `/ai/repos/2026/ktransformers`.
->
-> **BEFORE YOU EDIT ANYTHING**
-> - Read `AGENTS.md`, `docs/perf-roadmap.md` and `LESSONS_ZIG.md`.
-> - CLAIM this task in `TODO.md`.
-> - Do **NOT** edit `build.zig`, `tests/kernels/test_kernels.zig`,
->   `src/root.zig`, or `src/kernels/arch/amx.zig`.
->
-> **TASK**
-> The reference has three AVX2 INT4 kernels — the most INT4 coverage of any
-> family: `kt-kernel/operators/avx2/rawint4-moe.hpp` (18 `_mm256` uses),
-> `gptq_int4-moe.hpp`, `gptq_int4_dequant.hpp` (8). The Zig port has only
-> `src/kernels/amx/gemm_224_int4.zig` (GPTQ-style: 4-bit values with a scale and
-> a zero-point per 32-element group) and it is scalar.
->
-> GPTQ-INT4 is the friendliest starting point: `vpshufb` unpack, then an `vfmadd`
-> chain with a per-group scale and subtract. Raw-INT4 is simpler still (nibble
-> unpack, one global scale) but **there is no raw-INT4 kernel in Zig at all** —
-> decide whether to add one, or record deliberately that INT4 covers GPTQ only.
-> The `_avxvnni` reference variants need VNNI, which this host lacks; keep the
-> scalar path as their fallback and say so in a comment.
->
-> Use `gemmQ4KxQ8_0` in `src/kernels/amx/gemm_224_q4_k.zig` for the `*align(1)`
-> unaligned-load idiom and the n-outer/m-inner loop order. Explicit `@mulAdd`.
->
-> **ACCEPTANCE**
-> - Existing INT4 tests (`16x16x32 identity`, the partial-group case) keep
->   passing.
-> - Add a GEMM-vs-`dequantizeRow` test at ~2e-5 relative tolerance, with fixture
->   data that cannot pass with a swapped nibble interleave.
->
-> **GATES:** `zig build -Doptimize=ReleaseFast`, `zig build test`,
-> `python3 tools/verify_abi.py`.
->
-> **REPORT BACK:** before/after bandwidth against the vectorized BF16 ceiling,
-> new test names, gate status.
+### AMX inline asm (verified working, see arch/amx.zig)
+```zig
+asm volatile (
+    "ldtilecfg (%[cfg])"
+    :
+    : [cfg] "r" (cfg),
+    : "memory"
+);
+// Tile reg must be an immediate: pass as u8 with "n" constraint,
+// splice with %%tmm%[tmm]; memory operands look like (%[base],%[stride],1)
+```
+Requires one-time `arch_prctl` XFEATURE_XTILEDATA enable (done in `tile_loadconfig`).
 
----
+### Library wiring (the lazy-analysis trap)
+A `pub const mod = @import(...)` re-export in root.zig does NOT emit the
+module's code. Reference the functions in a `comptime { _ = &mod.fn; }` block,
+and verify with `nm zig-out/lib/libkt_kernel_ext.so | grep <symbol>`
+(plain `nm` shows internal `t` symbols; `nm -D` only shows `export fn` C API).
 
-## P1.3 — SwiGLU activation (diagnosed; needs register-pressure work)
+### C API export
+```zig
+export fn kt_moe_forward(moe_ptr: *KT_MOE, ...) void {
+    const m: *moe.TpMoe = @ptrCast(@alignCast(moe_ptr));
+    m.forward(...);
+}
+```
+Opaque handles (`KT_MOE` etc.) are `opaque {}`; wrappers cast to the real type.
+**Allocator (B1)**: contexts capture the allocator at `*_new` (from
+`kt_set_default_allocator` if installed, else page_allocator) and free
+through the CAPTURED one — a `*_free` never reads the current default,
+so swapping the default between new and free is safe. New C-API paths
+must follow this pattern (see `kt_moe_free`, `kt_mla_free`). Tests that
+call exports directly need them declared `pub export fn` in main.zig
+(same pattern as `kt_mla_*`/`kt_gate_*`).
 
-> Re-measured 2026-10-03: **0.68x**, not the 0.59x recorded below, and the line
-> numbers are current as of commit `2416b68`. Supersedes the earlier copy.
+### TpMoe per-expert decomposition (Zig-port design; C++ forward is monolithic)
+`forwardGateUp`/`forwardDown` split the expert pass so Python can interleave
+custom ops (e.g. alternate SwiGLU variants). Pattern: iterate `tp_count`
+ranks, slice per-rank output offsets, accumulate down-proj in FP32 -> BF16.
+Both are real implementations (the guarded no-op era ended with the
+loadWeights fix); D3 fixed the `ldc` for tp_count > 1.
 
-You are working in `/ai/repos/2026/ktransformers-zig`, a Zig 0.16 port of the
-ktransformers CPU inference kernels. A C++ reference implementation lives at
-`/ai/repos/2026/ktransformers`; compare against
-`ktransformers/kt-kernel/operators/avx2/avx2_bf16_utils.hpp` (`act_fn` at :118).
+## SIMD on AVX2 (the perf contract — read before touching a kernel)
 
-**BEFORE YOU EDIT ANYTHING**
-- Read `AGENTS.md`, `docs/perf-roadmap.md` (item P1.3) and `LESSONS_ZIG.md`. The
-  Zig 0.16 API gotchas in LESSONS_ZIG.md are real and will cost you an hour.
-- CLAIM this task in `TODO.md` **and** put a marker at the top of each file you
-  intend to edit — `src/kernels/arch/amx.zig` and possibly
-  `src/kernels/amx/gemm_224_bf16.zig`:
-  `// CLAIM: <handle> — SwiGLU activation — <date>`. Claims go in both places:
-  the moment one matters is when someone opens the file they are about to change.
-- `src/kernels/arch/amx.zig` is normally off limits and you must say in your
-  claim that you are touching it. It was held exclusively by the `vpshufb` work
-  (Stream J), which has now landed and released it — confirm it is still clean
-  (`git status src/kernels/arch/amx.zig`) before you start, and be the only
-  session in that file.
-- Do not edit `build.zig`, `tests/kernels/test_kernels.zig`, `src/root.zig`.
-  Append-only in `tests/kernels/simd_kernels_tests.zig` and your own TODO.md
-  section. Stage by filename when you commit — never `git add -A`; there is
-  uncommitted work from another session in this tree (Stream B, FP8).
-- Claim format is `CLAIMED (<handle>) since <date>`. No tool or model names in
-  claims, commits or commit trailers. Never push. Commit after each verified step.
+Benchmarked against the C++ reference's own AVX2 kernels
+(`kt-kernel/operators/avx2/avx2_bf16_gemm.hpp`) with
+`bench/cpp_vs_zig/run.sh` — see that directory's `README.md` (how to run,
+`KT_REF`/`KT_PIN`) and `RESULTS.md` (the measurement record); as of the SIMD
+rework the Zig port is **1.13x-1.88x the reference** on BF16 GEMM and
+**0.67x** on SwiGLU (with bit-identical output). Four rules carry almost all of
+it:
 
-**WHAT IS IN THAT FILE NOW.** `2416b68` added `pshufb16` / `pshufbTable` and a
-shared `ByteVec = @Vector(32, u8)` at the top of `amx.zig`. It is additive and
-does not touch `expVec`, but it shifted every line below it, so use the anchors
-below rather than any older note. It also moved the file's constants **into the
-same arch layer** you are about to edit — if you add a helper there, expect it
-to be shared with everything.
+1. **`@exp` does not vectorize.** compiler-rt has only scalar `expf` and Zig
+   does not target libmvec, so `@exp` on `@Vector(8, f32)` becomes 8 scalar
+   libcalls with stack spills (17x slower than a polynomial). Use
+   `amx.expScalar` / `amx.expVec` — the Cephes construction in
+   `arch/amx.zig`, derived (not transcribed) and verified to <= 1 ULP, which
+   is *tighter* than the reference's ~1e-6 polynomial. Never reintroduce
+   `@exp` in a vector loop; `grep -rn "@exp" src/` should only hit comments.
+2. **F16C is irrelevant here.** The weights are BF16, and AVX2 has no BF16
+   conversion instruction — the widening is `vpmovzxwd` + `vpslld $16`, which
+   LLVM already emits for both sides. F16C is IEEE-f16. Don't spend effort
+   "enabling F16C"; `KT_TYPE_F16` exists in the ABI but has no kernel.
+3. **Loop order is worth more than instruction selection.** `gemmExpert` and
+   `gemmF32Bf16` are n-outer / m-inner so the *weight* matrix (the huge
+   operand) streams from DRAM once instead of once per token row. Measured
+   3.4-4.0x — far more than the ~1.1x from FMA or extra accumulators. Never
+   "simplify" these back to a m/n/k triple loop.
+4. **GEMM accumulation is an explicit choice.** `gemmExpert` OVERWRITES its
+   output (callers may pass uninitialised memory); `gemmExpertAccum` ADDS to
+   it (tensor-parallel rank loops). This split fixed a real bug:
+   `forwardDown` used to call the overwrite-only entry point once per tp rank
+   into one shared buffer, silently discarding every rank but the last.
 
-**THE TASK**
-`amx.expVec` (`src/kernels/arch/amx.zig:675`) is why the activation sits at
-**0.68x** of the C++ reference. The gap is register allocation, not algorithm:
-`expVec` needs about thirteen simultaneously-live constants against sixteen ymm
-registers — seven polynomial coefficients (`EXP_C0`..`EXP_C6`, lines 639-645),
-`EXP_INV_LN2`, `EXP_LN2_HI`, `EXP_LN2_LO`, 0.5, 1.0 and the two clamp bounds
-(`EXP_LO`/`EXP_HI`, lines 634-635) — so LLVM rematerializes constants with
-`vbroadcastss` inside the loop where the C++ hoists all of them before it. A
-session that measured this recorded **48 instructions in the Zig 8-element body
-against 40 in C++**, and six `vbroadcastss` where C++ has none. Treat those as a
-starting point and re-derive them (see MEASUREMENT — LLVM unrolls this loop
-heavily, so an unnormalized count is meaningless).
+Also: `f32_to_bf16` rounds to nearest even (matching ggml / the reference);
+`f32_to_bf16_trunc` keeps the old truncating behaviour. And `-Dvariant` does
+**not** set Zig CPU features — it only sets C macros for the pybind path, so
+the feature set comes from the native target. `zig build -Dtarget=x86_64-linux-gnu
+-Dvariant=avx2` still prints "Building variant: avx2" while producing **nothing**:
+that target is baseline x86_64, which has no 32-byte vector type, so
+`amx.ByteVec = @Vector(32, u8)` fails to compile with "TODO moveStrategy for
+@Vector(32, u8)". This was true before the pshufb work as well — the `-Dvariant`
+macro not pinning features has always been the underlying issue — but it is worth
+stating plainly: **the only supported builds are the native target and the six
+x86 variants.** Narrowing `ByteVec` to 16 lanes with two shuffles would restore
+the baseline target, and nobody needs it yet.
 
-Fix by cutting peak live constants, in this order, stopping as soon as you are
-at parity:
-1. Split `expVec` into two phases — clamp, argument split, floor, exponent
-   synthesis first, the polynomial second — so the first group's constants are
-   dead before the second's are born. Most likely to work; does not change the
-   arithmetic.
-2. Hoist the clamp bounds out of the per-vector path. They are loop-invariant
-   per call; clamp once per call.
-3. Fold 0.5 and 1.0 out of the live set algebraically.
+Tests for all of the above live in `tests/kernels/simd_kernels_tests.zig`
+(kept separate from `test_kernels.zig`) — which is also the ONLY place a new
+kernel test can go: a `test` block inside a file belonging to the `kt` module
+is never executed by `zig build test` (Zig collects tests from the root file's
+module), which is how two broken copies hid in `gemm_224_q{3,6}_k.zig`.
 
-Last resort only, and only with a measured justification in your report: drop
-the polynomial from degree 6 to degree 5.
+**The six GGML K-quants have the same treatment** (`kquant_simd.zig`: one
+comptime-parameterized AVX2 driver, `gemmQ*_K` beside each `gemmQ*_KScalar`,
+6.3x-15.7x measured, wired into `gemmQuant` + `kt_matmul_q{4,5,6,8}_k`). The
+scalar versions are kept deliberately: they are the readable statement of each
+format's math and the reference the new tests compare against. Note their
+`test` blocks are dead (module boundary) — the live K-quant GEMM tests are in
+`tests/kernels/simd_kernels_tests.zig`.
 
-**A WARNING WORTH READING TWICE, because the same shape of bug was just fixed in
-another kernel.** The IQ4_XS stream expected its win from `vpshufb` and got
-none; the actual bottleneck was `f16_to_f32(blk.d)` sitting *inside* a
-per-sub-block helper, so the conversion ran eight times per block at the head of
-a serial dependency chain with only four FMAs per sub-block to hide it at m=1.
-Hoisting it was the whole 3x → 17-19x. **So before you start optimizing
-constants, establish what the dependency chain actually is** at m=1: dump the
-loop and look at what feeds the first FMA. The lesson generalizes — a
-conversion that looks like it belongs to the inner loop may belong to the block.
+**Next performance work is in `docs/perf-roadmap.md`.** Short version: BF16
+GEMM is won (1.13x-1.88x of the C++ reference) and the six K-quants are now
+vectorized too (6.3x-15.7x over their own scalar versions), but the remaining
+*quantized* families — Q8_0 and the nine IQ* formats — are still scalar on
+non-AMX hosts, and the C++ reference has 10 AVX2 kernels we do not run at all
+(FP8, MXFP4, MXFP8, GPTQ-INT4, raw-INT4; it has no K-quant kernel, so the
+K-quant work has no cross-implementation reference to diff against). Those,
+plus the 0.68x SwiGLU activation, is where the remaining gap lives.
 
-**TWO WARNINGS, BOTH FROM WORK ALREADY DONE HERE**
-- Do **not** drop to degree 5 to save a register. Zig emits 8 FMAs where C++ emits
-  6 on purpose: degree-6 truncation is 1.0e-8 relative against ~1e-6, and the
-  port is currently *more* accurate than the kernel it replaced. Reverting that
-  is an accuracy regression dressed as a speedup.
-- Do **not** retry the array-staging fix. Replacing the `[VEC_LEN]f32` staging in
-  `applySwiGLU` (`gemm_224_bf16.zig:240`) with direct `*align(1)` vector loads
-  plus a vectorized RNE narrowing store measured **1.02x median over six
-  back-to-back runs** (range 0.80-1.28x) and made the binary 29 instructions
-  larger. Tried, reverted, do not repeat.
-- Do **not** change `pub const VecF32 = @Vector(8, f32)` (now line 750) or
-  `VEC_LEN`. They are shared with the BF16 GEMM, MLA and every quantized kernel;
-  widening the vector is a different task with a much larger blast radius.
+## sentrux (architecture sensor — MCP + CLI)
 
-**TESTS — `tests/kernels/simd_kernels_tests.zig`, never next to the code.** A
-`test` block inside a file that belongs to the `kt` module is never executed by
-`zig build test`; Zig collects tests from the root file's module only. Assert,
-for all three variants (`swigluVec` :764, `swigluClampVec` :778, `swigluOaiVec`
-:785):
-- `expVec` still within 1 ULP of `@exp`, and the 90% bit-identical rate is not
-  regressed;
-- `expVec == expScalar` lane for lane, including the clamp at both ends;
-- the activation output stays **bit-identical** to the reference. It currently
-  is: 0 of 262144 elements differ. A change that shows up only as a 1e-7 relative
-  wobble is a bug here.
+`.sentrux/rules.toml` is the **layering contract** for this repo, enforced by
+the sentrux rules engine. In this environment sentrux is exposed via the
+**MCP tools** (`sentrux_scan`, `sentrux_check_rules`, ...); the standalone
+CLI (`sentrux check .`) exists upstream via `brew install sentrux/tap/sentrux`
+/ the install.sh script if you want the gate in CI.
 
-**MEASUREMENT.** The host is shared and absolute milliseconds move by up to 3x
-with the load — today another agent's inference job put it at load 31 on 16
-cores, and the same case measured 10x, 14x and 19x on three consecutive runs.
-Never compare against a remembered number.
+### The contract (know this before adding imports)
+Layer order (lower may be imported by higher, **never** the reverse):
+`numa/io leaves(0) -> arch intrinsics(1) -> mla engine(2) -> kernels(3) ->
+runtime(4) -> root hub(5) -> C exports(6) -> tests/bench(7) -> bindings(8)`.
 
-    KT_PIN=9 ./bench/cpp_vs_zig/run.sh
+Hard boundaries: `src/**` never imports `tests/**` or `bench/**`;
+`src/main.zig` reaches kernels only through `root.zig` (direct kernel imports
+bypass the comptime fn-ref wiring); kernels never import `main.zig`;
+`src/numa/**` is a std-only leaf; `src/kernels/arch/**` is imported-by-all and
+must not import any specific kernel.
 
-The row you care about is `SwiGLU activation swiglu act [m=128,n=2048]`. Take
-the best of at least three runs and state the load average with the number.
-Baseline as of today, pinned, best of 3: C++ 0.2046 ms, Zig 0.3009 ms, 0.68x —
-re-measure it yourself, do not quote that.
+**Two INTENTIONAL exceptions — do NOT "fix" them** (documented inline in
+rules.toml):
+1. `root.zig <-> main.zig` cycle: `root.zig:241` forces `main.zig` analysis
+   so the `export fn kt_*` are EMITTED into the `.so` (Zig drops exports
+   nothing references — the LAZY-ANALYSIS trap). Hence `max_cycles = 1`.
+2. `root.zig` fan-out 47: it IS the designated module hub + comptime fn-ref
+   block. Hence `no_god_files = false`.
 
-For instruction counts:
+Also intentional: grid/lookup tables have a single owner file that sibling
+kernels import (`gemm_224_iq1_s.zig` owns `IQ1S_GRID`; `gemm_224_iq2_xxs.zig`
+owns `KSIGNS`/`KMASK`). Same-layer data sharing is fine — don't split it.
 
-    zig build-exe -OReleaseFast -mcpu=native -lc --dep kt \
-        -Mroot=bench/cpp_vs_zig/zig_bench.zig -Mkt=src/root.zig \
-        -femit-bin=/tmp/zb
-    nm /tmp/zb | grep applySwiGLU
-    objdump -d --start-address=0x<SYMBOL> /tmp/zb
+### How to use the MCP tools (agent workflow)
 
-Count inside the loop body only, and normalize: the loop is heavily unrolled, so
-report both the raw count and the count per 8 elements processed. The number
-that must move is `vbroadcastss` inside the body.
+1. **Session start**: `sentrux_session_start` BEFORE your first edit (saves
+   the baseline). At the end, `sentrux_session_end` reports whether your
+   session degraded anything. If you don't have the MCP, the CLI equivalents
+   are `sentrux gate --save .` before / `sentrux gate .` after.
+2. **After adding/removing imports or new files**: `sentrux_rescan` then
+   `sentrux_check_rules`. The check FAILs on any new cycle, any layer
+   inversion, or any boundary break — fix it or, if the change is a
+   legitimate new pattern, update rules.toml WITH a comment explaining why
+   (the file's comments are the source of truth for intent).
+3. **`sentrux_health`**: `quality_signal` 0-10000. Useful for *deltas* over
+   your session (it went 4976 -> 5388 when a real import cycle was removed);
+   do NOT chase the absolute number — root.zig's fan-out keeps it structurally
+   capped, and that's by design.
+4. **Ignore `sentrux_test_gaps` entirely** for this repo: it reports 0%
+   coverage because it can't follow the `@import("kt")` module alias that
+   build.zig wires for every test suite. The real count is `zig build test`
+   (160+ across the suites). Decisions about what to test come from TODO.md
+   and the coverage of the file you're touching, NOT from this tool.
 
-**ACCEPTANCE**
-- The existing exp and SwiGLU tests pass, and the activation remains
-  bit-identical to the reference.
-- The activation moves from 0.68x toward parity. Parity is the goal; anything
-  above 0.85x is a strong result.
-- `vbroadcastss` per 8 elements in the loop body strictly decreases, reported
-  next to the times.
-- If the register work does not pay off, say so with numbers and leave the code
-  correct. A measured negative result with a clear write-up is a useful outcome
-  here; a lucky micro-optimization with a regression hidden behind noise is not.
+### Proven value (why this gate exists)
+First run with a correct layer model (b3f2916): found a REAL circular import
+`gemm_224_iq3_xxs <-> iq3_quantize` (introduced with the IQ3_XXS quantize
+work, a8f7455) sitting inside a dead wrapper that also declared the
+nonexistent `std.Thread.Mutex`. Cycle removed, wrapper deleted, signal +412.
+That's the class of bug the rules gate now catches at commit time instead
+of two sessions later.
 
-**GATES, all of them:**
-    zig build -Doptimize=ReleaseFast
-    zig build test
-    python3 tools/verify_abi.py
-    python3 tools/audit_layout.py
-    zig build all-variants
-    zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu
+### Rules format gotcha
+The schema is `[constraints]` + `[[layers]]` + `[[boundaries]]` (from the
+sentrux upstream docs) — a `[[rules]]` table parses as ZERO rules and
+silently passes. If `check_rules` ever reports `rules_checked: 0` after a
+rules.toml edit, that's what happened.
 
-**REPORT BACK**
-- Before/after table: C++ ms, Zig ms, ratio, load average stated.
-- Instruction counts: raw and per-8-element, for the loop body.
-- What the dependency chain at m=1 actually was, and which of the three fixes
-  you applied — and why you stopped there.
-- Confirmation that the output is still bit-identical, with the element count.
-- Anything this prompt got wrong.
 
-**FOOTGUNS, all verified in this repo**
-- `@exp` on a vector does not vectorize: compiler-rt ships only scalar `expf` and
-  Zig does not target libmvec, so it becomes eight scalar libcalls with spills,
-  17x slower. Never reintroduce it in a vector loop.
-- Zig defaults `fp-contract` off, so `a*b+c` emits `vmulps`+`vaddps` instead of one
-  `vfmadd`. Use `@mulAdd` where you touch arithmetic.
-- `@splat` is one-argument in Zig 0.16 and the value must be typed:
-  `@as(VecF32, @splat(@as(f32, 0.5)))`.
-- A vector shift needs a vector of the shift-logic type, typed even for a
-  comptime count: `v >> @as(@Vector(8, u5), @splat(@as(u5, 23)))`.
-- Vector element access needs a comptime index; stage through an array.
-- Run `sentrux_rescan` then `sentrux_check_rules` after touching `amx.zig`.
+## Documentation
+
+- `README.md` — project overview
+- `TODO.md` — task tracking (source of truth for current status)
+- `IMPROVE.md` — verified audit of external dev feedback (P0-P3 all resolved; commit map in Parte E)
+- `LESSONS_ZIG.md` — Zig 0.16 gotchas, verified AMX asm patterns, lazy-analysis/integration lessons (**read first**)
+- `include/kt_kernel.h` — C API contract (do not change without coordinating: Python/pybind11 depends on it; additive changes to the clearly-marked 'Zig extensions' section are the established pattern)
+- `docs/api.md` — C API reference for integrators
+- `docs/measuring.md` — **read before quoting any number.** The measurement
+  policy: a 14-23% noise floor measured against a byte-identical control, why
+  fragment microbenchmarks invert on this host, and the only trustworthy method
+- `docs/perf-roadmap.md` — **read before any kernel work.** Per-operator list of
+  what is still scalar, measured headroom, the four rules that make kernels
+  fast here, acceptance criteria, and the parallel-work rules
+- `docs/perf-task-prompts.md` — the same items pre-packaged as copy-paste
+  prompts, for handing a stream to another dev
+- `docs/porting-guide.md` — C++ → Zig porting patterns
+
+
+  The reference repo is at /ai/repos/2026/ktransformers
+
+
+## Coordination notes
+
+- `PLAN.md`, `LESSONS_KTRANSFORMERS.md` referenced by older docs do not exist.
+- Multiple agents have worked in this tree concurrently: before running
+  `git stash`/`git checkout`, check `git status` for live WIP that isn't yours.
