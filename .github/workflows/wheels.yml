@@ -98,6 +98,7 @@ jobs:
       # from the log.
 
       - name: "Test suites"
+        run: timeout 2400 zig build test
       # A suite binary that outlives the build runner IS the failure, even though
       # nothing in the log says so: the runner is killed, the suite keeps a CPU,
       # and an orphan is invisible (a hung run looks like a slow run). One was
@@ -116,7 +117,6 @@ jobs:
           tools/orphan_tests.sh 2>&1 | tee orphan.log
           echo "--- orphan check ---"
           cat orphan.log
-        run: timeout 2400 zig build test
       # Compiling aarch64 and gating its exports cannot catch a wrong ANSWER,
       # and `zig build test` only ever runs the host target — so every
       # aarch64 code path had no execution coverage at all. That is how
