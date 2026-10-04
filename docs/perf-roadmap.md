@@ -504,10 +504,16 @@ same range" as IQ2_XXS (1.26 GB/s at m=1) and IQ2_XS (1.06). That implies a band
 of **1.06–1.26 GB/s**. It was never measured, and it does not survive contact
 with a control arm.
 
-`bench/cpp_vs_zig/iq_anchor_bench.zig` re-measures the two anchors at
-n=2048, k=7168 (57344 blocks), blocks quantized from real data with each format's
-own `_WithInit` quantizer, agreement against the scalar reference **bit-exact
-(rel-L2 0.00)** at m=1 and m=8 for both:
+`bench/cpp_vs_zig/iq_bench.zig` re-measures the two anchors at n=2048, k=7168
+(57344 blocks), blocks quantized from real data with each format's own `_WithInit`
+quantizer. Agreement against the scalar reference is **~1e-6 relative L2**
+(5e-7 to 2.3e-6 measured) at m=1 and m=8 for both — **not bit-exact**, and this
+line previously said it was, on the strength of a `0.00` printed at two decimals.
+That printed value bounds the error below 0.005; it never measured zero, and the
+residual is ordinary f32 summation order (the vector path keeps several
+accumulators live, the scalar one does not). The per-format SIMD tests assert
+element-wise within 1e-3 at small k, where the summation order agrees; the ~1e-6
+appears at benchmark depth. Read either number as the one it is.
 
 | format | bytes | GB/s (3 direct runs) | spread |
 |---|---|---|---|
