@@ -250,8 +250,9 @@ pub const GemmKernel224Int4 = struct {
     /// b: [n, k/32] BlockQ4_0 weights (column-major, each row is one output dim)
     /// c: [m, n] FP32 output
     ///
-    /// On non-AMX hardware, this falls back to a scalar implementation
-    /// (same as the original placeholder).
+    /// On non-AMX hardware this falls back to `gemmAvx2`, which is the
+    /// vectorized path (see its comment block for the loop order, the scale
+    /// handling and why this format needs no `vpshufb`).
     ///
     /// K-axis strategy: we iterate by group (GROUP_SIZE = 32 K elements).
     /// Each group contributes its own int_c (AMX INT8 dot product output
@@ -268,7 +269,7 @@ pub const GemmKernel224Int4 = struct {
         m: usize, n: usize, k: usize
     ) void {
         if (!amx.detectAmxSupport()) {
-            gemmFullTileScalar(a, lda, b, ldb, c, ldc, m, n, k);
+            gemmAvx2(a, lda, b, ldb, c, ldc, m, n, k);
             return;
         }
 
@@ -383,10 +384,208 @@ pub const GemmKernel224Int4 = struct {
         _ = ldc;
     }
 
-    /// Scalar fallback for non-AMX hosts. Handles the partial-group case
-    /// (k not a multiple of GROUP_SIZE) by processing a partial final
-    /// block that covers [k_blocks * GROUP_SIZE, k).
-    fn gemmFullTileScalar(
+    // =======================================================================
+    // AVX2 path (non-AMX hosts) — the GEMM that actually runs
+    // =======================================================================
+    //
+    // `gemmFullTileScalar` is an m/n/k triple loop, which is the one loop order
+    // the SIMD contract forbids: the weight matrix — the huge operand — is
+    // re-streamed from DRAM once per token row. On every non-AMX host
+    // `gemmFullTile` lands on it, so it WAS the INT4 GEMM.
+    //
+    // Built like `gemm_224_{q8_0,mxfp8,fp8}.zig` and `kquant_simd`:
+    //
+    //   n-outer / m-inner  the n x k weight block is walked once, in order
+    //   MR = 4             four activation rows share one unpacked weight
+    //                       vector, so the nibble unpack amortizes over 4 FMAs
+    //   explicit @mulAdd   FP contraction is off in this toolchain, so a plain
+    //                       `a*w + acc` would be a separate multiply and add
+    //   deferred hsum      ONE @reduce per OUTPUT element
+    //
+    // On the scale and the zero point — the two things that are easy to get
+    // wrong here:
+    //
+    //   * The per-group scale is CONSTANT across the 32 weights of a group, so
+    //     folding it into the weight vector is exactly equivalent to applying
+    //     it at the group boundary. No per-group reduction is needed, and one
+    //     accumulator chain covers the whole k. It is also EXACT rather than
+    //     merely close: `q - 8` needs at most 4 significant bits and `d` is a
+    //     bf16, so `(q - 8) * d` needs at most 12 of the 24 an f32 has.
+    //     This is the trap `applyScales` exists for on the AMX path, and it
+    //     does not apply here: there the accumulator is INT32 and spans a
+    //     K-block, so the scale must be applied when the block ends. Here no
+    //     accumulator ever spans a group boundary unscaled.
+    //   * The zero point is a separate term and stays in the INTEGER domain:
+    //     the subtraction happens BEFORE the scale multiply, as `q*d +
+    //     (-8*d)` in one FMA. Folding the -8 anywhere else is a different
+    //     function — `d/8`-style scale surgery would scale the activations,
+    //     and subtracting 8 from the i8 activation would destroy the real
+    //     activation values.
+    //
+    // On `vpshufb`, which this format does NOT need: INT4 GPTQ is AFFINE in
+    // the nibble (`(q - 8) * d`), so the value conversion is one integer
+    // convert and one FMA. A lookup table only pays for a non-linear
+    // codebook, which is why `pshufb16` exists for MXFP4's E2M1 grid and the
+    // IQ formats' tables but is not used here. The reference agrees:
+    // `gptq_sym_dequant_8x4bit` (gptq_int4_dequant.hpp) is `_mm256_srlv_epi32`
+    // + `_mm256_and_si256` + `_mm256_cvtepi32_ps` + a subtract and a multiply,
+    // with no table and no shuffle anywhere.
+    //
+    // What the reference's variable shift buys, and why it works on THIS
+    // layout: the block is byte-interleaved (byte q holds weight 2q in its low
+    // nibble and weight 2q+1 in its high nibble), so bits 4t..4t+3 of the
+    // little-endian u32 holding bytes 0..3 are exactly weights 0..7. One
+    // broadcast + one `vpsrlvd` + one mask therefore replaces an interleave of
+    // the low-nibble and high-nibble vectors, and the lanes come out in weight
+    // order.
+    //
+    // Exactness: with i8 activations and 4-bit weights every product is an
+    // integer times `d`, and so is every partial sum, so this path is
+    // bit-identical to `gemmFullTileScalar` as long as the running sum stays
+    // under 2^16 in integer units (8 bits of `d`'s significand against f32's
+    // 24). That covers every k up to a few thousand on ordinary data; the SIMD
+    // suite asserts bit-equality on the shapes where it holds and a tight
+    // relative bound on the one where it does not.
+
+    /// Rows of activations processed per pass. With 4 rows in flight, one
+    /// unpacked weight vector feeds four accumulators.
+    pub const MR: usize = 4;
+
+    const Vec: type = @Vector(8, f32);
+
+    /// The INT4 zero point: `w = (q - ZERO_POINT) * d`. Symmetric GPTQ fixes
+    /// this at 8, so the 16 codes map onto -8..7 (the reference says so
+    /// outright: "qzeros: not needed (symmetric, zero_point = 8 for all)").
+    pub const ZERO_POINT: f32 = 8.0;
+
+    /// 8 i8 activations -> 8 f32: `vpmovsxbd` + `vcvtdq2ps`. The sign
+    /// extension is mandatory; i8 runs -128..127.
+    inline fn i8x8(p: [*]const i8) Vec {
+        const raw: @Vector(8, i8) = @as(*align(1) const @Vector(8, i8), @ptrCast(p)).*;
+        return @floatFromInt(raw);
+    }
+
+    /// 8 packed INT4 weights -> 8 f32, each `(q - ZERO_POINT) * d`.
+    ///
+    /// The whole dequant: one broadcast, one variable shift, one mask, one
+    /// int->float convert, one FMA. Single pointer parameter because
+    /// `&blk.qs[i]` sits at offset 2 in the block (after the bf16 scale) and is
+    /// therefore only 1-byte aligned — a single pointer also cannot coerce to
+    /// a many-item one.
+    ///
+    /// This is also the primitive a raw-INT4 (Kimi native) kernel would need:
+    /// the reference's `rawint4_dequant_8x4bit_unscaled` is this function with
+    /// `d = 1`. TODO.md Stream L records why the raw variant is not wired up:
+    /// no type id, no in-tree consumer, so a kernel for it would be dead code.
+    pub inline fn nibble8(p: *const u8, d: f32) Vec {
+        const word: u32 = @as(*align(1) const u32, @ptrCast(p)).*;
+        const shifts: @Vector(8, u5) = .{ 0, 4, 8, 12, 16, 20, 24, 28 };
+        const nib: @Vector(8, u32) = (@as(@Vector(8, u32), @splat(word)) >> shifts) &
+            @as(@Vector(8, u32), @splat(0x0F));
+        return @mulAdd(Vec, @floatFromInt(nib), @as(Vec, @splat(d)), @as(Vec, @splat(-ZERO_POINT * d)));
+    }
+
+    /// Scalar dot over the ragged tail of a k that is not a multiple of
+    /// GROUP_SIZE. Only the final group can be partial and it is at most 31
+    /// weights, so this runs once per output element.
+    ///
+    /// The indexing is the part that has to be right, and `kt_matmul_q{4,5,6,8}_k`
+    /// and FP8 all shipped ragged-k bugs, so it is asserted rather than trusted:
+    /// byte q of the block holds weights 2q and 2q+1 of the group, so `rem`
+    /// weights touch `ceil(rem/2)` bytes, and an odd `rem` leaves the last
+    /// weight in the LOW nibble of the last byte.
+    inline fn tailDot(a_row: [*]const i8, blk: *const BlockQ4_0, kbase: usize, rem: usize) f32 {
+        const d = amx.bf16_to_f32(blk.d);
+        const q_max = rem / 2;
+        var acc: f32 = 0;
+        for (0..q_max) |q| {
+            const byte = blk.qs[q];
+            acc += @as(f32, @floatFromInt(a_row[kbase + q * 2])) *
+                (@as(f32, @floatFromInt(byte & 0x0F)) - ZERO_POINT) * d;
+            acc += @as(f32, @floatFromInt(a_row[kbase + q * 2 + 1])) *
+                (@as(f32, @floatFromInt(byte >> 4)) - ZERO_POINT) * d;
+        }
+        if (rem % 2 == 1) {
+            const byte = blk.qs[q_max];
+            acc += @as(f32, @floatFromInt(a_row[kbase + q_max * 2])) *
+                (@as(f32, @floatFromInt(byte & 0x0F)) - ZERO_POINT) * d;
+        }
+        return acc;
+    }
+
+    /// AVX2 INT4 GPTQ GEMM. `c` is OVERWRITTEN on every element of [0,m) x
+    /// [0,n) — assigned, never accumulated, matching `gemmFullTileScalar`.
+    /// `ldb` is the row stride of `b` in BLOCKS (one block = 32 weights), `lda`
+    /// and `ldc` in elements.
+    ///
+    /// `noinline` so the kernel keeps its own symbol in the `.so` and its inner
+    /// loop stays disassemblable next to the scalar one. Without it LLVM folds
+    /// it into `gemmFullTile` and there is nothing for `nm` to show.
+    pub noinline fn gemmAvx2(
+        a: *const i8, lda: usize,
+        b: *const BlockQ4_0, ldb: usize,
+        c: [*]f32, ldc: usize,
+        m: usize, n: usize, k: usize
+    ) void {
+        if (m == 0 or n == 0) return;
+        const kb_full = k / GROUP_SIZE; // complete 32-weight groups
+        const rem = k - kb_full * GROUP_SIZE; // ragged tail, 0..31
+
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            // `a` and `b` are single-item pointers, so the arithmetic needs
+            // many-item views first (LESSONS_ZIG.md §6).
+            const arow: [*]const i8 = @ptrCast(a);
+            const brow: [*]const BlockQ4_0 = @as([*]const BlockQ4_0, @ptrCast(b)) + j * ldb;
+
+            var i: usize = 0;
+            // Main path: MR rows of A share every unpacked weight vector.
+            while (i + MR <= m) : (i += MR) {
+                var acc = [_]Vec{@splat(0.0)} ** MR;
+                for (0..kb_full) |g| {
+                    const blk = &brow[g];
+                    const d = amx.bf16_to_f32(blk.d);
+                    const kb0 = g * GROUP_SIZE;
+                    inline for (0..GROUP_SIZE / 8) |v| { // 4 chunks of 8 weights
+                        const w = nibble8(&blk.qs[v * 4], d);
+                        inline for (0..MR) |r| {
+                            acc[r] = @mulAdd(Vec, i8x8(arow + (i + r) * lda + kb0 + v * 8), w, acc[r]);
+                        }
+                    }
+                }
+                inline for (0..MR) |r| {
+                    var sum = @reduce(.Add, acc[r]); // ONE hsum per output element
+                    if (rem != 0) sum += tailDot(arow + (i + r) * lda, &brow[kb_full], kb_full * GROUP_SIZE, rem);
+                    c[(i + r) * ldc + j] = sum;
+                }
+            }
+            // Row tail (m % MR), one row at a time.
+            while (i < m) : (i += 1) {
+                var acc: Vec = @splat(0.0);
+                for (0..kb_full) |g| {
+                    const blk = &brow[g];
+                    const d = amx.bf16_to_f32(blk.d);
+                    const kb0 = g * GROUP_SIZE;
+                    inline for (0..GROUP_SIZE / 8) |v| {
+                        acc = @mulAdd(Vec, i8x8(arow + i * lda + kb0 + v * 8), nibble8(&blk.qs[v * 4], d), acc);
+                    }
+                }
+                var sum = @reduce(.Add, acc);
+                if (rem != 0) sum += tailDot(arow + i * lda, &brow[kb_full], kb_full * GROUP_SIZE, rem);
+                c[i * ldc + j] = sum;
+            }
+        }
+    }
+
+    /// Scalar fallback for non-AMX hosts, and the oracle the AVX2 path is
+    /// tested against. Handles the partial-group case (k not a multiple of
+    /// GROUP_SIZE) by processing a partial final block that covers
+    /// [k_blocks * GROUP_SIZE, k).
+    ///
+    /// Kept deliberately, not as dead code: it is the readable statement of the
+    /// math, and `gemmAvx2` below is diffed against it bit-for-bit in the SIMD
+    /// suite. Do not delete it when the fast path changes.
+    pub noinline fn gemmFullTileScalar(
         a: *const i8, lda: usize,
         b: *const BlockQ4_0, ldb: usize,
         c: [*]f32, ldc: usize,
