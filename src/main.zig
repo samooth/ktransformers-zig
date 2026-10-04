@@ -2655,7 +2655,7 @@ pub export fn kt_quantize_q4_k(src: [*]const f32, dst: *anyopaque, k: usize) voi
 }
 
 pub export fn kt_dequantize_q4_k(src: *const anyopaque, dst: [*]f32, k: usize) void {
-    gemm_q4_k.dequantizeRowQ4_K(@ptrCast(@alignCast(src)), dst[0..k], k);
+    gemm_q4_k.dequantizeRowQ4_KVec(@ptrCast(@alignCast(src)), dst[0..k], k);
 }
 
 pub export fn kt_quantize_q5_k(src: [*]const f32, dst: *anyopaque, k: usize) void {
@@ -2663,7 +2663,7 @@ pub export fn kt_quantize_q5_k(src: [*]const f32, dst: *anyopaque, k: usize) voi
 }
 
 pub export fn kt_dequantize_q5_k(src: *const anyopaque, dst: [*]f32, k: usize) void {
-    gemm_q5_k.dequantizeRowQ5_K(@ptrCast(@alignCast(src)), dst[0..k], k);
+    gemm_q5_k.dequantizeRowQ5_KVec(@ptrCast(@alignCast(src)), dst[0..k], k);
 }
 
 pub export fn kt_quantize_q6_k(src: [*]const f32, dst: *anyopaque, k: usize) void {
@@ -2679,7 +2679,7 @@ pub export fn kt_quantize_q8_k(src: [*]const f32, dst: *anyopaque, k: usize) voi
 }
 
 pub export fn kt_dequantize_q8_k(src: *const anyopaque, dst: [*]f32, k: usize) void {
-    gemm_q8_k.dequantizeRowQ8_K(@ptrCast(@alignCast(src)), dst[0..k], k);
+    gemm_q8_k.dequantizeRowQ8_KVec(@ptrCast(@alignCast(src)), dst[0..k], k);
 }
 
 /// GGML GEMMs: a [m,k] BF16 activations, b [n, k/QK] blocks (row-major,
@@ -2973,11 +2973,11 @@ fn toFloatDispatch(t: u32, src: [*]const u8, dst: [*]f32, n: usize) bool {
             return true;
         },
         16 => { // Q4_K
-            gemm_q4_k.dequantizeRowQ4_K(@as([*]const gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(src))), dst[0..n], n);
+            gemm_q4_k.dequantizeRowQ4_KVec(@as([*]const gemm_q4_k.BlockQ4_K, @ptrCast(@alignCast(src))), dst[0..n], n);
             return true;
         },
         17 => { // Q5_K
-            gemm_q5_k.dequantizeRowQ5_K(@as([*]const gemm_q5_k.BlockQ5_K, @ptrCast(@alignCast(src))), dst[0..n], n);
+            gemm_q5_k.dequantizeRowQ5_KVec(@as([*]const gemm_q5_k.BlockQ5_K, @ptrCast(@alignCast(src))), dst[0..n], n);
             return true;
         },
         18 => { // Q6_K
@@ -2985,7 +2985,7 @@ fn toFloatDispatch(t: u32, src: [*]const u8, dst: [*]f32, n: usize) bool {
             return true;
         },
         19 => { // Q8_K
-            gemm_q8_k.dequantizeRowQ8_K(@as([*]const gemm_q8_k.BlockQ8_K, @ptrCast(@alignCast(src))), dst[0..n], n);
+            gemm_q8_k.dequantizeRowQ8_KVec(@as([*]const gemm_q8_k.BlockQ8_K, @ptrCast(@alignCast(src))), dst[0..n], n);
             return true;
         },
         else => return false,

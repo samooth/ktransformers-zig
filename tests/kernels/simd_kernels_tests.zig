@@ -3173,3 +3173,119 @@ test "IQ1_S grid8s agrees with the format's own dequantizer on a negative-magnit
     }
     try testing.expect(negatives_seen > 0); // the block must exercise negatives
 }
+
+test "Q4_K vectorized dequant == scalar dequant, on fuzzed scale/min fields" {
+    // `dequantizeRowQ4_KVec` is a rewrite of the same math, so it is pinned
+    // against `dequantizeRowQ4_K`. The scale/min fields are FUZZED, not uniform:
+    // a uniform scale would let a wrong `getScaleMinK4` index pass, because every
+    // sub-block would then look alike. Same reasoning as the K-quant GEMM tests.
+    const q4 = kt.gemm_q4_k;
+    var st: u64 = 0x0DE0_0001;
+
+    for ([_]usize{ 1, 2, 5 }) |blocks| {
+        const k = blocks * q4.QK_K;
+        const nb = blocks;
+        try testing.expect(nb > 0); // a 0-block case would be vacuous
+        const w = try testing.allocator.alloc(q4.BlockQ4_K, nb);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = q4.f32_to_f16(0.05);
+            blk.dmin = q4.f32_to_f16(0.01);
+            for (&blk.scales) |*b| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @truncate(st >> 24);
+            }
+            for (&blk.qs) |*b| {
+                st = st *% 6364136223846793005 +% 1442695040888963407;
+                b.* = @truncate(st >> 24);
+            }
+        }
+        const got = try testing.allocator.alloc(f32, k);
+        defer testing.allocator.free(got);
+        const want = try testing.allocator.alloc(f32, k);
+        defer testing.allocator.free(want);
+        @memset(got, std.math.nan(f32));
+        @memset(want, std.math.nan(f32));
+
+        q4.dequantizeRowQ4_KVec(w.ptr, got, k);
+        q4.dequantizeRowQ4_K(w.ptr, want, k);
+
+        for (0..k) |i| {
+            try testing.expect(std.math.isFinite(got[i]));
+            // Both sides compute d1*(nibble) - m1 in the same order, so this is
+            // a bit-exact comparison, not a tolerance one.
+            try testing.expectEqual(want[i], got[i]);
+        }
+    }
+}
+
+test "Q8_K and Q5_K vectorized dequant == scalar, bit-exactly" {
+    // Same contract as the Q4_K pair: these are rewrites of the same math, pinned
+    // against the scalar body with FUZZED scales/mins and payloads. A uniform
+    // scale would let a wrong scale index pass.
+    //
+    // Q8_K's note: its `d` is f32, not f16 like the other K-quants. Writing
+    // `f16_to_f32(blk.d)` compiles nowhere near silently — it simply does not
+    // compile — but it is worth stating because it is the kind of copy-from-
+    // sibling that a future refactor could "fix" into a bug.
+    var st: u64 = 0x0DE0_0002;
+
+    // Q8_K
+    {
+        const q8 = kt.gemm_q8_k;
+        for ([_]usize{ 1, 3 }) |blocks| {
+            const k = blocks * q8.QK_K;
+            try testing.expect(blocks > 0);
+            const w = try testing.allocator.alloc(q8.BlockQ8_K, blocks);
+            defer testing.allocator.free(w);
+            for (w) |*blk| {
+                blk.d = 0.05;
+                for (&blk.qs) |*q| {
+                    st = st *% 6364136223846793005 +% 1442695040888963407;
+                    q.* = @bitCast(@as(u8, @truncate(st >> 24)));
+                }
+            }
+            const got = try testing.allocator.alloc(f32, k);
+            defer testing.allocator.free(got);
+            const want = try testing.allocator.alloc(f32, k);
+            defer testing.allocator.free(want);
+            q8.dequantizeRowQ8_KVec(w.ptr, got, k);
+            q8.dequantizeRowQ8_K(w.ptr, want, k);
+            for (0..k) |i| try testing.expectEqual(want[i], got[i]);
+        }
+    }
+
+    // Q5_K — fuzzes d, dmin, all 12 scale bytes, the qh high-bit plane and qs.
+    {
+        const q5 = kt.gemm_q5_k;
+        for ([_]usize{ 1, 2 }) |blocks| {
+            const k = blocks * q5.QK_K;
+            try testing.expect(blocks > 0);
+            const w = try testing.allocator.alloc(q5.BlockQ5_K, blocks);
+            defer testing.allocator.free(w);
+            for (w) |*blk| {
+                blk.d = q5.f32_to_f16(0.05);
+                blk.dmin = q5.f32_to_f16(0.01);
+                for (&blk.scales) |*b| {
+                    st = st *% 6364136223846793005 +% 1442695040888963407;
+                    b.* = @truncate(st >> 24);
+                }
+                for (&blk.qh) |*b| {
+                    st = st *% 6364136223846793005 +% 1442695040888963407;
+                    b.* = @truncate(st >> 24);
+                }
+                for (&blk.qs) |*b| {
+                    st = st *% 6364136223846793005 +% 1442695040888963407;
+                    b.* = @truncate(st >> 24);
+                }
+            }
+            const got = try testing.allocator.alloc(f32, k);
+            defer testing.allocator.free(got);
+            const want = try testing.allocator.alloc(f32, k);
+            defer testing.allocator.free(want);
+            q5.dequantizeRowQ5_KVec(w.ptr, got, k);
+            q5.dequantizeRowQ5_K(w.ptr, want, k);
+            for (0..k) |i| try testing.expectEqual(want[i], got[i]);
+        }
+    }
+}

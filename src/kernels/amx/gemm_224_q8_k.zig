@@ -99,6 +99,26 @@ pub fn quantizeRowQ8_K(src: []const f32, dst: [*]BlockQ8_K, k: usize) void {
 }
 
 /// ggml-quants.c:2807 dequantize_row_q8_K. k must be a multiple of 256.
+/// AVX2 Q8_K dequant. Bit-exact with `dequantizeRowQ8_K` by construction: the
+/// scalar body is `dst[out+j] = d * f32(qs[j])`, so widening the signed quats
+/// and multiplying by a broadcast `d` computes the same products in the same
+/// order.
+pub fn dequantizeRowQ8_KVec(src: [*]const BlockQ8_K, dst: []f32, k: usize) void {
+    std.debug.assert(k % QK_K == 0);
+    const nb = k / QK_K;
+    var out: usize = 0;
+    for (0..nb) |i| {
+        const blk = &src[i];
+        const dv: @Vector(8, f32) = @splat(blk.d); // Q8_K d is f32, unlike the other K-quants
+        inline for (0..QK_K / 8) |v| {
+            const raw: @Vector(8, i8) = @as(*align(1) const @Vector(8, i8), @ptrCast(&blk.qs[v * 8])).*;
+            const fv: @Vector(8, f32) = @floatFromInt(@as(@Vector(8, i32), @intCast(raw)));
+            dst[out + v * 8 ..][0..8].* = dv * fv;
+        }
+        out += QK_K;
+    }
+}
+
 pub fn dequantizeRowQ8_K(src: [*]const BlockQ8_K, dst: []f32, k: usize) void {
     std.debug.assert(k % QK_K == 0);
     const nb = k / QK_K;

@@ -1322,6 +1322,40 @@ regression: `expected 6400, found 6391` on a timing-sensitive worker-completion
 counter, with this stream touching neither `src/runtime/` nor the pool. Passes 3/3
 in isolation. Worth a retry bound if it ever reaches CI.
 
+**Stream L (mine) — P1.2 dequant-to-BF16 paths: Q4_K / Q5_K / Q8_K DONE, 3x.**
+
+The roadmap's "cheap first win", and the reason it is worth doing is leverage:
+this path sits in front of **all six K-quants** via `kt_to_float` /
+`kt_from_float`, so a vectorized dequant lifts every format that routes through
+it, not just one.
+
+Three of six done. Each `*Vec` is a **rewrite of the same math**, not a second
+definition of it, and each is pinned **bit-exactly** against the scalar body with
+fuzzed scales/mins and payloads — a uniform scale would let a wrong
+`getScaleMinK4` index pass, which is the same reason the K-quant GEMM tests fuzz
+their scale fields.
+
+| format | structure that makes it vectorizable |
+|---|---|
+| Q4_K | per 64 weights: 32 low nibbles sharing d1/m1, then 32 high sharing d2/m2 — 4 x Vec8 each with one broadcast scale |
+| Q5_K | same, plus Q5_K's 5th bit from `qh` (masked in, scaled by 16, no per-lane branch) |
+| Q8_K | `dst = d * f32(qs[j])` — widen and multiply |
+
+Measured on Q4_K at k=7168 (4 KB of weights -> 28 KB of f32): **4 us -> 1 us,
+3x, 18 GB/s of f32 out**, checksums **bit-identical** to the scalar path.
+
+Two format facts worth writing down because they are copy-from-sibling traps:
+- **Q8_K's `d` is f32**, not f16 like the other five K-quants. Writing
+  `f16_to_f32(blk.d)` does not compile, so this one is safe by accident.
+- **Q5_K's `qh` never advances.** It is indexed 0..32 for *every* chunk; chunks
+  are separated by shifting the hi-bit mask left by 2 each time. Advancing `qh`
+  per chunk would be the natural-looking bug.
+
+Still scalar in this path: **Q6_K, Q2_K, Q3_K** (6-bit, 2-bit and 3-bit payloads
+respectively — more unpacking per element than Q4/Q5's nibble, and Q2/Q3 need
+their shift-plane / k-map machinery). Also untouched: the `*ToBF16` wrappers,
+which still run a scalar f32->bf16 loop after the (now vectorized) dequant.
+
 **Stream K complete.** Next unclaimed work: roadmap P0.4's remaining INT4 families
 (raw-INT4 and GPTQ-INT4 kernels do not exist yet — another stream has claimed
 `gemm_224_int4.zig`), P1.2's dequant-to-BF16 paths, and P2.1's primitive

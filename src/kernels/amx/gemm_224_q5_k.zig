@@ -264,6 +264,66 @@ pub fn quantizeRowQ5_K(src: []const f32, dst: [*]BlockQ5_K, k: usize) void {
 }
 
 /// ggml-quants.c:1731 dequantize_row_q5_K. k must be a multiple of 256.
+const Dq5Vec: type = @Vector(8, f32);
+
+/// 8 packed nibbles -> 8 f32, plus the high-bit plane added in. `shift` 0 for the
+/// low nibbles, 4 for the high; `hi_mask` is the per-lane 0/1 high-bit plane from
+/// `qh` (Q5_K's 5th bit), which contributes 16 when set.
+inline fn nibHi8(p: *const u8, qh: *const u8, comptime shift: u4, hi_mask: u8) Dq5Vec {
+    const bytes: @Vector(8, u8) = @as(*align(1) const @Vector(8, u8), @ptrCast(p)).*;
+    const hb: @Vector(8, u8) = @as(*align(1) const @Vector(8, u8), @ptrCast(qh)).*;
+    const base: @Vector(8, u8) = if (shift == 0)
+        bytes & @as(@Vector(8, u8), @splat(0x0F))
+    else
+        bytes >> @as(@Vector(8, u4), @splat(shift));
+    // The mask is a runtime value (it shifts by 2 per chunk), so select the
+    // high bit as a 0/1 and scale by 16 rather than branching per lane.
+    const hit: @Vector(8, i32) = @intCast((hb >> @as(@Vector(8, u3), @splat(@intCast(@ctz(hi_mask)))) & @as(@Vector(8, u8), @splat(1))));
+    const sum: @Vector(8, i32) = @as(@Vector(8, i32), @intCast(base)) + hit * @as(@Vector(8, i32), @splat(16));
+    return @floatFromInt(sum);
+}
+
+/// AVX2 Q5_K dequant. Bit-exact with `dequantizeRowQ5_K`.
+///
+/// Same super-group structure as Q4_K (32 low nibbles sharing d1/m1, then 32 high
+/// sharing d2/m2), plus Q5_K's 5th bit: the high-bit plane lives in `qh`, is
+/// indexed 0..32 for EVERY chunk (the C reference never advances that pointer —
+/// chunks are separated by shifting the mask), and contributes 16 when set.
+pub fn dequantizeRowQ5_KVec(src: [*]const BlockQ5_K, dst: []f32, k: usize) void {
+    std.debug.assert(k % QK_K == 0);
+    const nb = k / QK_K;
+    var out: usize = 0;
+    for (0..nb) |i| {
+        const blk = &src[i];
+        const d = f16_to_f32(blk.d);
+        const min = f16_to_f32(blk.dmin);
+        var is: usize = 0;
+        var hi_mask1: u8 = 1;
+        var hi_mask2: u8 = 2;
+        var q_off: usize = 0;
+        var j: usize = 0;
+        while (j < QK_K) : (j += 64) {
+            var sc: u8 = undefined;
+            var m: u8 = undefined;
+            getScaleMinK4(is, &blk.scales, &sc, &m);
+            const d1: Dq5Vec = @splat(d * @as(f32, @floatFromInt(sc)));
+            const m1: Dq5Vec = @splat(min * @as(f32, @floatFromInt(m)));
+            getScaleMinK4(is + 1, &blk.scales, &sc, &m);
+            const d2: Dq5Vec = @splat(d * @as(f32, @floatFromInt(sc)));
+            const m2: Dq5Vec = @splat(min * @as(f32, @floatFromInt(m)));
+            inline for (0..4) |v| {
+                dst[out + v * 8 ..][0..8].* = d1 * nibHi8(&blk.qs[q_off + v * 8], &blk.qh[v * 8], 0, hi_mask1) - m1;
+                dst[out + 32 + v * 8 ..][0..8].* = d2 * nibHi8(&blk.qs[q_off + v * 8], &blk.qh[v * 8], 4, hi_mask2) - m2;
+            }
+            out += 64;
+            q_off += 32;
+            is += 2;
+            hi_mask1 <<= 2;
+            hi_mask2 <<= 2;
+        }
+    }
+}
+
 pub fn dequantizeRowQ5_K(src: [*]const BlockQ5_K, dst: []f32, k: usize) void {
     std.debug.assert(k % QK_K == 0);
     const nb = k / QK_K;

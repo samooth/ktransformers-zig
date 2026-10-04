@@ -65,7 +65,8 @@ comptime {
     _ = &gemm_q4_k.nearestInt;
     _ = &gemm_q4_k.getScaleMinK4;
     _ = &gemm_q4_k.quantizeRowQ4_K;
-    _ = &gemm_q4_k.dequantizeRowQ4_K;
+    _ = &gemm_q4_k.dequantizeRowQ4_K; // oracle
+    _ = &gemm_q4_k.dequantizeRowQ4_KVec;
     _ = &gemm_q4_k.dequantizeRowQ4_KToBF16;
     _ = &gemm_q4_k.gemmQ4_KScalar;
     _ = &gemm_q6_k.BlockQ6_K;
@@ -83,12 +84,14 @@ comptime {
     _ = &gemm_q5_k.getScaleMinK4;
     _ = &gemm_q5_k.quantizeRowQ5_K;
     _ = &gemm_q5_k.dequantizeRowQ5_K;
+    _ = &gemm_q5_k.dequantizeRowQ5_KVec;
     _ = &gemm_q5_k.dequantizeRowQ5_KToBF16;
     _ = &gemm_q5_k.gemmQ5_KScalar;
     _ = &gemm_q8_k.BlockQ8_K;
     _ = &gemm_q8_k.nearestInt;
     _ = &gemm_q8_k.quantizeRowQ8_K;
     _ = &gemm_q8_k.dequantizeRowQ8_K;
+    _ = &gemm_q8_k.dequantizeRowQ8_KVec;
     _ = &gemm_q8_k.dequantizeRowQ8_KToBF16;
     _ = &gemm_q8_k.gemmQ8_KScalar;
     _ = &gemm_q2_k.BlockQ2_K;

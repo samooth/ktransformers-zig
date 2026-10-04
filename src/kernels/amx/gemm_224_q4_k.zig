@@ -248,6 +248,66 @@ pub fn quantizeRowQ4_K(src: []const f32, dst: [*]BlockQ4_K, k: usize) void {
 }
 
 /// ggml-quants.c:1529 dequantize_row_q4_K. k must be a multiple of 256.
+/// AVX2 Q4_K dequant: 256 f32 per block, all of them written.
+///
+/// Identical output to `dequantizeRowQ4_KScalar` — this is a rewrite of the same
+/// math, not a second definition of it, and the test below pins them against each
+/// other on random blocks with fuzzed scale/min fields (a uniform scale would let
+/// a wrong scale index pass).
+///
+/// The structure that makes it vectorizable: each 64-weight super-group pair
+/// reads 32 bytes and emits the 32 LOW nibbles first (sharing one d1/m1) and then
+/// the 32 HIGH nibbles (sharing d2/m2). So each half is 4 x Vec8 with a single
+/// broadcast scale and min — 8 lanes of `d1*m - m1` per multiply, instead of one
+/// multiply per element.
+///
+/// This is on the path in front of ALL SIX K-quants: `kt_to_float` /
+/// `kt_from_float` route through here, and it is the first thing a caller touches
+/// when converting a checkpoint.
+const DeqVec: type = @Vector(8, f32);
+
+/// 8 packed nibbles -> 8 f32. `shift` 0 for the low nibbles, 4 for the high.
+inline fn nib8(p: *const u8, comptime shift: u4) DeqVec {
+    const bytes: @Vector(8, u8) = @as(*align(1) const @Vector(8, u8), @ptrCast(p)).*;
+    const n: @Vector(8, u8) = if (shift == 0)
+        bytes & @as(@Vector(8, u8), @splat(0x0F))
+    else
+        bytes >> @as(@Vector(8, u4), @splat(shift));
+    return @floatFromInt(@as(@Vector(8, u32), @intCast(n)));
+}
+
+pub fn dequantizeRowQ4_KVec(src: [*]const BlockQ4_K, dst: []f32, k: usize) void {
+    std.debug.assert(k % QK_K == 0);
+    const nb = k / QK_K;
+    var out: usize = 0;
+    for (0..nb) |i| {
+        const blk = &src[i];
+        const d = f16_to_f32(blk.d);
+        const min = f16_to_f32(blk.dmin);
+        var q_off: usize = 0;
+        var is: usize = 0;
+        var j: usize = 0;
+        while (j < QK_K) : (j += 64) {
+            var sc: u8 = undefined;
+            var m: u8 = undefined;
+            getScaleMinK4(is, &blk.scales, &sc, &m);
+            const d1: DeqVec = @splat(d * @as(f32, @floatFromInt(sc)));
+            const m1: DeqVec = @splat(min * @as(f32, @floatFromInt(m)));
+            getScaleMinK4(is + 1, &blk.scales, &sc, &m);
+            const d2: DeqVec = @splat(d * @as(f32, @floatFromInt(sc)));
+            const m2: DeqVec = @splat(min * @as(f32, @floatFromInt(m)));
+            // 32 low nibbles, then 32 high — matching the scalar order exactly.
+            inline for (0..4) |v| {
+                dst[out + v * 8 ..][0..8].* = d1 * nib8(&blk.qs[q_off + v * 8], 0) - m1;
+                dst[out + 32 + v * 8 ..][0..8].* = d2 * nib8(&blk.qs[q_off + v * 8], 4) - m2;
+            }
+            out += 64;
+            q_off += 32;
+            is += 2;
+        }
+    }
+}
+
 pub fn dequantizeRowQ4_K(src: [*]const BlockQ4_K, dst: []f32, k: usize) void {
     std.debug.assert(k % QK_K == 0);
     const nb = k / QK_K;
