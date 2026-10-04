@@ -5,13 +5,14 @@
 const std = @import("std");
 const amx = @import("../arch/amx.zig");
 const buffers = @import("buffers.zig");
+const fp8 = @import("gemm_224_fp8.zig");
 
 // ============================================================================
 // MXFP8 Type (E4M3 with microscaling)
 // ============================================================================
 
-/// Reuse FP8 E4M3 from fp8 kernel
-pub const fp8_e4m3 = u8;
+/// Reuse FP8 E4M3 from fp8 kernel: the alias now lives with the rest of the
+/// imported codec further down, next to the other re-exports.
 
 /// MXFP8 block: 32 FP8 weights + 1 scale (BF16) = 34 bytes
 /// MXFP8 group: 32 FP8 E4M3 values sharing one scale.
@@ -60,109 +61,36 @@ pub fn f32_to_ue8m0(x: f32) u8 {
     return @intCast(std.math.clamp(rounded + 127, 0, 255));
 }
 
-/// FP8 E4M3 conversion (from gemm_224_fp8.zig)
-const E4M3_MAX: f32 = 448.0;
+// ============================================================================
+// E4M3 codec — IMPORTED, NOT COPIED
+// ============================================================================
+//
+// This file used to own a second copy of `FP8_E4M3_LUT`, `fp8e4m3_to_f32` and
+// `f32_to_fp8e4m3`, and the two copies drifted: the MX encoder was rewritten
+// (correctly, four real bugs) while `gemm_224_fp8.zig` kept all four of its own,
+// and the MX decoder's replacement was written out again there. Two editable
+// copies of a codec is a future bug report, so `gemm_224_fp8.zig` is now the
+// single owner and this file re-exports its names, which keeps every existing
+// caller (`root.zig`, `src/main.zig`, the test suites) working unchanged.
+//
+// Same-layer data sharing is the pattern the sentrux rules describe for the
+// grid/lookup tables (`gemm_224_iq1_s.zig` owns `IQ1S_GRID` for its siblings);
+// this is the same thing one level up.
 
-/// FP8 E4M3 -> f32, via the 256-entry table.
-///
-/// This is the SAME table the reference builds in
-/// `operators/avx2/fp8_dequant.hpp::FP8LUT::init` and that
-/// `gemm_224_fp8.zig` now owns. It replaced a pure bit-reconstruction decoder
-/// that was wrong twice over: subnormals (exp field 0) were decoded as normals
-/// (~1.0-2.0 instead of `man/8 * 2^-6`), and 0x7F — the only NaN encoding in
-/// E4M3 — decoded to 480.0, above E4M3_MAX. `gemm_224_fp8.zig` carries the
-/// full rationale; TODO.md records the follow-up to de-duplicate the codec
-/// into a single owner once that file is not mid-change by another stream.
-pub const FP8_E4M3_LUT: [256]f32 = blk: {
-    var t: [256]f32 = undefined;
-    for (0..256) |i| {
-        const sign: f32 = if (i & 0x80 != 0) -1.0 else 1.0;
-        const e = (i >> 3) & 0x0F;
-        const man = i & 0x07;
-        // Built from the f32 exponent field, NOT std.math.ldexp: ldexp takes a
-        // `comptime_float`/f32 union and fails to evaluate at comptime in Zig
-        // 0.16 ("access of union field 'float' while field 'comptime_float' is
-        // active", plus a branch-quota overflow). Setting exponent = e + 120
-        // and mantissa = man << 20 gives 2^(e-7) * (1 + man/8) exactly, and
-        // 2^-9 is representable so the subnormal product is exact too.
-        const mag: f32 = if (e == 0)
-            @as(f32, @floatFromInt(man)) * 0.001953125 // man * 2^-9 = man/8 * 2^-6
-        else if (e == 15 and man == 7)
-            0.0 // the one NaN encoding; decode as 0 so it cannot poison a tile
-        else
-            @bitCast(@as(u32, @as(u32, e) + 120) << 23 | @as(u32, man) << 20);
-        t[i] = sign * mag;
-    }
-    break :blk t;
-};
-
-pub fn fp8e4m3_to_f32(x: fp8_e4m3) f32 {
-    return FP8_E4M3_LUT[x];
-}
-
-/// f32 -> FP8 E4M3, round-to-nearest-even.
-///
-/// Rewritten because the version it replaces was wrong in four ways, all of
-/// them reachable from ordinary weight data:
-///
-///  1. The 3-bit mantissa round-overflow was MASKED (`rounded_mant & 0x7`)
-///     instead of carried into the exponent, so every value whose mantissa
-///     rounded up from 7 encoded one power of two too small — 3.875 became
-///     0x40 (2.0) instead of 0x48 (4.0). That is a 2x error on 1/16 of the
-///     whole normal range.
-///  2. Saturation returned 0x7F / 0xFF, which are the NaN encodings, so any
-///     weight above E4M3_MAX became NaN. The largest FINITE encoding is 0x7E
-///     (exp 15, man 6) = 448.
-///  3. Every subnormal was flushed to zero — the `|x| < 2^-9` guard discarded
-///     all seven valid subnormal encodings, and the `e4m3_exp < 0` guard
-///     mis-encoded the [2^-7, 2^-6) band into the subnormal field.
-///  4. Rounding was round-half-up rather than round-to-nearest-even.
-///
-/// `gemm_224_fp8.zig` carries the same four bugs in its own copy of this
-/// function; see TODO.md, which records it as an open item for that stream.
-pub fn f32_to_fp8e4m3(x: f32) fp8_e4m3 {
-    if (std.math.isNan(x)) return if (std.math.signbit(x)) 0xFF else 0x7F;
-
-    const s: u8 = if (std.math.signbit(x)) 0x80 else 0x00;
-    const a = @abs(x);
-
-    // 0x7E = 448 is the largest finite encoding; 0x7F is NaN.
-    if (a >= E4M3_MAX) return s | 0x7E;
-
-    // Subnormal band: value = man * 2^-9 with man in 0..7. 2^-9 is exactly
-    // representable, so scaling by 512 is exact and the rounding below is
-    // exact too. A result of 8 means it rounded up past the subnormals and
-    // belongs in the normal band as 0x08 (2^-6).
-    if (a < 0.015625) {
-        const scaled = a * 512.0;
-        const fl = @floor(scaled);
-        var man: u8 = @intFromFloat(fl);
-        const frac = scaled - fl;
-        if (frac > 0.5 or (frac == 0.5 and (man & 1) == 1)) man += 1;
-        return s | (if (man >= 8) 0x08 else man);
-    }
-
-    const u: u32 = @bitCast(a);
-    const exp = @as(i32, @intCast((u >> 23) & 0xFF)) - 127;
-    const mant = u & 0x007FFFFF;
-
-    var e_out: u8 = @intCast(exp + 7); // bias 7
-    const m3 = (mant >> 20) & 0x7;
-    const round_bit = (mant >> 19) & 1;
-    const sticky = mant & 0x7FFFF != 0;
-    var mm: u8 = @intCast(m3);
-    // Round-to-nearest-even: round up on >half, or on an exact half when the
-    // retained value is odd (so 2.5 -> 2, not 3).
-    if (round_bit == 1 and (sticky or (m3 & 1) == 1)) mm += 1;
-    // Carry the mantissa overflow into the exponent. THIS IS THE FIX for the
-    // 2x error; masking it here is what broke 3.875.
-    if (mm == 8) {
-        mm = 0;
-        e_out += 1;
-    }
-    if (e_out > 15) return s | 0x7E; // 2^9 and up saturate
-    return s | (e_out << 3) | mm;
-}
+/// E4M3 -> f32, via the 256-entry table. Owned by `gemm_224_fp8.zig`, which
+/// carries the rationale: the bit-reconstruction decoder this replaced was
+/// wrong for the subnormals (exp field 0 read as normal, up to 1024x too large)
+/// and for 0x7F, the only NaN encoding, which it returned as 480.0 — above
+/// E4M3_MAX and therefore not even representable.
+pub const fp8_e4m3 = fp8.fp8_e4m3;
+pub const E4M3_MAX = fp8.E4M3_MAX;
+pub const FP8_E4M3_LUT = fp8.FP8_E4M3_LUT;
+pub const fp8e4m3_to_f32 = fp8.fp8e4m3_to_f32;
+/// f32 -> E4M3, round-to-nearest-even, saturating at 0x7E. The four bugs it
+/// used to carry in THIS file are fixed in the copy that is now the owner; see
+/// `gemm_224_fp8.zig::f32_to_fp8e4m3` for them, and TODO.md for the case that
+/// exposed the remaining copy (500.0 -> 0x7F -> 0.0).
+pub const f32_to_fp8e4m3 = fp8.f32_to_fp8e4m3;
 
 // ============================================================================
 // Kernel Configuration for MXFP8

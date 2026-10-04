@@ -8,8 +8,16 @@ const amx = @import("../arch/amx.zig");
 const buffers = @import("buffers.zig");
 
 // ============================================================================
-// FP8 E4M3 Type
+// FP8 E4M3 Type — THE SINGLE OWNER OF THE CODEC
 // ============================================================================
+//
+// `gemm_224_mxfp8.zig` imports this file's codec from here and keeps only its
+// MX-specific parts. It used to carry its own copy of all three functions, and
+// that is exactly how the two copies drifted: the MX encoder was rewritten
+// (correctly) while this one kept all four of its bugs, and the MX decoder's
+// replacement was then written out again here. Two editable copies of a codec
+// is not a redundancy, it is a future bug report. If you need E4M3
+// encode/decode, import it; do not re-derive it.
 
 /// FP8 E4M3 format: 1 sign bit, 4 exponent bits, 3 mantissa bits
 /// Range: ~0.00195 to 448.0
@@ -19,33 +27,71 @@ pub const fp8_e4m3 = u8;
 pub const E4M3_MAX: f32 = 448.0;
 pub const E4M3_MIN: f32 = 0.001953125; // 2^-9
 
-/// Convert f32 to FP8 E4M3 (saturate to range)
+/// f32 -> FP8 E4M3, round-to-nearest-even, saturating.
+///
+/// The version this replaces was wrong in four ways, all reachable from
+/// ordinary weight data and all measured at 2026-10-04 (see TODO.md Stream B):
+///
+///  1. The 3-bit mantissa round-overflow was MASKED (`rounded_mant & 0x7`)
+///     instead of carried into the exponent, so every value whose mantissa
+///     rounded up from 7 encoded one power of two too small — 3.875 became
+///     0x40 (2.0) instead of 0x48 (4.0). A 2x error on 1/16 of the whole
+///     normal range.
+///  2. Saturation returned 0x7F / 0xFF, which are the NaN encodings, so any
+///     weight above E4M3_MAX became NaN: 500.0 encoded to 0x7F, which the
+///     decoder then maps to 0.0, so an over-range weight was silently DELETED.
+///     The largest FINITE encoding is 0x7E (exp 15, man 6) = 448.
+///  3. Every subnormal was flushed to zero — the `|x| < 2^-9` guard discarded
+///     all seven valid subnormal encodings, and the `e4m3_exp < 0` guard
+///     mis-encoded the [2^-7, 2^-6) band into the subnormal field.
+///  4. Rounding was round-half-up rather than round-to-nearest-even.
+///
+/// This is live in the C ABI: `kt_fp8_quantize`, `kt_fp8_quantize_block` and
+/// `kt_quantize_fp8_e4m3` all call it (src/main.zig:2020, 2058, 2540), as does
+/// `quantizeRowBF16ToFP8` below. Identical to the encoder `gemm_224_mxfp8.zig`
+/// carried before the two were merged here.
 pub fn f32_to_fp8e4m3(x: f32) fp8_e4m3 {
-    if (x > E4M3_MAX) return 0x7F; // max positive
-    if (x < -E4M3_MAX) return 0xFF; // max negative
-    if (@abs(x) < E4M3_MIN and x != 0) {
-        // Subnormal or zero
-        return if (x < 0) 0x80 else 0x00;
+    if (std.math.isNan(x)) return if (std.math.signbit(x)) 0xFF else 0x7F;
+
+    const s: u8 = if (std.math.signbit(x)) 0x80 else 0x00;
+    const a = @abs(x);
+
+    // 0x7E = 448 is the largest finite encoding; 0x7F is NaN.
+    if (a >= E4M3_MAX) return s | 0x7E;
+
+    // Subnormal band: value = man * 2^-9 with man in 0..7. 2^-9 is exactly
+    // representable, so scaling by 512 is exact and the rounding below is
+    // exact too. A result of 8 means it rounded up past the subnormals and
+    // belongs in the normal band as 0x08 (2^-6).
+    if (a < 0.015625) {
+        const scaled = a * 512.0;
+        const fl = @floor(scaled);
+        var man: u8 = @intFromFloat(fl);
+        const frac = scaled - fl;
+        if (frac > 0.5 or (frac == 0.5 and (man & 1) == 1)) man += 1;
+        return s | (if (man >= 8) 0x08 else man);
     }
 
-    // Simple conversion: extract sign, exponent, mantissa
-    const u = @as(u32, @bitCast(x));
-    const sign = (u >> 31) & 1;
+    const u: u32 = @bitCast(a);
     const exp = @as(i32, @intCast((u >> 23) & 0xFF)) - 127;
     const mant = u & 0x007FFFFF;
 
-    // E4M3: bias = 7, so exp + 7
-    const e4m3_exp = exp + 7;
-    if (e4m3_exp < 0) return if (sign == 1) 0x80 else 0x00; // underflow to zero
-    if (e4m3_exp > 15) return if (sign == 1) 0xFF else 0x7F; // overflow to max
-
-    // 3 mantissa bits (round)
+    var e_out: u8 = @intCast(exp + 7); // bias 7
     const m3 = (mant >> 20) & 0x7;
     const round_bit = (mant >> 19) & 1;
-    const rounded_mant = if (round_bit == 1) m3 + 1 else m3;
-
-    const result: u8 = (@as(u8, @intCast(e4m3_exp)) << 3) | @as(u8, @intCast(rounded_mant & 0x7));
-    return if (sign == 1) result | @as(u8, 0x80) else result;
+    const sticky = mant & 0x7FFFF != 0;
+    var mm: u8 = @intCast(m3);
+    // Round-to-nearest-even: round up on >half, or on an exact half when the
+    // retained value is odd (so 2.5 -> 2, not 3).
+    if (round_bit == 1 and (sticky or (m3 & 1) == 1)) mm += 1;
+    // Carry the mantissa overflow into the exponent. THIS IS THE FIX for the
+    // 2x error; masking it here is what broke 3.875.
+    if (mm == 8) {
+        mm = 0;
+        e_out += 1;
+    }
+    if (e_out > 15) return s | 0x7E; // 2^9 and up saturate
+    return s | (e_out << 3) | mm;
 }
 
 /// FP8 E4M3 -> F32 lookup table, built at comptime.
