@@ -271,26 +271,59 @@ experiment.
 
 ---
 
-### P0.4 — INT4 families · `gemm_224_int4.zig` (+ raw-INT4 / GPTQ-INT4)
+### P0.4 — INT4 families · `gemm_224_int4.zig` — **DONE** (GPTQ), with the plan's primitive corrected
 
-**Why:** the reference has three AVX2 INT4 kernels (`rawint4-moe` with 18
-intrinsics, `gptq_int4-moe`, `gptq_int4_avxvnni-moe`) — the most INT4 coverage
-of any family. Zig has one `gemm_224_int4.zig` (GPTQ-style groups of 32 with
-scales+zero-points) and no raw-INT4 kernel.
+**The plan below prescribed the wrong instruction, and the reference proves it.**
+It said to unpack with `vpshufb`. GPTQ-INT4 is **affine** in the nibble -
+`w = (q - 8) * d` - so the conversion is one `vcvtdq2ps` plus one FMA, and a
+lookup table only pays for a NON-linear codebook. The reference's own
+`gptq_int4_dequant.hpp` agrees: `vpsrlvd` + `vpand` + `cvtepi32_ps` + `sub` +
+`mul`, with no shuffle and no LUT anywhere in the file. Do not reach for
+`pshufb` on an affine format; that is the FP8/IQ shape, not this one.
 
-**What to do.** GPTQ-INT4 is the friendliest: 4-bit values, a scale and a
-zero-point per 32-element group, so it is a `vpshufb` unpack plus an
-`vfmadd` chain with a per-group scale and subtract. Raw-INT4 is the simplest
-(nibble unpack, one global scale). The `_avxvnni` variants need VNNI — out of
-scope on this host, keep the scalar path as the fallback.
+What the reference's variable shift *does* buy is the nibble interleave: the
+block is byte-interleaved, so bits 4t..4t+3 of the little-endian u32 over bytes
+0..3 are exactly weights 0..7 - one broadcast, one `vpsrlvd`, one mask.
 
-**Also:** there is no raw-INT4 kernel in Zig at all. Either add one or record
-deliberately that INT4 covers GPTQ only.
+**Delivered** (`2b6dbb7` kernel, `464252a` tests, `4e6e245` bench, `c9b52f6`
+results plus the raw-INT4 decision). Three things that matter, in order:
 
-**Acceptance.** Existing INT4 tests (`16x16x32 identity`, partial-group case)
-pass; new GEMM-vs-dequantized-reference test.
+1. **Bit-exactness is a GUARANTEE here, not a passing test.** i8 activations and
+   4-bit weights make every product and partial sum an exact integer times an
+   8-bit significand, and the tests hold activations to `|a| <= 8` so the integer
+   sum stays under 2^16. Nothing in that chain can round. Anyone changing this
+   kernel may rely on exactness **only while that precondition holds** - relax the
+   activation bound and the oracle stops being bit-comparable, which is the trap
+   to know about before trying to optimise it.
+2. **The decode is 47% of the inner loop, and that is the headroom.** 43
+   instructions per 32 weights, of which 20 are decode; a decode-free variant is
+   about 2x. There is no cheap fix - five ops per 8 weights is the arithmetic
+   floor for an f32 result. The two routes past it are an integer `vpmaddubsw`
+   dot needing the per-group activation-sum correction, or an AVX-512 `vpermb`
+   path. **The first route is exactly the raw-INT4 trick**, so the ABI question
+   below and this 2x are the same piece of code.
+3. **Do not quote the 15-24x as kernel quality.** The scalar baseline is
+   pathological: ~13 cycles/weight, two multiplies per weight into a serial f32
+   add chain, against 4-5 for the K-quant scalars on the same shape. What the
+   speedup establishes is the loop order. The GB/s column is the number to carry,
+   and it has no floor yet - `cpp_bench.cpp` has no INT4 coverage, so the harness
+   can produce absolute throughput plus a control arm here, but not a ratio.
 
----
+**Raw-INT4: deliberately not done, and it is an ABI question, not a missing
+trick.** `KT_TYPE_I4` is the GPTQ block (18 B per 32 weights), a different
+layout; there is no in-tree consumer (`kt_matmul_int4` takes the GPTQ block); and
+the scale is a separate `scales[n * k/group]` array with a runtime group size
+where GPTQ's is fixed at 32 - a different signature, not a flag. It is ~40 lines
+once the header lands, and `nibble8` is already
+`rawint4_dequant_8x4bit_unscaled` with `d = 1`. The decision deferred is whether
+to fold the scale per group (the reference's way; needs an hsum per group per
+output) or into the weights (needs none, but makes the accumulator non-integer).
+The bit-exact oracle does **not** carry over, because raw-INT4 activations are
+bf16.
+
+**The original acceptance, for the record.** Existing INT4 tests (`16x16x32`
+identity, partial-group case) pass; new GEMM-vs-dequantized-reference test.
+
 
 ### P0.5 — Q8_0 GEMM · `gemm_224_q8_0.zig` — **DONE** (4x at m=1, 13x at m=4/m=8)
 
@@ -311,6 +344,22 @@ root.zig comptime ref. `gemmQ8_0Scalar` stays as the oracle.
 | 8 | 90 ms | 6 ms | 13x |
 
 at n=2048, k=7168, pinned, ReleaseFast, best of 5.
+
+**READ THE FORMAT IN EVERY Q8 FIGURE IN THIS FILE.** Q8_0 and Q8_K are different
+formats at different weights-per-byte, and both appear here:
+
+| format | bytes/weight | recorded | where |
+|---|---|---|---|
+| **Q8_0** | 1.0625 | **7.8 GB/s** at m=1 | P0.5, this entry |
+| **Q8_K** | 2.25 | **13.19 GB/s** | P0.1 tables, two places |
+
+They are **not comparable**, and treating them as one "Q8" number has already
+misled: the INT4 session took a Q8_0 control (correctly computed at 1.063
+B/weight) and compared it against the 13.19 GB/s recorded for **Q8_K**, and read
+the host as 5x slower than it was — the same-format gap is about 3x, and a
+control measured in the SAME run cancels the host out entirely. Use the 7.8 GB/s
+above, or better a same-run control. See `docs/measuring.md`.
+
 
 **This entry is also the evidence for P0.3's open question.** Q8_0 needs no
 lookup table — its i8→f32 step is pure `vpmovsxbd` + `vcvtdq2ps` — and reaches
@@ -454,6 +503,29 @@ bf16 widening. Move it (and a matching RNE narrowing store) to
 `src/kernels/arch/amx.zig` so P0.1-P0.4 share one copy. **Do this first** — it
 is the one change that makes the parallel streams easier, and it is the only
 item here that requires editing `arch/amx.zig` (coordinate via a CLAIM).
+
+
+**CONSTRAINT, learned the hard way: the shared thing is the SHAPE; the primitive
+is per-format. Do NOT put `vpshufb` in a shared driver.**
+
+- `pshufb` buys a **non-linear** codebook (FP8 E4M3/E5M2, the IQ families). It is
+  the wrong primitive for an **affine** one: GPTQ-INT4 is `w = (q-8)*d`, and the
+  reference's `gptq_int4_dequant.hpp` contains no shuffle and no LUT at all.
+  Importing `pshufb` for every format would give the affine formats a dependency
+  they do not need, and a slower path besides.
+- Formats that legitimately share a driver should **instantiate** it. FP8's
+  `gemmAvx2With(decode8, tailDot)` takes the two format-specific steps as comptime
+  parameters, so `gemmAvx2E5M2` is a wrapper and not a second copy of the loop.
+  That is the shape to converge on: a driver with a **decode slot**, each format
+  supplying its own decode.
+- **"Left local" must mean local file with an identical shape, not a local file
+  with a private shape.** There are now three hand-written GEMM bodies (K-quant via
+  `kquant_simd`, FP8, INT4). Two duplications have already cost us: the
+  E4M3/MXFP8 codec pair, and `gemmAvx2E5M2` before it was parameterised. INT4 is
+  the newest, and writing it in the instantiable shape is what makes a future
+  shared driver a one-argument move rather than a rewrite. `kquant_simd` hardcodes
+  bf16 activations and per-format `QK` asserts, which is why INT4 and FP8 are not
+  in it — a reason to keep them out, not a reason to let the shapes drift.
 
 ---
 
