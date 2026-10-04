@@ -1,5 +1,11 @@
-// CLAIM: swiglu-regalloc — bench/cpp_vs_zig measurement harness — 2026-10-04
-// — holds bench/cpp_vs_zig/ until committed. Touches no build.zig step.
+// CLAIM: bench-harness — the measurement harness (Stream O) — 2026-10-04
+// Holds bench/cpp_vs_zig/ until committed. See TODO.md Stream O.
+//
+// This directory had NO claim while three sessions were editing it, and
+// measure.zig was swept by another commit three times — twice leaving HEAD
+// not compiling. A marker does not prevent that; tools/check_staged_claims.sh
+// does. Until it is wired as a hook, check `git status` for this path before
+// you commit anything in it.
 
 // bench/cpp_vs_zig/measure.zig — trustworthy ratios for the C++/Zig comparison.
 //
