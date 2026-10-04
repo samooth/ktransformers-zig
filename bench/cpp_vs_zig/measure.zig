@@ -41,6 +41,11 @@
 //
 //   zig run bench/cpp_vs_zig/measure.zig -- [options] [filter]
 //
+// NOTE the `--` before the options. `zig run` treats everything after the
+// script as its own arguments unless the separator is there, so omitting it
+// makes the tool silently ignore --iters/--pin/--self-test and run with
+// defaults. It fails confusingly rather than loudly.
+//
 //   filter          only rows whose label contains this substring
 //   --iters N       process invocations per arm (default 5, minimum 3)
 //   --cpp PATH      C++ harness   (default bench/cpp_vs_zig/cpp_bench)

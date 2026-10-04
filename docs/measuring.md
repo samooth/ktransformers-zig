@@ -11,16 +11,41 @@ answer from different directions.
 If the control cannot resolve the difference, print "below the noise floor" and
 stop. A number that invites a decision it cannot support is worse than no number.
 
-## The noise floor is 14–23%
+## The noise floor is load-dependent, not a constant
 
-A copy of a binary that was byte-identical to the baseline differed from it by
-**14% to 23%** on the same shapes, interleaved, pinned, min-of-N. This is the
-single most important fact on this page:
+**This section previously said "the noise floor is 14-23%" and "nothing under
+~25% is measurable". Both were wrong, and wrong in the exact way this document
+exists to prevent: a measurement taken under load was generalised into a law, by
+me, about noise.**
 
-- **Nothing under ~25% is measurable.**
-- A reported "1.2x" on this host is indistinguishable from a 23% regression.
-- If a change is real, it should be worth far more than 25% — the kernel work
-  that landed landed at 3x–165x, not 1.2x.
+The 14-23% figures are real but they were measured at **load 17-80 on 16
+cores**. Re-measured with a control arm on each side
+(`bench/cpp_vs_zig/measure.zig`, three passes each), the floor tracks load:
+
+| load average (16 cores) | measured floor | what resolves |
+|---|---|---|
+| **2 - 4** | **1.02x - 1.14x** | most rows, including `m>=8` GEMM |
+| 17 - 27 | ~1.17x | fewer |
+| ~80 | ~1.25x | little |
+
+So the corrected rule:
+
+- **On a quiet box the floor is ~1.02-1.14x, not 1.25x.** A 15-20% difference is
+  measurable there, and the five-format IQ and the `m>=8` GEMM rows are all in
+  that band.
+- **The floor must be measured in the same pass as the number it judges**, with a
+  same-code control arm on each side. Never quote a floor from an earlier
+  session, and never quote a ratio without the floor beside it.
+- **State the load average with every figure.** It is not context, it is the
+  variable that sets whether the figure means anything.
+- **Prefer a quiet box to more iterations.** Going from load 80 to load 3 moved
+  the floor from 1.25x to 1.04x; going from 3 to 9 iterations on a busy box does
+  not buy the same thing, because the spread being measured is the host's, and
+  more samples of a noisy host estimate the same noisy host.
+
+The general form of the mistake is worth stating, since I made it here: a floor
+measured under one condition and quoted under another is not a conservative
+estimate, it is a fabricated one. It reads as rigor and delivers the opposite.
 
 ## Absolute time moves by up to 3x with load
 
@@ -82,6 +107,56 @@ Two further rules:
   questionable. A 165x speedup against a 55-cycles-per-weight baseline is a
   statement about the baseline, not about the kernel. `1.26 GB/s at m=1` places a
   format correctly next to its siblings; `69x` places it nowhere.
+
+## Adding an enum variant: iterate the enum, never a hand-written list
+
+This is a shape failure, not a review failure, and it is worth separating those
+two things because "be careful" does not fix it.
+
+What happened, concretely: `bench/cpp_vs_zig/measure.zig` grew a **fourth arm**
+(a same-code control on the Zig side, so the floor could bound both sides of a
+quotient). Four loops iterate the arms. Two of the four were updated to name all
+four; two still listed three. The two that were missed are exactly the ones that
+computed the statistics, so `ctl`'s `lo`/`hi`/`best` stayed `undefined` — and
+**the Zig-side control contributed nothing to any floor, silently.** Half the
+measurement was missing from every number the tool printed.
+
+Three things made it survive:
+
+- `undefined` in ReleaseFast is usually benign. The floors came out plausible
+  and nobody could tell.
+- A `TODO`-free, compiling, plausible-output state is not a state any review
+  flags. It looks finished.
+- It only became visible as an `inf` floor under `--self-test`, and the
+  Debug-mode allocator was reporting six *arena* leaks at the same moment, which
+  is what actually led me to look.
+
+The fix is one line, and it is a shape fix:
+
+```zig
+// WRONG: adding a variant means finding every tuple that lists them.
+for ([_]Arm{ .cpp, .zig, .ctl }) |arm| { ... }
+
+// RIGHT: adding a variant cannot break it.
+for (std.enums.values(Arm)) |arm| { ... }
+```
+
+The same applies to every dispatch table, every `inline for` over a
+hand-maintained tuple of cases, every "and the third call site" edit. I had four
+call sites and edited three; that is not carelessness, it is the shape inviting
+it. Anything that enumerates cases should enumerate the enum.
+
+Two habits that follow from the same incident:
+
+- **Initialise aggregates to a defined value, not `undefined`,** when they are
+  filled by a loop. `undefined` turns a missed iteration into a wrong-but-finite
+  number that survives review. `@splat(0)` turns it into something a self-test
+  catches.
+- **A self-test is only an asset if it can fail.** The whole reason this was
+  caught is that `--self-test` asserts something checkable — with both arms the
+  same binary the true ratio is 1.0, so every row must read UNMEASURABLE. A
+  check that cannot fail is a comment, and the previous two implementations of
+  the floor passed a casual read while failing it.
 
 ## Benchmarks that do not exercise the kernel
 
