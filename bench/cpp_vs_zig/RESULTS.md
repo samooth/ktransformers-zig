@@ -275,34 +275,61 @@ independent measurements, so each side contributes error and the two compound.
 The distinction is asserted in the code so the ratio path cannot be "simplified"
 onto one control later.
 
-INT4 GPTQ is the first row in this mode, and it is the first row in the Zig
-harness with **i8 activations** — which is the axis `kquant_simd.gemmBF16xQuant`
-hardcodes (`widen16`), so the tree's "shared driver" cannot express INT4 or the
-INT8 path at all today. The row is the evidence for why that driver needs a
-decode slot and a widening slot rather than being widened until it fits.
+INT4 GPTQ and Q8_0 are the rows in this mode, and Q8_0 is the partner INT4's
+published claim is written against — "1.49x over the Q8_0 control" was a ratio
+of two numbers with no band, which is the defect absolute mode exists to remove.
+With both as harness rows each figure carries its own band and its own
+`setup:meas`, so the comparison can be read with the noise next to it. INT4 is
+also the first row in the Zig harness with **i8 activations** — the axis
+`kquant_simd.gemmBF16xQuant` hardcodes, so the tree's "shared driver" cannot
+express INT4 or the INT8 path at all today, and this row is the evidence for why
+that driver needs a decode slot and a widening slot rather than being widened
+until it fits.
 
-Recorded pass: commit `2d91e7a`, `--iters 7 --pin 9`, filter `gptq`, load average
-27.5/24.5/13.6, min-of-7 across process invocations with each harness doing its
-own min-of-9 in-process.
+### Consolidated pass, 2026-10-04 — `--iters 5 --pin 9`, no filter
 
-| row | shape | Zig ms | **band** | GB/s over weight bytes |
-|---|---|---|---|---|
-| int4 gptq | m=1, n=2048, k=7168 | 1.860 | **±27.0%** | 3.70 |
-| int4 gptq m4 | m=4, n=2048, k=7168 | 2.675 | **±51.5%** | 2.26 |
+Load average 43-75 on 16 threads during this pass (other sessions active), so
+read the bands as pessimistic and the `why` column as the diagnosis.
 
-**The band is the finding, not the figure.** An earlier pass at load 5 gave 4.07
-and 2.89 GB/s for these two rows; this one at load 27 gives 3.70 and 2.26. That
-movement is what ±27% and ±51% mean, and it is why neither figure should be
-quoted without its band or off an idle host. The m=4 row is the wider of the two
-because it does four times the arithmetic over the same weight stream.
+| row | shape | Zig ms | setup:meas | **band** | GB/s over weight bytes | why |
+|---|---|---|---|---|---|---|
+| int4 gptq | m=1, n=2048, k=7168 | 2.273 | **18x** | ±8.2% | 3.41 | setup-dominated |
+| int4 gptq m4 | m=4 | 3.425 | **15x** | ±28.8% | 2.24 | setup-dominated |
+| q8_0 | m=1, n=2048, k=7168 | 2.883 | **69x** | ±97.2% | 4.76 | setup-dominated |
+| q8_0 m4 | m=4 | 4.228 | **81x** | ±74.1% | 3.55 | setup-dominated |
+
+**Correction to this file's earlier INT4 entry.** It attributed the wide INT4
+bands to the host, on the reasoning that a setup-dominated band should *shrink*
+as the kernel grows. The `setup:meas` cell says otherwise: INT4 spends 15-18x
+more time building inputs than timing the kernel, which is far above the
+`SETUP_DOMINATED` threshold of 3.0, so the wide band is **ours**, not the
+weather's. A cheapening attempt (one PRNG draw per 8 bytes instead of per byte)
+did not move it materially, so the cost is not the PRNG — it is the allocation
+and first touch of the 8.26 MB weight matrix. The fix is in-process sampling, not
+a quieter box.
+
+**And the consequence for the claim this row was added to settle:** the
+INT4-vs-Q8_0 comparison is still not publishable, now for a measured reason. The
+control's own band is ±97.2% because its setup is 69x its measurement, so
+3.41 / 4.76 is a quotient of one bounded number and one that carries no
+information. Adding the row did not strengthen the 1.49x claim; it **measured
+why the claim cannot currently be made**. Both rows need in-process sampling
+before the ratio means anything.
+
+### Comparison rows in the same pass: 0 of 7 resolved
+
+Every BF16 and activation row came back `UNMEASURABLE — setup-dominated`, with
+floors of 2.0x-18.4x (`prefill 32` was widest at ±1739%). The `setup:meas` cells
+were 16x-68x. This is the load-bearing finding of the pass and it applies to the
+1.21x-1.34x range quoted in `AGENTS.md`: **that range is currently not
+reproducible**, because a process-per-arm sampler against a bench whose setup is
+16-68x its measurement cannot see a 1.2x effect at any level of host quiet. The
+band width is now printed beside the summary and the harness says
+`THE INSTRUMENT IS BLIND` when it exceeds 1.9x, so a null result and an
+unmeasurable one cannot be confused.
 
 `--self-test --cpp-absent` runs no C++ arm at all, which forces every row through
 the absolute path; inside `--self-test` that path prints its band and **refuses
 the figure**, because both arms are then the same binary and nothing has been
 validated against an independent implementation. `--cpp-absent` without
 `--self-test` is refused outright.
-
-The 1.49x that INT4 shows against the **Q8_0** control (`bench/int4_bench.zig`,
-TODO.md Stream L) is *not* in this table: Q8_0 is not a harness row, so that
-comparison carries no harness band and should be read as the weaker of the two
-claims until it is either added to the harness or re-run on an idle host.

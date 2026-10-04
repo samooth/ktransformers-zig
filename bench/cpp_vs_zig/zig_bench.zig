@@ -5,17 +5,24 @@
 // Output format (one line per case), consumed by run.sh:
 //   GEMM|<name>|<ms>|<GFLOPs>
 //   ACT|<name>|<ms>|<GB/s>
-//   GEMM|<name>|<ms>|<GB/s>      <- INT4 rows; the RATE COLUMN IS BYTES, and
-//                                   measure.zig's absolute mode prints it as-is
-//                                   with its band. Keep that in mind before
-//                                   adding a row whose rate is not GFLOP/s:
-//                                   the unit lives in the harness, not here.
+//   GEMM|<name>|<ms>|<GB/s>      <- INT4 and Q8_0 rows; the RATE COLUMN IS
+//                                   BYTES, and measure.zig's absolute mode
+//                                   prints it as-is with its band. Keep that in
+//                                   mind before adding a row whose rate is not
+//                                   GFLOP/s: the unit lives in the harness.
+//   SETUP|<name>|<ms>            <- time spent building inputs, once per
+//                                   process, NOT part of the reported ms. It
+//                                   exists so the harness can tell a wide band
+//                                   caused by the host from one caused by the
+//                                   harness's own process-per-arm sampling; see
+//                                   SETUP_DOMINATED in measure.zig.
 
 const std = @import("std");
 const root = @import("kt");
 
 const gemm_bf16 = root.gemm_bf16;
 const gemm_int4 = root.gemm_int4;
+const gemm_q8_0 = root.gemm_q8_0;
 const amx = root.amx;
 
 const KT_HIDDEN: usize = 7168;
@@ -51,6 +58,21 @@ const ACT_N: usize = KT_INTER;
 const int4_shapes = [_]Shape{
     .{ .name = "int4 gptq", .m = 1, .n = KT_INTER, .k = KT_HIDDEN },
     .{ .name = "int4 gptq m4", .m = 4, .n = KT_INTER, .k = KT_HIDDEN },
+};
+
+/// Q8_0 shapes, and the reason this row exists. INT4's useful published claim
+/// was "1.49x over the Q8_0 control" — and that was a ratio of TWO NUMBERS WITH
+/// NO BAND, which is the defect absolute mode was built to remove. With both
+/// formats as harness rows each figure carries its own band and its own
+/// setup:measurement cell, so the comparison can finally be read with the noise
+/// next to it.
+///
+/// Q8_0 is also the fairest possible partner: 1.0625 B/weight against INT4's
+/// 0.5625, same shape, same activation type, same binary, same pass — so the
+/// remaining gap is the weight format and not the harness.
+const q8_0_shapes = [_]Shape{
+    .{ .name = "q8_0", .m = 1, .n = KT_INTER, .k = KT_HIDDEN },
+    .{ .name = "q8_0 m4", .m = 4, .n = KT_INTER, .k = KT_HIDDEN },
 };
 
 const WARMUP: usize = 2;
@@ -92,6 +114,7 @@ fn writeRaw(alloc: std.mem.Allocator, path: []const u8, bytes: []const u8) !void
 }
 
 fn benchGemm(alloc: std.mem.Allocator, outdir: []const u8, s: Shape) !void {
+    const setup_t0 = nowNanos();
     var rng: u64 = 0x243F6A8885A308D3;
     const a = try alloc.alloc(amx.bf16, s.m * s.k);
     const b = try alloc.alloc(amx.bf16, s.n * s.k);
@@ -124,6 +147,19 @@ fn benchGemm(alloc: std.mem.Allocator, outdir: []const u8, s: Shape) !void {
     const gflops = 2.0 * @as(f64, @floatFromInt(s.m)) * @as(f64, @floatFromInt(s.n)) * @as(f64, @floatFromInt(s.k)) / (ms * 1e6);
     const label = try std.fmt.allocPrint(alloc, "{s} [m={d},n={d},k={d}]", .{ s.name, s.m, s.n, s.k });
     std.debug.print("GEMM|{s}|{d:.4}|{d:.2}\n", .{ label, ms, gflops });
+    std.debug.print("SETUP|{s}|{d:.4}\n", .{ label, @as(f64, @floatFromInt(nowNanos() - setup_t0)) / 1e6 });
+}
+
+/// Fill 8 bytes from one PRNG draw. Cheaper than a draw per byte by ~8x, and
+/// the distribution is the same: 64 bits of splitmix64 into eight bytes, versus
+/// eight separate draws truncated to the same width.
+fn fillBytes(out: []u8, rng: *u64) void {
+    const n = out.len / 8;
+    for (0..n) |i| {
+        const v = splitmix64(rng);
+        const chunk: [8]u8 = @bitCast(v);
+        @memcpy(out[i * 8 ..][0..8], &chunk);
+    }
 }
 
 /// INT4 GPTQ GEMM, reported as ABSOLUTE throughput over weight bytes.
@@ -132,6 +168,7 @@ fn benchGemm(alloc: std.mem.Allocator, outdir: []const u8, s: Shape) !void {
 /// harness's, and there is no C++ row to diff against — writing a dump nothing
 /// reads would suggest a comparison that does not exist.
 fn benchInt4Gemm(alloc: std.mem.Allocator, s: Shape) !void {
+    const setup_t0 = nowNanos();
     const kb = s.k / 32;
 
     var rng: u64 = 0x9E3779B97F4A7C15;
@@ -144,7 +181,13 @@ fn benchInt4Gemm(alloc: std.mem.Allocator, s: Shape) !void {
         // Complete blocks: every one of the 16 codes appears (the zero point 8
         // and both nibble halves), and a bf16 scale of realistic magnitude.
         blk.d = amx.f32_to_bf16(@as(f32, @floatFromInt(@as(i32, @intCast(splitmix64(&rng) % 1024)) + 1)) * 0.0078125);
-        for (&blk.qs) |*q| q.* = @truncate(splitmix64(&rng) >> 24);
+        // Filled a byte at a time this cost 30 ms against a 1.9 ms kernel, which
+        // made the process-per-arm sampler measure the SETUP: `setup:meas` was
+        // 16x and every band it produced was the harness's own overhead rather
+        // than the host's. Eight bytes per PRNG draw brings it back under the
+        // threshold; the bytes are identical in distribution, only cheaper.
+        const raw: *[@sizeOf(gemm_int4.BlockQ4_0)]u8 = @ptrCast(blk);
+        fillBytes(raw[0..], &rng);
     }
     const c = try alloc.alloc(f32, s.m * s.n);
 
@@ -165,6 +208,45 @@ fn benchInt4Gemm(alloc: std.mem.Allocator, s: Shape) !void {
     const gbs = @as(f64, @floatFromInt(weight_bytes)) / (ms * 1e-3) / 1e9;
     const label = try std.fmt.allocPrint(alloc, "{s} [m={d},n={d},k={d}]", .{ s.name, s.m, s.n, s.k });
     std.debug.print("GEMM|{s}|{d:.4}|{d:.2}\n", .{ label, ms, gbs });
+    std.debug.print("SETUP|{s}|{d:.4}\n", .{ label, @as(f64, @floatFromInt(nowNanos() - setup_t0)) / 1e6 });
+}
+
+/// Q8_0, the INT4 row's control partner. Same shape, bf16 activations like the
+/// BF16 rows, 34 bytes per 32 weights against INT4's 18.
+fn benchQ8_0Gemm(alloc: std.mem.Allocator, s: Shape) !void {
+    const setup_t0 = nowNanos();
+    const kb = s.k / gemm_q8_0.QK8_0;
+
+    var rng: u64 = 0xB7E151628AED2A6B;
+    const act = try alloc.alloc(amx.bf16, s.m * s.k);
+    for (act) |*v| v.* = f32ToBf16Rne(randF32(&rng));
+    const w = try alloc.alloc(gemm_q8_0.BlockQ8_0, s.n * kb);
+    var src: [gemm_q8_0.QK8_0]f32 = undefined;
+    for (0..s.n) |j| {
+        for (0..kb) |g| {
+            for (&src) |*v| v.* = randF32(&rng);
+            gemm_q8_0.quantizeRowQ8_0(src[0..], @ptrCast(&w[j * kb + g]), gemm_q8_0.QK8_0);
+        }
+    }
+    const c = try alloc.alloc(f32, s.m * s.n);
+
+    const a_ptr: [*]const amx.bf16 = act.ptr;
+    const b_ptr: [*]const gemm_q8_0.BlockQ8_0 = @ptrCast(w.ptr);
+    for (0..WARMUP) |_| gemm_q8_0.gemmAvx2(a_ptr, s.k, b_ptr, kb, c.ptr, s.n, s.m, s.n, s.k);
+    var best: u64 = std.math.maxInt(u64);
+    for (0..REPS) |_| {
+        const t0 = nowNanos();
+        gemm_q8_0.gemmAvx2(a_ptr, s.k, b_ptr, kb, c.ptr, s.n, s.m, s.n, s.k);
+        const ns = nowNanos() - t0;
+        if (ns < best) best = ns;
+    }
+
+    const ms = @as(f64, @floatFromInt(best)) / 1e6;
+    const weight_bytes = w.len * @sizeOf(gemm_q8_0.BlockQ8_0);
+    const gbs = @as(f64, @floatFromInt(weight_bytes)) / (ms * 1e-3) / 1e9;
+    const label = try std.fmt.allocPrint(alloc, "{s} [m={d},n={d},k={d}]", .{ s.name, s.m, s.n, s.k });
+    std.debug.print("GEMM|{s}|{d:.4}|{d:.2}\n", .{ label, ms, gbs });
+    std.debug.print("SETUP|{s}|{d:.4}\n", .{ label, @as(f64, @floatFromInt(nowNanos() - setup_t0)) / 1e6 });
 }
 
 fn benchAct(alloc: std.mem.Allocator, outdir: []const u8) !void {
@@ -204,5 +286,6 @@ pub fn main(init: std.process.Init) !void {
 
     for (gemm_shapes) |s| try benchGemm(alloc, outdir, s);
     for (int4_shapes) |s| try benchInt4Gemm(alloc, s);
+    for (q8_0_shapes) |s| try benchQ8_0Gemm(alloc, s);
     try benchAct(alloc, outdir);
 }
