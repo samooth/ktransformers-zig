@@ -980,7 +980,51 @@ new `vpshufb` tests). `verify_abi.py` 112/112; avx2 and amx variants build.
 - The CI test step is now bounded (`timeout 2400 zig build test`), so the hang
   recorded above fails the job instead of stalling it.
 
-**Stream L — INT4 (GPTQ) GEMM. CLAIMED (int4-avx2) since 2026-10-04.**
+**Stream L — INT4 (GPTQ) GEMM. DONE (5 commits: a99f20c claim, 2b6dbb7 kernel,
+464252a tests, 4e6e245 bench, c9b52f6 results + the raw-INT4 decision). CLAIMED
+(int4-avx2) since 2026-10-04; the work is committed and the in-file CLAIM marker
+in `gemm_224_int4.zig` is STALE and should be released by whoever still holds it.**
+
+**Bit-exactness here is a guarantee, not a pass count — and it has a precondition.**
+i8 activations x 4-bit weights make every product and partial sum an exact integer
+times an 8-bit significand, and the tests hold activations to |a| <= 8 so the
+integer sum stays under 2^16. Nothing in that chain can round. **Anyone optimising
+this kernel may rely on exactness only while that bound holds**; relax it and the
+oracle stops being bit-comparable, so the tests would need loosening too. This is
+worth knowing before the 47%-decode work below, not after.
+
+**The plan's primitive was wrong and the reference proves it.** P0.4 said to unpack
+with `vpshufb`; GPTQ is affine in the nibble (`w = (q-8)*d`), so it is one
+`vcvtdq2ps` plus one FMA, and the reference's `gptq_int4_dequant.hpp` has no
+shuffle and no LUT at all. `pshufb` buys a NON-linear codebook. The roadmap now
+says so, so nobody re-derives the wrong instruction.
+
+Numbers, with the caveat attached: 3.68 GB/s at m=1 (scalar 0.23), measured at
+load 57-62 with no control arm, so those are floors being quoted as point
+estimates — `cpp_bench.cpp` has no INT4 coverage, so the harness can only give
+absolute throughput plus a control here, never a ratio. **Do not quote the 15-24x
+as kernel quality**: the scalar baseline is ~13 cycles/weight (two multiplies into
+a serial f32 chain) against 4-5 for the K-quant scalars on the same shape, so what
+the ratio establishes is the loop order. The useful host-relative number is against
+a same-run control: his own Q8_0 control read 2.47 GB/s in the same run, so INT4 is
+1.49x that — but compare it to Q8_0's recorded 7.8 GB/s, NOT the Q8_K figure of
+13.19 GB/s two hundred lines away in the roadmap.
+
+Headroom: the decode is 47% of the inner loop (43 instructions per 32 weights, 20
+of them decode); a decode-free variant is ~2x, and five ops per 8 weights is the
+arithmetic floor for an f32 result. The two routes past it are an integer
+`vpmaddubsw` dot needing the per-group activation-sum correction, or an AVX-512
+`vpermb` path. **The first is exactly the raw-INT4 trick**, so the deferred ABI
+decision and this 2x are the same code.
+
+Raw-INT4: deliberately not done — `KT_TYPE_I4` is the GPTQ block (18 B/32), a
+different layout; no in-tree consumer; and the scale is a separate array with a
+RUNTIME group size where GPTQ's is fixed at 32, so it is a different signature
+rather than a flag. ~40 lines once the header lands (`nibble8` is already
+`rawint4_dequant_8x4bit_unscaled` with d = 1). Open decision: fold the scale per
+group (reference's way, needs an hsum per group per output) or into the weights
+(needs none, non-integer accumulator). The bit-exact oracle does NOT carry over —
+raw-INT4 activations are bf16.
 `src/kernels/amx/gemm_224_int4.zig`, roadmap P0.4. The last quant family in the
 tree with no vectorized path: `gemmFullTile` dispatches to `gemmFullTileScalar`
 on every non-AMX host, and that is an m/n/k triple loop, so the weight matrix is
