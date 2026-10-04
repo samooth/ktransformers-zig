@@ -165,6 +165,100 @@ sign bit" has nothing to add to yet. Adding a type id is a change to the C ABI
 contract that Python and the pybind11 shim both depend on, so it needs its own
 claim on `include/kt_kernel.h`, not a kernel detail.
 
+**E4M3 GEMM: DONE (3.2x at m=1, 9.2x at m=4). `gemmAvx2` in
+`gemm_224_fp8.zig`, wired through `gemmFullTile` so it is reachable from the
+exported `kt_matmul_fp8` with no `root.zig` change. `b88e90b`.**
+
+`gemmFullTileScalar` was an m/n/k triple loop, so the n x k weight matrix was
+re-streamed from DRAM once per token row. The replacement is n-outer / m-inner
+with MR=4, one decoded weight vector feeding four accumulators, explicit
+`@mulAdd`, and one `@reduce` per OUTPUT element — the reference's four-accumulator
+fold reaches the same place with the four chains on the M axis instead of the k
+axis, for 4 registers rather than 16.
+
+At n=2048 k=7168, pinned to cpu 9, ReleaseFast, best of 4 runs of 9 reps, both
+paths in the same binary (`bench/fp8_bench.zig`). Load average 22-25 on 16
+threads throughout, so absolute ms are ~2x worse than a quiet host and only the
+ratios mean anything — note the Q8_0 control below reads 4.5 GB/s where
+Stream F recorded 7.8:
+
+| path | m=1 | m=4 |
+|---|---|---|
+| `gemmFullTileScalar` (before) | 13.36 ms / 1.08 GB/s | 54.80 ms / 0.27 GB/s |
+| **`gemmAvx2` (after)** | **4.13 ms / 3.55 GB/s — 3.2x** | **5.97 ms / 2.46 GB/s — 9.2x** |
+| same loop, asm `vgatherdps` | 8.05 ms / 1.82 GB/s — **0.51x** | 9.47 ms / 1.50 GB/s — 0.63x |
+| same loop, table-free arithmetic decode | 4.14 ms / 3.54 GB/s — 1.00x | 6.36 ms / 2.31 GB/s — 0.94x |
+| decode-free floor (loop cost alone) | 2.94 ms / 5.00 GB/s | 4.24 ms / 3.46 GB/s |
+| Q8_0 `gemmAvx2`, table-free control | 3.45 ms / 4.52 GB/s | 4.81 ms / 3.24 GB/s |
+
+Agreement between the two FP8 paths, L2-normalised max-abs: 2.0e-7 at m=1 and
+1.3e-7 at m=4 — f32 summation order, not either kernel.
+
+**The asm `vgatherdps` is a LOSS on this host (Zen 3), 1.6x-1.9x slower than
+eight scalar table loads.** That closes roadmap P0.2's "an asm `vgatherdps` is
+the obvious next experiment" and Stream E/F's copy of it: on this CPU the
+gather costs ~5.1 ms per 14.7M weights against ~1.2 ms for the plain loads,
+i.e. ~14 cycles per 8 lanes versus ~4. Do not spend the arch-layer slot on a
+gather. Two traps worth writing down: the AT&T operand order for `vgatherdps`
+is REVERSED relative to Intel (the destination is the LAST operand and the mask
+is the first) — written the Intel way it assembles, runs, and returns all zeros,
+because the mask register is then the uninitialised destination; and the asm
+needs an x86 guard or `zig build -Dtarget=aarch64-linux-gnu` fails with
+"couldn't allocate output register for constraint 'x'".
+
+**But the LUT is not the bottleneck either — it is second.** At m=1 the decode
+is 1.2 ms of the 4.13 ms total (29%), and the floor with NO decode at all is
+2.94 ms, so even a free decode would only buy 1.4x. The other 71% is weight
+streaming plus the loop, and the table-free Q8_0 control (3.45 ms) is SLOWER
+than the FP8 decode-free floor (2.94 ms), which says the remaining cost is the
+memory system on a loaded host, not the format. The arithmetic decode costs the
+same as the table at m=1 (15 ALU ops against 16 load/insert ops — both land at
+the ~4-uops/cycle issue limit) and is slightly WORSE at m=4, so there is nothing
+to win there either. What is left is the loop order and the memory system.
+
+That is the input for whoever owns a shared decode primitive: `vpshufb` cannot
+serve 256 entries, but if any single-nibble (16-entry) decode helps, the MX
+formats are where it pays — their tables ARE 16 entries, and `pshufb16` already
+exists for them. For E4M3 the two-level decomposition is worth at most the 1.4x
+above.
+
+**Inner loop, disassembly (ReleaseFast, x86-64).** Scalar triple loop: **7
+instructions per weight** (3 to widen the bf16 activation, 1 byte load, 1
+`vmulss` against the table that also applies the scale, 1 `vmulss`, 1 `vaddss`)
+with a serial `vaddss` dependency chain. `gemmAvx2`, MR=4 path: **32
+instructions per 8 weights = 1.0 per MAC** (8 byte loads, 8 table loads, 4
+activation `vpmovzxwd`, 4 `vpslld`, 4 `vfmadd`, 4 loop overhead). The m=1
+row-tail path is 32 instructions per 8 MACs = 4 per MAC, against the scalar 7.
+Both entry points are `noinline` so each keeps a symbol in the `.so`.
+
+**Tests** (`tests/kernels/simd_kernels_tests.zig`, `6153821`): decode exact for
+all 256 encodings by BIT PATTERN against an independent transcription of the
+reference rule, including the negative zeros the reference also produces; the
+GEMM against an f64 once-scaled oracle over 9 shapes (m = 1/4/5, n = 1/2/7,
+k = 8/16/32 exact, past one 32-step, and with 1/5/7-element tails) with both
+outputs NaN-poisoned; and the "scale applied once, after the accumulation"
+choice pinned BIT-EXACTLY (0x3B866667 once-scaled, which is the f64 truth
+rounded once, against 0x3B866666 per-element — one ULP apart, so no tolerance
+would have separated them).
+
+**Not touched, still open.** `FP8BufferB.fromMatBF16` and `batchedGemm` have no
+callers in the tree (`kt_matmul_fp8` is the only consumer, and `gemmQuant`'s
+`isWeightTypeSupported` list must NOT grow FP8: it is a per-row-scale format,
+not a GGML block format, so LlamaMoe has no route to it). The AMX path in
+`gemmFullTile` still has its own known gaps — `loadB` fills 16 of the 32 rows
+the tile config asks for and `lda` is passed as elements where `tile_loadd`
+wants bytes — but fixing it needs the C++ `BufferBFP8Impl` packing ported
+first, and it cannot be tested on this host.
+
+**NOTE for the arch layer (found while gating, NOT caused by this stream):**
+`amx.pshufb16` (2416b68) has no target guard, so
+`zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu` now fails with
+"couldn't allocate output register for constraint 'x'". Verified by building
+`4f222ba` (aarch64: PASS) against `2416b68` (aarch64: same error), and by
+building this tree with only that one function guarded (aarch64: PASS, with
+`gemmAvx2` present in the aarch64 object — so this stream is portable and
+`@Vector`-only).
+
 **Stream C — K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K. DONE (6.3x–15.7x).**
 `src/kernels/amx/gemm_224_{q2_k,q3_k,q4_k,q5_k,q6_k,q8_k}.zig` + the new shared
 driver `src/kernels/amx/kquant_simd.zig`. Each format gained a `gemmQ*_K`
