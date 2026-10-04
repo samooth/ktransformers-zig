@@ -53,7 +53,16 @@ jobs:
       # symbol regression otherwise ships in the wheel.
       - name: Build default variant for layout audit
         run: zig build -Dvariant=avx2
-      - name: "ABI gate: exports + arity (all variants)"
+      # aarch64 is a build-and-gate target, never a wheel target: the
+      # matrix above is x86 only, so without this leg a regression that
+      # only affects aarch64 ships green. `amx.pshufb16` reached main that
+      # way — inline x86 assembly with no comptime target guard, so the
+      # cross-build failed while all six x86 variants and the whole test
+      # suite passed. Build-only on purpose: this library must never end up
+      # inside an x86 wheel.
+      - name: Build aarch64 neon variant (build only, not a wheel)
+        run: zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu
+      - name: "ABI gate: exports + arity (all variants, incl. aarch64)"
         run: python3 tools/verify_abi.py
       - name: "ABI gate: pybind11 struct layouts"
         run: python3 tools/audit_layout.py

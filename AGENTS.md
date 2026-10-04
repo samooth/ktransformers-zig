@@ -90,7 +90,17 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
 
 ## Status (see TODO.md for details)
 
-- Build: working; 6 x86 variants + aarch64 neon cross-build.
+- Build: working; 6 x86 variants. The aarch64 neon cross-build
+  (`zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu`) **is currently
+  broken** — `amx.pshufb16` (commit `2416b68`) has no comptime target guard, so
+  the x86 inline assembly fails to assemble for aarch64 ("couldn't allocate
+  output register for constraint 'x'"). A guard with an exact scalar fallback
+  has been written and verified, and is waiting on the file's current claim
+  holder (roadmap P1.3) to land it. Until then treat the neon variant as
+  unavailable, and note that **no CI job builds aarch64 at all** — the matrix
+  is six x86 variants and `zig build all-variants` is x86-only — which is how
+  this regression reached `main` with a green pipeline. An aarch64 leg has been
+  added to the abi-gate job so the next one fails the build.
  - C API: **112 symbols** gated by `verify_abi.py` triple gate (exports +
   arity + layout via audit_layout.py). All operator families implemented:
   MoE (incl. SFT/LoRA forward+backward), MLA, Gate (DeepSeek-V3
@@ -255,8 +265,14 @@ Also: `f32_to_bf16` rounds to nearest even (matching ggml / the reference);
 `f32_to_bf16_trunc` keeps the old truncating behaviour. And `-Dvariant` does
 **not** set Zig CPU features — it only sets C macros for the pybind path, so
 the feature set comes from the native target. `zig build -Dtarget=x86_64-linux-gnu
--Dvariant=avx2` really does produce an SSE2-only library that still prints
-"Building variant: avx2".
+-Dvariant=avx2` still prints "Building variant: avx2" while producing **nothing**:
+that target is baseline x86_64, which has no 32-byte vector type, so
+`amx.ByteVec = @Vector(32, u8)` fails to compile with "TODO moveStrategy for
+@Vector(32, u8)". This was true before the pshufb work as well — the `-Dvariant`
+macro not pinning features has always been the underlying issue — but it is worth
+stating plainly: **the only supported builds are the native target and the six
+x86 variants.** Narrowing `ByteVec` to 16 lanes with two shuffles would restore
+the baseline target, and nobody needs it yet.
 
 Tests for all of the above live in `tests/kernels/simd_kernels_tests.zig`
 (kept separate from `test_kernels.zig`) — which is also the ONLY place a new
