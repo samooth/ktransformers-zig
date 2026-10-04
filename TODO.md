@@ -18,7 +18,7 @@ attribution trailers of any kind.
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
 **Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels + the six K-quant AVX2 GEMMs) = **268 total pass across 18 suites, 0 leaks, exit 0**.
-**Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon (8 installed names), each exporting **112 C API symbols** (triple-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). Runs in CI (`wheels.yml` `abi-gate` job).
+**Multi-variant: WORKING** - `zig build all-variants` produces **6** `.so` (`libkt_kernel_ext_{variant}.so` for avx2, avx512_base, avx512_vnni, avx512_vbmi, avx512_bf16, amx), each exporting **112 C API symbols** (triple-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). Runs in CI (`wheels.yml` `abi-gate` job). **There is no neon leg**: `all-variants` is x86-only, and the aarch64 build is a separate one-shot `zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu`. Verified by moving the stale `libkt_kernel_ext_neon.so` out of `zig-out/lib`, running `all-variants`, and getting zero neon outputs. The old "+ neon (8 installed names)" here was wrong, and it stayed wrong through a cycle in which aarch64 was actually broken - the same blind spot as the missing aarch64 CI leg.
 **Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
 **Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
 **SFT/LoRA: FORWARD+BACKWARD COMPLETE** - training path done; C API exports (forward_sft/backward/update_lora_weights); smoke test passes.
@@ -240,6 +240,44 @@ outputs NaN-poisoned; and the "scale applied once, after the accumulation"
 choice pinned BIT-EXACTLY (0x3B866667 once-scaled, which is the f64 truth
 rounded once, against 0x3B866666 per-element — one ULP apart, so no tolerance
 would have separated them).
+
+**The E4M3 ENCODER was still the four-bug version until 6a64d45.** `1e8369a`
+fixed the decoder and `b88e90b` the GEMM; nothing had touched
+`f32_to_fp8e4m3`, which is live in the C ABI (`kt_fp8_quantize`,
+`kt_fp8_quantize_block`, `kt_quantize_fp8_e4m3`, `quantizeRowBF16ToFP8`).
+Re-measured over all 256 encodings, decode -> encode: **14 of 256 round trips
+failed** (16 counting 0x7F/0xFF, which are the NaN hole and cannot round trip
+by definition), worst case **100% relative error**, twice over:
+
+| input | old byte | old value | new byte | new value |
+|---|---|---|---|---|
+| 500.0 / -500.0 / 1e9 / inf | 0x7F / 0xFF | **0** | 0x7E / 0xFE | +-448 |
+| 3.875 | 0x40 | **2.0** | 0x48 | 4.0 |
+| 1.0625 (exact tie) | 0x39 | **1.125** | 0x38 | 1.0 |
+| 2^-9 ... 7*2^-9 (7 subnormals) | 0x00,0x00,0x00,0x00,0x02,0x04,0x06 | **all wrong** | 0x01..0x07 | exact |
+
+The saturation row is the one that matters: 0x7F is the NaN encoding and the
+decoder maps it to 0, so any weight above 448 was silently DELETED, not
+clipped. Now 0 of 256 fail. `gemm_224_fp8.zig` OWNS the codec (LUT, decode,
+encode) and `gemm_224_mxfp8.zig` imports it, re-exporting the same names — the
+de-duplication that TODO.md had deferred on the grounds that Stream B was in
+flight. Two editable copies of a codec is how the MX one got fixed and this one
+did not. Test `793efb8`, verified to have teeth: against the old encoder it
+fails the 256-sweep with exactly 14 mismatches.
+
+**NOTE for the arch layer: the pshufb guard has landed.** The "NOTE for the
+arch layer" paragraph below diagnosed `amx.pshufb16` (2416b68) as breaking the
+aarch64 cross-build with no target guard. Stream D (which holds
+`src/kernels/arch/amx.zig`) has since added a `comptime builtin.cpu.arch ==
+.x86_64` guard with a scalar fallback, and `zig build -Dvariant=neon
+-Dtarget=aarch64-linux-gnu` now PASSES again (2026-10-04, re-verified here). No
+handoff is needed. Worth recording for whoever wrote it: the fallback indexes
+`table[(k & 16) + (idx[k] & 15)]`, i.e. it keeps the per-128-bit-lane offset,
+which is the actual `vpshufb` semantics on a ymm — a fallback that indexed
+`table[idx[k] & 15]` would be right only while callers happen to build their
+table with `pshufbTable` (which duplicates it into both lanes). An independent
+guard written here used the lane-less form and would have been the weaker of the
+two, which is the argument for letting the claim holder land their own.
 
 **Not touched, still open.** `FP8BufferB.fromMatBF16` and `batchedGemm` have no
 callers in the tree (`kt_matmul_fp8` is the only consumer, and `gemmQuant`'s
