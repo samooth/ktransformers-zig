@@ -306,7 +306,7 @@ pub const GemmKernel224FP8 = struct {
         m: usize, n: usize, k: usize
     ) void {
         if (!amx.detectAmxSupport()) {
-            gemmFullTileScalar(a, lda, b, b_scales, ldb, c, ldc, m, n, k);
+            gemmAvx2(a, lda, b, b_scales, ldb, c, ldc, m, n, k);
             return;
         }
 
@@ -352,8 +352,12 @@ pub const GemmKernel224FP8 = struct {
         }
     }
 
-    /// Scalar fallback for non-AMX hosts. Identical to the original placeholder.
-    fn gemmFullTileScalar(
+    /// Scalar fallback for non-AMX hosts, and the oracle the AVX2 path is
+    /// tested against. Kept as the readable statement of the math; see
+    /// `gemmAvx2` below for why it is no longer what runs. `noinline` for the
+    /// same reason as there: it keeps this loop disassemblable next to the
+    /// vectorized one, which is how the two are compared.
+    pub noinline fn gemmFullTileScalar(
         a: [*]const amx.bf16, lda: usize,
         b: [*]const fp8_e4m3, b_scales: [*]const f32, ldb: usize,
         c: [*]f32, ldc: usize,
@@ -369,6 +373,134 @@ pub const GemmKernel224FP8 = struct {
                     sum += a_val * b_val;
                 }
                 (@as([*]f32, @ptrCast(c)))[i * ldc + j] = sum;
+            }
+        }
+    }
+
+    // =======================================================================
+    // AVX2 path (non-AMX hosts) — the GEMM that actually runs
+    // =======================================================================
+    //
+    // `gemmFullTileScalar` is an m/n/k triple loop, which is the one loop order
+    // the SIMD contract forbids: the weight matrix — the huge operand — is
+    // re-streamed from DRAM once per token row. On any non-AMX host (including
+    // the development box) `gemmFullTile` lands on it, so it WAS the FP8 GEMM.
+    // This is the replacement, built like `kquant_simd.gemmBF16xQuant` and its
+    // two siblings (`gemm_224_q8_0.zig`, `gemm_224_mxfp8.zig`):
+    //
+    //   n-outer / m-inner  the n x k weight block is walked once, in order.
+    //                       Same as the reference's `gemm_fp8`, which also puts
+    //                       `ni` outside `mi`, and worth 3.4-4.0x on BF16.
+    //   MR = 4             four activation rows share one decoded weight
+    //                       vector, so the 8 table lookups amortize over 4 FMAs
+    //   explicit @mulAdd   FP contraction is off in this toolchain, so a plain
+    //                       `a*w + acc` would be a separate multiply and add
+    //   deferred hsum      ONE @reduce per OUTPUT element, not per 32-weight
+    //                       step (see below)
+    //
+    // On the accumulators: the reference runs FOUR `__m256` accumulators over
+    // each 32-element k step and folds them with one `hsum_avx2`
+    // (fp8-moe.hpp:178-201). That is the same intent — independent chains for
+    // ILP, a single fold, the scale applied last — reached differently here:
+    // MR=4 gets the four independent chains from the M axis instead of the k
+    // axis, which costs 4 registers rather than 16 and leaves ONE reduction
+    // for the whole row rather than one per 32 weights. Nothing is lost; the
+    // fold happens later.
+    //
+    // On the scale: the reference has 128x128 block-wise scales indexed
+    // `b.d[n_block_idx * n_blocks_k + k_block_idx]` and multiplies each k
+    // block's folded sum by it. This port has ONE f32 scale per row of B
+    // (`FP8BufferB.scales`, filled by `fromMatBF16`), so the scale is constant
+    // across the whole k of a row: accumulate raw and multiply ONCE at the end,
+    // exactly as `kquant_simd.gemmBF16xQuant` does for the K-quants. That is
+    // also strictly more accurate — it is the formulation `gemmFullTileScalar`
+    // approximates by folding `scale` into each product.
+
+    const MR: usize = 4;
+    const Vec: type = @Vector(8, f32);
+
+    /// 8 bf16 -> 8 f32. Single pointer parameter and `align(1)`: an
+    /// activation row can start at any byte offset.
+    inline fn widen8(p: [*]const amx.bf16) Vec {
+        const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+        return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+    }
+
+    /// 8 E4M3 bytes -> 8 f32. The local stand-in for the reference's
+    /// `fp8x8_to_fp32x8`, which widens with `_mm256_cvtepu8_epi32` and then
+    /// does `_mm256_i32gather_ps` against the same 256-entry table.
+    ///
+    /// A single `vpshufb` cannot replace the gather: the table is 16x16, and
+    /// `vpshufb` indexes 16 BYTES. So this keeps the table and pays eight
+    /// scalar L1 loads per 8 weights — which is the known cost of this format
+    /// (see the report in TODO.md Stream B). `gemmAvx2Gather` below is the
+    /// asm-gather experiment against that cost.
+    inline fn fp8x8(p: [*]const fp8_e4m3) Vec {
+        const raw: @Vector(8, u8) = @as(*align(1) const @Vector(8, u8), @ptrCast(p)).*;
+        var out: [8]f32 = undefined;
+        inline for (0..8) |i| out[i] = FP8_E4M3_LUT[raw[i]];
+        return out;
+    }
+
+    /// Scalar dot over the ragged tail of a k that is not a multiple of 8.
+    /// Deliberately does NOT apply the row scale: the caller folds that in
+    /// once, after the reduction, exactly as the vector path does.
+    inline fn tailDot(a_row: [*]const amx.bf16, brow: [*]const fp8_e4m3, kbase: usize, rem: usize) f32 {
+        var acc: f32 = 0;
+        for (0..rem) |t| {
+            acc += amx.bf16_to_f32(a_row[kbase + t]) * FP8_E4M3_LUT[brow[kbase + t]];
+        }
+        return acc;
+    }
+
+    /// AVX2 FP8 E4M3 GEMM. `c` is OVERWRITTEN on every element of [0,m) x
+    /// [0,n) — it is assigned, never accumulated, matching
+    /// `gemmFullTileScalar`. The per-row scale is applied once, after the
+    /// reduction.
+    /// `noinline` so the kernel keeps its own symbol in the `.so`. LLVM
+    /// otherwise folds it into `gemmFullTile` (and that into `kt_matmul_fp8`),
+    /// which is correct but leaves nothing to disassemble and nothing for `nm`
+    /// to show — the failure mode this repo has hit twice.
+    pub noinline fn gemmAvx2(
+        a: [*]const amx.bf16, lda: usize,
+        b: [*]const fp8_e4m3, b_scales: [*]const f32, ldb: usize,
+        c: [*]f32, ldc: usize,
+        m: usize, n: usize, k: usize
+    ) void {
+        if (m == 0 or n == 0) return;
+        const kv = k / 8; // full 8-weight vectors
+        const rem = k - kv * 8; // ragged tail, < 8
+
+        var j: usize = 0;
+        while (j < n) : (j += 1) {
+            const brow = b + j * ldb;
+
+            var i: usize = 0;
+            // Main path: MR rows of A share every decoded weight vector.
+            while (i + MR <= m) : (i += MR) {
+                var acc = [_]Vec{@splat(0.0)} ** MR;
+                for (0..kv) |v| {
+                    const w = fp8x8(brow + v * 8);
+                    const kb = v * 8;
+                    inline for (0..MR) |r| {
+                        acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + kb), w, acc[r]);
+                    }
+                }
+                inline for (0..MR) |r| {
+                    var sum = @reduce(.Add, acc[r]); // ONE hsum per output element
+                    if (rem != 0) sum += tailDot(a + (i + r) * lda, brow, kv * 8, rem);
+                    c[(i + r) * ldc + j] = sum * b_scales[j];
+                }
+            }
+            // Row tail (m % MR), one row at a time.
+            while (i < m) : (i += 1) {
+                var acc: Vec = @splat(0.0);
+                for (0..kv) |v| {
+                    acc = @mulAdd(Vec, widen8(a + i * lda + v * 8), fp8x8(brow + v * 8), acc);
+                }
+                var sum = @reduce(.Add, acc);
+                if (rem != 0) sum += tailDot(a + i * lda, brow, kv * 8, rem);
+                c[i * ldc + j] = sum * b_scales[j];
             }
         }
     }
