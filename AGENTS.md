@@ -449,6 +449,24 @@ of the above.** Three options, in order of preference:
    commit that sweeps someone else's work cannot land silently. A marker documents
    intent; this enforces it.
 
+**KNOWN GAP, found the hard way: this check is blind to files with no marker, and
+the shared documents have none.** `TODO.md`, `AGENTS.md` and `docs/*.md` are
+claimable by protocol but carry no `// CLAIM:` line, so nothing about them can be
+detected — and four of my own commits absorbed another session's staged edits to
+exactly those files while I believed I was staging by filename. Three remedies,
+none taken unilaterally:
+
+1. Put `// CLAIM:` markers in the shared documents too — visible, but then two
+   sessions editing `TODO.md` both hold it.
+2. Require every staged file to be named in the commit message, and have the hook
+   annotate when one is not — universal, but a new convention for every session.
+3. Accept the risk on documents and keep the check for source files only.
+
+The inverse failure is also invisible: a commit that takes what happened to be
+**staged** rather than what it wrote, when every staged file happens to be yours.
+A `git diff --cached --stat` assertion at commit time is the mechanical version of
+that, and is worth adding whichever remedy is chosen.
+
    Installed here as an **advisory** `prepare-commit-msg` hook, which appends the
    warning to your message and always exits 0 — so every session sees it and none
    is blocked. A blocking hook would break other sessions mid-flight, because
