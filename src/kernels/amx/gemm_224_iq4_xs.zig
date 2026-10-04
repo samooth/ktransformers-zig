@@ -349,25 +349,59 @@ inline fn widen8(p: [*]const amx.bf16) Vec {
 
 /// The dequant scale for sub-block `ib`: the 6-bit field reassembled from
 /// `scales_l`/`scales_h`, signed by subtracting 32, times the super-block f16
-/// scale. Runtime `ib` — one call per 32 weights, versus the 128 FMAs it feeds.
-inline fn subBlockScale(blk: *const BlockIQ4_XS, ib: usize) f32 {
+/// scale.
+///
+/// `d` is passed in rather than read from `blk.d` because that conversion is
+/// per-BLOCK, not per-sub-block: computing it here meant re-converting the same
+/// f16 eight times per 256-weight block. Worse, it sat at the head of a serial
+/// dependency chain immediately before the FMAs, and at m=1 there are only four
+/// FMAs per sub-block to hide the latency. Hoisting it is what actually moved
+/// the m=1 number — NOT the vpshufb, which made no measurable difference here.
+inline fn subBlockScale(blk: *const BlockIQ4_XS, d: f32, ib: usize) f32 {
     const l_low = (blk.scales_l[ib / 2] >> @intCast(4 * (ib % 2))) & 0xf;
     const l_high: u8 = @intCast((blk.scales_h >> @intCast(2 * ib)) & 3);
     const ls: u32 = @as(u32, l_low) | (@as(u32, l_high) << 4);
-    return f16_to_f32(blk.d) * (@as(f32, @floatFromInt(ls)) - 32.0);
+    return d * (@as(f32, @floatFromInt(ls)) - 32.0);
 }
 
-/// 8 nibbles out of 8 consecutive bytes -> 8 f32 via the shared non-linear i8
-/// table. `shift` 0 = low nibbles (weights 0..15), 4 = high (weights 16..31).
-inline fn kvalues8(p: *const u8, comptime shift: u4) Vec {
-    const raw: @Vector(8, u8) = @as(*align(1) const @Vector(8, u8), @ptrCast(p)).*;
-    var out: [8]f32 = undefined;
-    if (shift == 0) {
-        inline for (0..8) |i| out[i] = @floatFromInt(KVALUES_IQ4NL[raw[i] & 0xF]);
-    } else {
-        inline for (0..8) |i| out[i] = @floatFromInt(KVALUES_IQ4NL[raw[i] >> 4]);
+
+/// `KVALUES_IQ4NL` as raw bytes, then broadcast into both 128-bit lanes so one
+/// `vpshufb` can serve indices from either half of the result.
+const KV_BYTES: [16]u8 = blk: {
+    var t: [16]u8 = undefined;
+    for (KVALUES_IQ4NL, 0..) |v, i| t[i] = @bitCast(v); // i8 -> u8, same byte
+    break :blk t;
+};
+pub const KV_VEC: amx.ByteVec = amx.pshufbTable(&KV_BYTES);
+
+/// 16 packed nibbles -> 16 f32, as two `Vec8`, in ONE `vpshufb`.
+///
+/// This replaces 16 scalar table loads. `KVALUES_IQ4NL` is 16 bytes, which is
+/// exactly what `vpshufb` indexes, so the whole 16-entry non-linear table is one
+/// instruction. `shift` 0 takes the low nibbles (weights 0..15 of a sub-block),
+/// 4 takes the high ones (weights 16..31).
+///
+/// The two `Vec8` come from one 16-byte result widened twice: sign-extend with
+/// `@intCast` (a `vpmovsxbd`) then convert (a `vcvtdq2ps`).
+pub inline fn kvalues16(p: *const u8, comptime shift: u4) [2]Vec {
+    // Arrays, not vectors, for the indexed part: `vec[i]` needs a comptime `i`.
+    const bytes: [16]u8 = @as(*align(1) const [16]u8, @ptrCast(p)).*;
+    var idx: [16]u8 = undefined;
+    for (0..16) |i| {
+        idx[i] = if (shift == 0) bytes[i] & 0x0F else bytes[i] >> shift;
     }
-    return out;
+    // `pshufb` on a ymm works lane-wise, so the 16 indices go into both
+    // 128-bit halves (KV_VEC has the table in both, so either half works).
+    var idx32: [32]u8 = undefined;
+    for (0..16) |i| {
+        idx32[i] = idx[i];
+        idx32[i + 16] = idx[i];
+    }
+    const looked: [32]u8 = amx.pshufb16(KV_VEC, idx32);
+
+    const lof: Vec = @floatFromInt(@as(@Vector(8, i32), @intCast(@as(@Vector(8, i8), @bitCast(looked[0..8].*)))));
+    const hif: Vec = @floatFromInt(@as(@Vector(8, i32), @intCast(@as(@Vector(8, i8), @bitCast(looked[8..16].*)))));
+    return .{ lof, hif };
 }
 
 /// AVX2 IQ4_XS GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
@@ -394,16 +428,20 @@ pub fn gemmAvx2(
             for (0..nb) |blk| {
                 const blk_ptr = &brow[blk];
                 const abase = blk * QK_K;
+                const dsuper = f16_to_f32(blk_ptr.d); // hoisted: per block, not per sub-block
                 // 8 sub-blocks of 32. Runtime `ib` so this does not unroll 128
                 // vfmadd per block; the 4 Vec8 inside each sub-block are
                 // comptime so their byte offsets fold into the load displacement.
                 for (0..N_SUB) |ib| {
-                    const dv: Vec = @splat(subBlockScale(blk_ptr, ib));
+                    const dv: Vec = @splat(subBlockScale(blk_ptr, dsuper, ib));
                     const qbase = ib * 16;
-                    inline for (0..2) |bh| {
-                        inline for (0..2) |nh| {
-                            const koff = abase + ib * SUB_BLOCK + bh * 8 + nh * 16;
-                            const w = kvalues8(&blk_ptr.qs[qbase + bh * 8], if (nh == 0) 0 else 4) * dv;
+                    // Two vpshufb per sub-block: low nibbles -> weights 0..15,
+                    // high nibbles -> weights 16..31. Each yields two Vec8.
+                    inline for (0..2) |nh| {
+                        const halves = kvalues16(&blk_ptr.qs[qbase], if (nh == 0) 0 else 4);
+                        inline for (0..2) |half| {
+                            const koff = abase + ib * SUB_BLOCK + nh * 16 + half * 8;
+                            const w = halves[half] * dv;
                             inline for (0..MR) |r| {
                                 acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + koff), w, acc[r]);
                             }
@@ -420,13 +458,15 @@ pub fn gemmAvx2(
             for (0..nb) |blk| {
                 const blk_ptr = &brow[blk];
                 const abase = blk * QK_K;
+                const dsuper = f16_to_f32(blk_ptr.d); // hoisted: per block, not per sub-block
                 for (0..N_SUB) |ib| {
-                    const dv: Vec = @splat(subBlockScale(blk_ptr, ib));
+                    const dv: Vec = @splat(subBlockScale(blk_ptr, dsuper, ib));
                     const qbase = ib * 16;
-                    inline for (0..2) |bh| {
-                        inline for (0..2) |nh| {
-                            const koff = abase + ib * SUB_BLOCK + bh * 8 + nh * 16;
-                            acc = @mulAdd(Vec, widen8(a + i * lda + koff), kvalues8(&blk_ptr.qs[qbase + bh * 8], if (nh == 0) 0 else 4) * dv, acc);
+                    inline for (0..2) |nh| {
+                        const halves = kvalues16(&blk_ptr.qs[qbase], if (nh == 0) 0 else 4);
+                        inline for (0..2) |half| {
+                            const koff = abase + ib * SUB_BLOCK + nh * 16 + half * 8;
+                            acc = @mulAdd(Vec, widen8(a + i * lda + koff), halves[half] * dv, acc);
                         }
                     }
                 }

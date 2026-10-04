@@ -1509,3 +1509,62 @@ test "IQ4_XS AVX2 GEMM == the scalar oracle, and the 6-bit scale index is right"
         }
     }
 }
+
+test "pshufb16 is a correct 16-entry byte lookup (asm operand order)" {
+    // Load-bearing, not decorative. The AT&T form of `vpshufb` takes the DATA
+    // operand second; writing it first still compiles and still emits bytes, but
+    // the table then acts as the index and every output is zero whenever the
+    // table's bytes have bit 7 set. This test uses table values 200..215, all
+    // of which have bit 7 set, precisely so that mistake cannot hide.
+    var tbl: [16]u8 = undefined;
+    for (&tbl, 0..) |*t, i| t.* = @intCast(200 + i);
+    const tv = amx.pshufbTable(&tbl);
+
+    // 0..15 in the low lane, 15..0 in the high lane: exercises both 128-bit
+    // halves, since `pshufb` on a ymm is lane-wise.
+    var idx: [32]u8 = undefined;
+    for (0..16) |i| {
+        idx[i] = @intCast(i);
+        idx[i + 16] = @intCast(15 - i);
+    }
+    const got: [32]u8 = amx.pshufb16(tv, idx);
+    for (0..32) |i| {
+        const want: u8 = if (i < 16) tbl[i] else tbl[15 - (i - 16)];
+        try testing.expectEqual(want, got[i]);
+    }
+
+    // pshufb semantics: bit 7 of the index SET means "write zero", not
+    // "index 128". Every quant table here relies on this to stay in range.
+    const zeroed: [32]u8 = amx.pshufb16(tv, @as([32]u8, @splat(0x83)));
+    for (zeroed) |v| try testing.expectEqual(@as(u8, 0), v);
+    // Indices only use the low nibble, so bit 4..6 must be ignored too.
+    const masked: [32]u8 = amx.pshufb16(tv, @as([32]u8, @splat(0x05)));
+    for (masked) |v| try testing.expectEqual(tbl[5], v);
+}
+
+test "kvalues16 (pshufb unpack) == the scalar KVALUES table for all nibbles" {
+    // The unpack the IQ4_NL and IQ4_XS kernels both use, checked against the
+    // scalar table lookup for every index and both nibble halves.
+    const k16 = kt.gemm_iq4_xs.kvalues16;
+    const kv = kt.gemm_iq4_xs.KVALUES_IQ4NL;
+    var bytes: [16]u8 = undefined;
+    for (&bytes, 0..) |*b, i| {
+        // byte i: low nibble = i, high nibble = 15 - i, so all 16 indices
+        // appear in each half.
+        b.* = @as(u8, @intCast(i)) | (@as(u8, @intCast(15 - i)) << 4);
+    }
+    const lo_pair = k16(&bytes[0], 0);
+    const hi_pair = k16(&bytes[0], 4);
+    const lo0: [8]f32 = lo_pair[0];
+    const lo1: [8]f32 = lo_pair[1];
+    const hi0: [8]f32 = hi_pair[0];
+    const hi1: [8]f32 = hi_pair[1];
+    for (0..8) |i| {
+        // low nibble of byte i -> index i        (weights 0..7, 8..15)
+        try testing.expectEqual(@as(f32, @floatFromInt(kv[i])), lo0[i]);
+        try testing.expectEqual(@as(f32, @floatFromInt(kv[i + 8])), lo1[i]);
+        // high nibble of byte i -> index 15 - i   (weights 16..23, 24..31)
+        try testing.expectEqual(@as(f32, @floatFromInt(kv[15 - i])), hi0[i]);
+        try testing.expectEqual(@as(f32, @floatFromInt(kv[7 - i])), hi1[i]);
+    }
+}

@@ -28,6 +28,9 @@
 const std = @import("std");
 const amx = @import("../arch/amx.zig");
 const gemm_iq4_xs = @import("gemm_224_iq4_xs.zig");
+// kvalues16 is the pshufb-based unpack; iq4_xs owns KVALUES_IQ4NL and the
+// shared table, so this file imports rather than duplicating it.
+const kvalues16 = gemm_iq4_xs.kvalues16;
 
 // ============================================================================
 // Block Structure (byte-exact vs ggml's block_iq4_nl)
@@ -139,21 +142,6 @@ inline fn widen8(p: [*]const amx.bf16) Vec {
     return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
 }
 
-/// 8 nibbles out of 8 consecutive bytes -> 8 f32 via the shared non-linear
-/// i8 table. `shift` is 0 for the low nibbles (weights 0..15) and 4 for the
-/// high ones (weights 16..31).
-inline fn kvalues8(p: *const u8, comptime shift: u4) Vec {
-    // One 8-byte load, then the nibble extracts read out of the register.
-    // `*align(1)` because the caller's `&q[bh * 8]` sits at an odd offset.
-    const raw: @Vector(8, u8) = @as(*align(1) const @Vector(8, u8), @ptrCast(p)).*;
-    var out: [8]f32 = undefined;
-    if (shift == 0) {
-        inline for (0..8) |i| out[i] = @floatFromInt(gemm_iq4_xs.KVALUES_IQ4NL[raw[i] & 0xF]);
-    } else {
-        inline for (0..8) |i| out[i] = @floatFromInt(gemm_iq4_xs.KVALUES_IQ4NL[raw[i] >> 4]);
-    }
-    return out;
-}
 
 /// AVX2 IQ4_NL GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
 /// `k` must be a multiple of QK4_NL, as for the scalar version.
@@ -180,11 +168,13 @@ pub fn gemmAvx2(
                 const dv: Vec = @splat(f16_to_f32(brow[blk].d));
                 const q = &brow[blk].qs;
                 const ab = blk * QK4_NL;
-                // 2 byte-halves x 2 nibble-halves = 4 Vec8 = 32 weights.
-                inline for (0..2) |bh| {
-                    inline for (0..2) |nh| {
-                        const voff = bh * 8 + nh * 16;
-                        const w = kvalues8(&q[bh * 8], if (nh == 0) 0 else 4) * dv;
+                // Two vpshufb per 32-weight block: low nibbles -> weights 0..15,
+                // high nibbles -> 16..31. Each yields two Vec8.
+                inline for (0..2) |nh| {
+                    const halves = kvalues16(&q[0], if (nh == 0) 0 else 4);
+                    inline for (0..2) |half| {
+                        const voff = nh * 16 + half * 8;
+                        const w = halves[half] * dv;
                         inline for (0..MR) |r| {
                             acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + ab + voff), w, acc[r]);
                         }
@@ -201,10 +191,11 @@ pub fn gemmAvx2(
                 const dv: Vec = @splat(f16_to_f32(brow[blk].d));
                 const q = &brow[blk].qs;
                 const ab = blk * QK4_NL;
-                inline for (0..2) |bh| {
-                    inline for (0..2) |nh| {
-                        const voff = bh * 8 + nh * 16;
-                        acc = @mulAdd(Vec, widen8(a + i * lda + ab + voff), kvalues8(&q[bh * 8], if (nh == 0) 0 else 4) * dv, acc);
+                inline for (0..2) |nh| {
+                    const halves = kvalues16(&q[0], if (nh == 0) 0 else 4);
+                    inline for (0..2) |half| {
+                        const voff = nh * 16 + half * 8;
+                        acc = @mulAdd(Vec, widen8(a + i * lda + ab + voff), halves[half] * dv, acc);
                     }
                 }
             }

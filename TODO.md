@@ -1,6 +1,6 @@
 # ktransformers-zig TODO
 
-## Status: Beta (15/15 GGML formats + 266 tests; SIMD at/above C++ parity)
+## Status: Beta (15/15 GGML formats + 268 tests; SIMD at/above C++ parity)
 
 Last updated: 2026-10-03
 
@@ -17,7 +17,7 @@ and the reasoning, not who or what typed it. Commit messages carry no
 attribution trailers of any kind.
 
 **Build: WORKING** - `zig build` produces `zig-out/lib/libkt_kernel_ext.so`; 6 x86 variants + aarch64 neon cross-build.
-**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels + the six K-quant AVX2 GEMMs) = **266 total pass across 18 suites, 0 leaks, exit 0**.
+**Tests: WORKING** - `zig build test` runs all suites (kernels incl. 15 GGML formats + dispatch/ABI audits, MLA + MLA C-API, Qwen3 MoE + layer C-API + GGUF e2e, FP8 transport, GGML C API, to/from_float C-API, aarch64, NEON kernel, allocator C-API, LlamaMoe C-API, K_BLOCK runtime, math-helpers C-API (swiglu 3 variants/rms_norm/rope/softmax), SIMD primitives + GEMM micro-kernels + the six K-quant AVX2 GEMMs) = **268 total pass across 18 suites, 0 leaks, exit 0**.
 **Multi-variant: WORKING** - `zig build all-variants` produces 6 `.so` + neon (8 installed names), each exporting **112 C API symbols** (triple-gated: exports + arity via `tools/verify_abi.py`; layout via `tools/audit_layout.py`). Runs in CI (`wheels.yml` `abi-gate` job).
 **Bench: WORKING** - `zig build -Doptimize=ReleaseFast bench` (B2 + moe_bench extensions): gemmExpert vectorized vs scalar ref at DeepSeek-V3 shapes — **2.8x (down, memory-bound) to 5.3x (prefill) measured**, maxdiff ≤ 1.7e-6; MoE forward end-to-end with default-vs-tuned tile params.
 **Runtime: WORKING** - work-stealing worker pool + **sched_setaffinity pinning (A3)** + **waitIdle/kt_cpuinfer_sync drain (B3)**; NUMA topology via /sys and /proc/cpuinfo + **mbind in NumaAllocator (A3)**; **L1/L2/L3 sysfs detection + selectTileParams (A4)**.
@@ -211,7 +211,7 @@ new functions would never be emitted into the .so.
 Tests: 6 new, in `tests/kernels/simd_kernels_tests.zig`, one per format,
 `fused == dequantizeRow + f32 dot` (no approximation) with deliberately
 non-uniform per-group scales, at m ∈ {1, 4, 5} and 3 super-blocks, plus the
-scalar path on the same assertion. Suite total 266 across 18 suites, `zig build test` exit 0.
+scalar path on the same assertion. Suite total 268 across 18 suites, `zig build test` exit 0.
 Also here: `gemmQ4_KScalar` (the BF16-activation Q4_K entry, i.e. Stream A's
 remaining item) got the same treatment and is now dispatched too.
 
@@ -671,6 +671,69 @@ reason — 2.1 GB/s against Q8_0's table-free 7.8 GB/s.
 - Do **not** sweep `src/kernels/amx/gemm_224_fp8.zig` into this commit. It holds
   an uncommitted lookup table written by a different session (see Stream B); it
   is not part of this work. Stage by filename.
+
+**Stream J — `vpshufb` table lookup + the real IQ4_XS bottleneck. DONE. CLAIMED
+(pshufb) since 2026-10-03.**
+
+**The prediction was wrong, and finding out why was the value.** I expected
+`vpshufb` to fix the m=1 case, on the theory that 8 scalar table loads per 8
+weights were the bottleneck (IQ4_XS at m=1 was 2 GB/s against Q8_0's table-free
+7.8 GB/s). Measured: **no reliable difference at all.** The win came from
+something else entirely.
+
+**What actually mattered: `f16_to_f32(blk.d)` was inside the per-sub-block scale
+helper.** IQ4_XS has one f16 super-block scale and EIGHT 32-weight sub-blocks, so
+that conversion was being redone 8 times per 256-weight block — and it sat at the
+head of a serial dependency chain immediately before the FMAs. At m=1 there are
+only four FMAs per sub-block to hide the latency, so the chain, not the table,
+was the bottleneck. Passing `d` in instead of re-reading it:
+
+| m | before | after |
+|---|---|---|
+| 1 | 4-6 ms | **1-2 ms** |
+| 4 | 5-7 ms | **3 ms** |
+| 8 | 11-15 ms | **7 ms** |
+
+i.e. 3x -> 5-9x at m=1 and 12x -> 17-19x at m=4/m=8.
+
+`vpshufb` is kept because it replaces 32 scalar table loads with 2 instructions
+and cannot be slower, but its effect was not measurable in isolation here and the
+commit does not claim otherwise.
+
+**The primitive** (`amx.pshufb16`) is in the arch layer, which is where a generic
+byte shuffle belongs. Getting the AT&T operand order wrong is silent: `vpshufb`
+takes the DATA operand second, and writing it first still compiles and still
+emits bytes — but the table then acts as the index, and `pshufb` writes zero for
+any index with bit 7 set, so every output becomes 0. It produced exactly 0/32 on
+the first attempt. The round-trip test uses table values 200..215, all of which
+have bit 7 set, specifically so that mistake cannot hide.
+
+`KVALUES_IQ4NL` is 16 bytes, which is byte-for-byte the shape `vpshufb` indexes,
+so the whole 16-entry non-linear table is now one instruction. `kvalues16` lives
+in `gemm_224_iq4_xs.zig` (which owns `KVALUES_IQ4NL`) and `gemm_224_iq4_nl.zig`
+imports it rather than duplicating. Both formats now unpack 16 weights per
+shuffle.
+
+**CAVEAT ON TODAY'S TIMINGS.** Partway through this work another agent started a
+multi-threaded CPU inference job (`zig-ai-engine --ppl` on Qwen3.5-0.8B) and the
+host went to load average 17 on 16 cores. Every number in this session's later
+entries was taken under that contention. Scalar-vs-AVX2 ratios are measured
+back-to-back in one binary so they are more robust than absolute times, but even
+they drift: the same m=8 case measured 10x, 14x and 19x on three consecutive
+runs. **Treat today's ratios as lower bounds and re-measure on an idle host
+before quoting them anywhere.** The 3x -> 17-19x move above is large enough to
+survive that noise; the pshufb null result is not resolvable either way.
+
+**A suite test can hang instead of failing.** `zig build test` stalled for 1300
+seconds at `test_kernels.test.Subpool pins worker threads to the configured CPU
+set (A3)` — the process sat at 0% CPU in `Sl` state with 2 threads, so it was
+blocked, not starved. No test has a timeout, so a hang blocks CI indefinitely
+rather than reporting a failure. Worth a per-test timeout; recorded here rather
+than fixed, since the worker pool is not this stream's file.
+
+**Verification.** Because the parallel runner stalls, every suite was verified by
+running its compiled binary directly: **268 tests, all passing** (266 plus the two
+new `vpshufb` tests). `verify_abi.py` 112/112; avx2 and amx variants build.
 
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
 

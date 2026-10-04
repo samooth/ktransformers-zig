@@ -256,6 +256,59 @@ pub fn tile_release() void {
     asm volatile ("tilerelease" ::: .{ .memory = true });
 }
 
+// ============================================================================
+// SSSE3 byte shuffle — a 16-entry table lookup in one instruction
+// ============================================================================
+//
+// `vpshufb` is exactly a 16-entry byte-indexed lookup: for each byte of the
+// index vector, bit 7 CLEAR selects `table[index & 15]` and bit 7 SET writes
+// zero. That makes it the natural fit for the small quant tables in this tree —
+// `KVALUES_IQ4NL` (16 i8 entries) is byte-for-byte the shape `vpshufb` wants.
+//
+// It matters because the alternative is 16 scalar table loads per lookup. The
+// vectorized IQ4_NL and IQ4_XS GEMMs were doing 8 per 8 weights and were
+// measurably lookup-bound at m=1 (2.1 GB/s, against 7.8 GB/s for the
+// table-free Q8_0 GEMM). One `vpshufb` replaces those with a single
+// instruction over 16 bytes, so it lifts every format whose table is 16 bytes
+// at once.
+///
+/// Only the low 16 bytes of `table` are read; indices must be 0..15.
+/// `nonvolatile` is NOT set — this is a pure function of its inputs, but Zig's
+/// `asm` treats outputs as clobbered unless a register class is given, and the
+/// "x" constraint handles that.
+pub const ByteVec = @Vector(32, u8);
+
+/// 32 parallel byte lookups in `table[0..16]`.
+pub fn pshufb16(table: ByteVec, idx: ByteVec) ByteVec {
+    // AT&T operand order reverses Intel's. Intel reads
+    //   VPSHUFB ymm_data, ymm_index, ymm_dst      (dst = shuffle(index, data))
+    // so AT&T must write the DATA operand second:
+    //   vpshufb %[i], %[t], %[r]                  means r = shuffle(t, i)
+    // Getting this the other way round still compiles and still emits bytes —
+    // it just emits zeros whenever the table bytes happen to have bit 7 SET,
+    // because the table would then be acting as the index, and pshufb writes
+    // zero for any index with bit 7 set. That is a silent wrong answer, not a
+    // compile error, so the round-trip test in
+    // tests/kernels/simd_kernels_tests.zig is load-bearing rather than
+    // decorative: it is what caught the swap the first time.
+    return asm ("vpshufb %[i], %[t], %[r]"
+        : [r] "=x" (-> ByteVec),
+        : [t] "x" (table),
+          [i] "x" (idx),
+    );
+}
+
+/// Broadcast a 16-byte table into both 128-bit lanes of a `ByteVec`, so one
+/// `pshufb16` can serve indices taken from either half of the result.
+pub fn pshufbTable(bytes: *const [16]u8) ByteVec {
+    var out: [32]u8 = undefined;
+    for (0..16) |i| {
+        out[i] = bytes[i];
+        out[i + 16] = bytes[i];
+    }
+    return out; // [32]u8 coerces to @Vector(32, u8)
+}
+
 /// Load tile from memory (row-major)
 /// Encoding: tileloadd (%[base],%[stride],1), %tmm%[tmm]
 /// base must be 64-byte aligned.
