@@ -66,6 +66,22 @@ parallel. Two rules so they do not collide:
    kernel files are one-per-stream. If you genuinely need an arch-layer
    change, say so in the claim rather than editing it.
 2. **CLAIM here first** (the protocol at the top of this file), then work.
+   Put the claim in **two** places: the section below, and a one-line comment at
+   the top of each file you intend to edit:
+
+   ```zig
+   // CLAIM: <handle> — <scope> — <date> — holds <shared file> until committed
+   ```
+
+   `grep -rn "^// CLAIM:" src/` answers "is this file free?" without anyone having
+   to remember to open this file — and that is the moment it matters, because a
+   claim only protects the sessions that know about it. A claim recorded here
+   but not in the file is a claim nobody sees; a claim in the file but not here
+   is a claim nobody counts.
+3. **Before you commit, check what you staged.** Another session's uncommitted
+   work can be sitting in the same tree, and `git add -A` will absorb it. Stage
+   the files you touched by name. If you did not write a hunk, it does not go in
+   your commit, however reasonable it looks next to your change.
 
 **Stream A follow-up — Q4_K m=1 routing. DONE (3.3x, commit `ab09aa5`).**
 
@@ -623,6 +639,40 @@ grid machinery, and IQ2_XS is a real DeepSeek format), then IQ3_XXS/IQ3_S
 together, then the two 1-bit formats last. The open `vpshufb` item below would
 also lift IQ4_NL, IQ4_XS and MXFP4 together, so doing it before the remaining
 seven may be worth more than a seventh format.
+
+**Stream J — `vpshufb` table lookup, shared. CLAIMED (iq4xs-avx2) since
+2026-10-03.** IN FLIGHT at the time of writing: `pshufb16` / `pshufbTable` in
+`src/kernels/arch/amx.zig`, `kvalues16` in `gemm_224_iq4_xs.zig`, uncommitted.
+
+**This claim holds `src/kernels/arch/amx.zig` exclusively until the work is
+committed.** That file is layer 1 and every kernel in the tree imports it, so no
+other task may touch it in the meantime. In particular it **blocks roadmap
+P1.3, the SwiGLU activation**, whose fix lives in `expVec` in the same file —
+do not start that task until this claim is released.
+
+Why the arch layer is the right home rather than a copy per format: `vpshufb`
+is an arch intrinsic, like the AMX tile helpers already there, and the whole
+point of the item is to have ONE implementation that the IQ and MX formats
+share. The cost is the wide blast radius, which is what the exclusive hold is
+for.
+
+The win it targets: the small quant tables (`KVALUES_IQ4NL` and its relatives)
+are 16 bytes, and `vpshufb` is exactly a 16-entry byte-indexed lookup, so the
+non-linear dequant that currently costs 8 scalar table loads per 8 weights
+becomes one instruction. IQ4_NL was measured lookup-bound at m=1 for that
+reason — 2.1 GB/s against Q8_0's table-free 7.8 GB/s.
+
+**Two traps in the helper, both worth a test rather than a comment.**
+- The AT&T operand order is the reverse of Intel's: `vpshufb %[i], %[t], %[r]`
+  means `r = shuffle(t, i)`. Written the other way round it still compiles and
+  still emits bytes, and it returns zero for any table byte with bit 7 set — a
+  silent wrong answer, not a build failure. `KVALUES_IQ4NL` is non-negative so
+  its bytes are clear, but the same helper is about to be applied to the 2-bit
+  and 1-bit tables, and at least one of those has signed entries. The round-trip
+  test must cover a table with a high-bit byte before the helper is shared.
+- Do **not** sweep `src/kernels/amx/gemm_224_fp8.zig` into this commit. It holds
+  an uncommitted lookup table written by a different session (see Stream B); it
+  is not part of this work. Stage by filename.
 
 ## ✅ Completed (2026-10-03 — AVX2 SIMD rework; C++ parity, several real bugs)
 
