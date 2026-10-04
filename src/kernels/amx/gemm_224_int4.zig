@@ -1,3 +1,4 @@
+// CLAIM: int4-avx2 — INT4 GPTQ GEMM — 2026-10-04
 // GEMM Kernel 224 INT4 GPTQ for AMX/AVX512
 // Ported from ktransformers kt-kernel/operators/amx/la/amx_kernels.hpp
 // INT4 weights with per-group scales and zeros (GPTQ-style quantization)

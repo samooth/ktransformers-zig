@@ -980,6 +980,21 @@ new `vpshufb` tests). `verify_abi.py` 112/112; avx2 and amx variants build.
 - The CI test step is now bounded (`timeout 2400 zig build test`), so the hang
   recorded above fails the job instead of stalling it.
 
+**Stream L — INT4 (GPTQ) GEMM. CLAIMED (int4-avx2) since 2026-10-04.**
+`src/kernels/amx/gemm_224_int4.zig`, roadmap P0.4. The last quant family in the
+tree with no vectorized path: `gemmFullTile` dispatches to `gemmFullTileScalar`
+on every non-AMX host, and that is an m/n/k triple loop, so the weight matrix is
+re-streamed from DRAM once per token row. The reference has three AVX2 INT4
+kernels (`gptq_int4-moe`, `rawint4-moe`, `gptq_int4_avxvnni-moe`).
+
+Scope as agreed: the scalar reference stays and becomes `pub` (it is the oracle),
+the AVX2 GPTQ path lands beside it, tests go in
+`tests/kernels/simd_kernels_tests.zig` (that file is open in another session, so
+they land as a separate append-only commit once it is free), and raw-INT4 is
+either added or recorded as deliberately out of scope with the reason. The
+`_avxvnni` variant is out of scope: this host has no VNNI and the scalar path
+stays the fallback for it.
+
 **Stream K — IQ2_XXS GEMM. DONE. The earlier "weak result" entry was WRONG and
 is corrected below. CLAIMED (iq2xs-avx2) since 2026-10-04.**
 
