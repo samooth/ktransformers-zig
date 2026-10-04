@@ -5,11 +5,17 @@
 // Output format (one line per case), consumed by run.sh:
 //   GEMM|<name>|<ms>|<GFLOPs>
 //   ACT|<name>|<ms>|<GB/s>
+//   GEMM|<name>|<ms>|<GB/s>      <- INT4 rows; the RATE COLUMN IS BYTES, and
+//                                   measure.zig's absolute mode prints it as-is
+//                                   with its band. Keep that in mind before
+//                                   adding a row whose rate is not GFLOP/s:
+//                                   the unit lives in the harness, not here.
 
 const std = @import("std");
 const root = @import("kt");
 
 const gemm_bf16 = root.gemm_bf16;
+const gemm_int4 = root.gemm_int4;
 const amx = root.amx;
 
 const KT_HIDDEN: usize = 7168;
@@ -28,6 +34,24 @@ const gemm_shapes = [_]Shape{
 
 const ACT_M: usize = 128;
 const ACT_N: usize = KT_INTER;
+
+/// INT4 GPTQ shapes. m = 1 and m = 4 only: this row exists to be an ABSOLUTE
+/// measurement (see measure.zig), and it is a bandwidth-bound decode either way,
+/// so more m values would cost pass time without changing what it reports.
+///
+/// INT4 IS THE FIRST ROW HERE WITH i8 ACTIVATIONS, and that is the point of it,
+/// not an incidental detail. Every other GEMM row is bf16 activations, which is
+/// exactly what `kquant_simd.gemmBF16xQuant` hardcodes (`widen16`) — so the
+/// tree currently has a "shared driver" that cannot express INT4 or the INT8
+/// path at all. This row is the evidence for why the shared driver must expose
+/// a decode slot AND a widening slot rather than be extended until it fits every
+/// format: the two things that make INT4 different from the rows above are
+/// i8 activations and a per-GROUP scale, and both are outside the driver's
+/// signature today.
+const int4_shapes = [_]Shape{
+    .{ .name = "int4 gptq", .m = 1, .n = KT_INTER, .k = KT_HIDDEN },
+    .{ .name = "int4 gptq m4", .m = 4, .n = KT_INTER, .k = KT_HIDDEN },
+};
 
 const WARMUP: usize = 2;
 const REPS: usize = 9;
@@ -102,6 +126,47 @@ fn benchGemm(alloc: std.mem.Allocator, outdir: []const u8, s: Shape) !void {
     std.debug.print("GEMM|{s}|{d:.4}|{d:.2}\n", .{ label, ms, gflops });
 }
 
+/// INT4 GPTQ GEMM, reported as ABSOLUTE throughput over weight bytes.
+///
+/// No output dump: `compare.py` diffs the `out_zig_gemm_*` dumps against the C++
+/// harness's, and there is no C++ row to diff against — writing a dump nothing
+/// reads would suggest a comparison that does not exist.
+fn benchInt4Gemm(alloc: std.mem.Allocator, s: Shape) !void {
+    const kb = s.k / 32;
+
+    var rng: u64 = 0x9E3779B97F4A7C15;
+    const act = try alloc.alloc(i8, s.m * s.k);
+    for (act) |*v| {
+        v.* = @bitCast(@as(u8, @truncate(splitmix64(&rng) >> 24)));
+    }
+    const w = try alloc.alloc(gemm_int4.BlockQ4_0, s.n * kb);
+    for (w) |*blk| {
+        // Complete blocks: every one of the 16 codes appears (the zero point 8
+        // and both nibble halves), and a bf16 scale of realistic magnitude.
+        blk.d = amx.f32_to_bf16(@as(f32, @floatFromInt(@as(i32, @intCast(splitmix64(&rng) % 1024)) + 1)) * 0.0078125);
+        for (&blk.qs) |*q| q.* = @truncate(splitmix64(&rng) >> 24);
+    }
+    const c = try alloc.alloc(f32, s.m * s.n);
+
+    const a_ptr: *const i8 = @ptrCast(act.ptr);
+    const b_ptr: *const gemm_int4.BlockQ4_0 = @ptrCast(w.ptr);
+
+    for (0..WARMUP) |_| gemm_int4.GemmKernel224Int4.gemmAvx2(a_ptr, s.k, b_ptr, kb, c.ptr, s.n, s.m, s.n, s.k);
+    var best: u64 = std.math.maxInt(u64);
+    for (0..REPS) |_| {
+        const t0 = nowNanos();
+        gemm_int4.GemmKernel224Int4.gemmAvx2(a_ptr, s.k, b_ptr, kb, c.ptr, s.n, s.m, s.n, s.k);
+        const ns = nowNanos() - t0;
+        if (ns < best) best = ns;
+    }
+
+    const ms = @as(f64, @floatFromInt(best)) / 1e6;
+    const weight_bytes = w.len * @sizeOf(gemm_int4.BlockQ4_0);
+    const gbs = @as(f64, @floatFromInt(weight_bytes)) / (ms * 1e-3) / 1e9;
+    const label = try std.fmt.allocPrint(alloc, "{s} [m={d},n={d},k={d}]", .{ s.name, s.m, s.n, s.k });
+    std.debug.print("GEMM|{s}|{d:.4}|{d:.2}\n", .{ label, ms, gbs });
+}
+
 fn benchAct(alloc: std.mem.Allocator, outdir: []const u8) !void {
     var rng: u64 = 0x13198A2E03707344;
     const g = try alloc.alloc(amx.bf16, ACT_M * ACT_N);
@@ -138,5 +203,6 @@ pub fn main(init: std.process.Init) !void {
     const outdir = if (args.len > 1) args[1] else ".";
 
     for (gemm_shapes) |s| try benchGemm(alloc, outdir, s);
+    for (int4_shapes) |s| try benchInt4Gemm(alloc, s);
     try benchAct(alloc, outdir);
 }

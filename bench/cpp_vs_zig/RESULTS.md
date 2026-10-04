@@ -254,6 +254,55 @@ cross-implementation reference would have to be ported in from llamafile's
 | SwiGLU | (same header) | vectorized, 0.68x of reference |
 | FP8 E4M3/E5M2 | yes (12 + 4) | scalar + AMX tile |
 | MXFP4 / MXFP8 | yes (42 / 18) | scalar + AMX tile |
-| GPTQ-INT4 / raw-INT4 | yes (4,8,7 / 18,7) | scalar + AMX tile; no raw-INT4 kernel at all |
+| GPTQ-INT4 / raw-INT4 | yes (4,8,7 / 18,7) | GPTQ-INT4 vectorized (AVX2 + AMX tile); **no raw-INT4 kernel at all** |
 | Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K | **none** | vectorized (6.3x-15.7x over own scalar) |
 | Q8_0, IQ4_NL, IQ4_XS, IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S | **none** | scalar |
+## Absolute mode — formats the C++ reference has no kernel for
+
+`measure.zig` normally answers "is the port faster than the reference", which is
+a quotient of two measurements and needs a control on each side. Some formats have
+no C++ row at all — `cpp_bench.cpp` covers BF16 GEMM and the activation, and
+nothing else — and for those there is no quotient to resolve. Absolute mode
+reports the Zig ms, the harness-reported figure, and `dev(zig, ctl)` as a band,
+with **no ratio and no verdict**. It deliberately does not print UNMEASURABLE:
+that word means "a comparison this pass could not resolve", and reusing it would
+make a successful measurement read as a failed one.
+
+The band is `zig_bench` against **itself** in the same pass. That is the entire
+error budget of a single measurement — one code path, sampled N times — and it is
+why one control suffices here when the ratio needs two: a ratio divides two
+independent measurements, so each side contributes error and the two compound.
+The distinction is asserted in the code so the ratio path cannot be "simplified"
+onto one control later.
+
+INT4 GPTQ is the first row in this mode, and it is the first row in the Zig
+harness with **i8 activations** — which is the axis `kquant_simd.gemmBF16xQuant`
+hardcodes (`widen16`), so the tree's "shared driver" cannot express INT4 or the
+INT8 path at all today. The row is the evidence for why that driver needs a
+decode slot and a widening slot rather than being widened until it fits.
+
+Recorded pass: commit `2d91e7a`, `--iters 7 --pin 9`, filter `gptq`, load average
+27.5/24.5/13.6, min-of-7 across process invocations with each harness doing its
+own min-of-9 in-process.
+
+| row | shape | Zig ms | **band** | GB/s over weight bytes |
+|---|---|---|---|---|
+| int4 gptq | m=1, n=2048, k=7168 | 1.860 | **±27.0%** | 3.70 |
+| int4 gptq m4 | m=4, n=2048, k=7168 | 2.675 | **±51.5%** | 2.26 |
+
+**The band is the finding, not the figure.** An earlier pass at load 5 gave 4.07
+and 2.89 GB/s for these two rows; this one at load 27 gives 3.70 and 2.26. That
+movement is what ±27% and ±51% mean, and it is why neither figure should be
+quoted without its band or off an idle host. The m=4 row is the wider of the two
+because it does four times the arithmetic over the same weight stream.
+
+`--self-test --cpp-absent` runs no C++ arm at all, which forces every row through
+the absolute path; inside `--self-test` that path prints its band and **refuses
+the figure**, because both arms are then the same binary and nothing has been
+validated against an independent implementation. `--cpp-absent` without
+`--self-test` is refused outright.
+
+The 1.49x that INT4 shows against the **Q8_0** control (`bench/int4_bench.zig`,
+TODO.md Stream L) is *not* in this table: Q8_0 is not a harness row, so that
+comparison carries no harness band and should be read as the weaker of the two
+claims until it is either added to the harness or re-run on an idle host.

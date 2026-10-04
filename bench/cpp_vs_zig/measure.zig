@@ -55,6 +55,16 @@
 //   --raw           TSV instead of the markdown table
 //   --self-test     run BOTH arms as the same binary, so the true ratio is
 //                   exactly 1.0 and every row must come back UNMEASURABLE
+//   --cpp-absent    self-test only: run NO C++ arm at all, modelling a format
+//                   the reference has no kernel for. Every row then takes the
+//                   absolute path, and in --self-test it must print its band
+//                   and REFUSE its figure. Without this the absolute mode is
+//                   reachable in a self-test only by accident, and an unguarded
+//                   mode that emits confident absolute numbers off one control
+//                   is the same quiet confidence this tool exists to remove.
+//                   Refused outside --self-test: a real pass that silences the
+//                   C++ arm has no cross-implementation check at all, and must
+//                   not be able to print a figure.
 //
 // --self-test exists because the control arm should be re-measurable on demand
 // rather than borrowed from a previous session's notes. It is also the check
@@ -86,10 +96,17 @@ const Samples = struct {
     label: []const u8 = "",
     ms: [ARM_COUNT]std.ArrayList(f64) = @splat(.empty),
     seen: [ARM_COUNT]usize = @splat(0),
+    /// Set-up milliseconds this bench reported for the row, if any. `null` means
+    /// the bench did not say, and the tool then says so rather than assuming 1x.
+    setup_ms: ?f64 = null,
+    /// The harness's own rate for the last sample seen on that arm (GFLOP/s for
+    /// a GEMM row, GB/s for an activation row). Carried only because ABSOLUTE
+    /// mode prints it; ratio mode has no use for it.
+    rate: [ARM_COUNT]f64 = @splat(0),
 };
 
 /// One `KIND|label|ms|rate` line, parsed.
-const Reading = struct { label: []const u8, ms: f64 };
+const Reading = struct { label: []const u8, ms: f64, rate: f64 };
 
 /// Linear lookup: there are single-digit row counts, and this avoids taking a
 /// dependency on a std container whose 0.16 initializer churned under us.
@@ -110,6 +127,14 @@ const Row = struct {
     lo: [ARM_COUNT]f64,
     mid: [ARM_COUNT]f64,
     hi: [ARM_COUNT]f64,
+    /// Setup reported by the bench for this row, if any. See SETUP_DOMINATED.
+    setup_ms: ?f64 = null,
+    /// The Zig harness's own rate for this row, carried through untouched.
+    rate: f64 = 0,
+    /// ABSOLUTE MODE: the C++ harness never reported this label, so there is no
+    /// cross-implementation ratio to resolve. The row is a successful
+    /// measurement of the Zig side with a band, not a failed comparison.
+    absolute: bool = false,
 };
 
 const MIN_ITERS: usize = 3;
@@ -131,6 +156,7 @@ pub fn main(init: std.process.Init) !void {
     var pin: ?usize = null;
     var raw = false;
     var self_test = false;
+    var cpp_absent = false;
     var filter: ?[]const u8 = null;
 
     var i: usize = 1;
@@ -155,6 +181,8 @@ pub fn main(init: std.process.Init) !void {
             raw = true;
         } else if (std.mem.eql(u8, a, "--self-test")) {
             self_test = true;
+        } else if (std.mem.eql(u8, a, "--cpp-absent")) {
+            cpp_absent = true;
         } else if (std.mem.startsWith(u8, a, "--")) {
             std.debug.print("unknown option {s}\n", .{a});
             return error.BadArgs;
@@ -165,6 +193,17 @@ pub fn main(init: std.process.Init) !void {
 
     if (self_test) {
         cpp_path = zig_path;
+    }
+
+    if (cpp_absent and !self_test) {
+        std.debug.print(
+            "refusing --cpp-absent without --self-test: silencing the C++ arm in a\n" ++
+                "real pass would print absolute figures with nothing to validate them against,\n" ++
+                "which is the failure mode this tool exists to prevent. Pass --self-test,\n" ++
+                "which withholds every figure and checks the band instead.\n",
+            .{},
+        );
+        return error.BadArgs;
     }
 
     if (iters < MIN_ITERS) {
@@ -201,6 +240,11 @@ pub fn main(init: std.process.Init) !void {
         // Interleaved: one invocation of each arm per iteration, in a fixed
         // rotation, so no arm systematically owns a quieter slice of the pass.
         for (std.enums.values(Arm)) |arm| {
+            // `--cpp-absent` runs neither C++ arm, so every label is reported
+            // by the Zig side alone and takes the absolute path. Skipping the
+            // arm (rather than running it and discarding its samples) keeps the
+            // pass cheap and makes the condition obvious at the call site.
+            if (cpp_absent and (arm == .cpp or arm == .cppctl)) continue;
             const path = switch (arm) {
                 .cpp => cpp_path,
                 .cppctl => cpp_path, // same-code control for the C++ side
@@ -208,7 +252,15 @@ pub fn main(init: std.process.Init) !void {
                 .ctl => zig_path, // same-code control for the Zig side
             };
             const parsed = try runHarness(io, init.gpa, arena, path, out_dir);
-            for (parsed) |kv| {
+            for (parsed.setup) |sv| {
+                const sidx: usize = @intFromEnum(arm);
+                const slot = try slotFor(arena, &table, sv.label);
+                _ = sidx;
+                // First arm to report a setup for this row wins; they are
+                // measuring the same row and should agree.
+                if (slot.setup_ms == null) slot.setup_ms = sv.ms;
+            }
+            for (parsed.rows) |kv| {
                 if (filter) |f| {
                     if (std.mem.indexOf(u8, kv.label, f) == null) continue;
                 }
@@ -219,6 +271,7 @@ pub fn main(init: std.process.Init) !void {
                     slot.ms = @splat(.empty);
                 }
                 slot.seen[idx] += 1;
+                slot.rate[idx] = kv.rate;
                 try slot.ms[idx].append(arena, kv.ms);
             }
         }
@@ -228,23 +281,53 @@ pub fn main(init: std.process.Init) !void {
     var rows = std.ArrayList(Row).empty;
     defer rows.deinit(arena);
     for (table.items) |slot| {
-        var complete = true;
-        for (std.enums.values(Arm)) |arm| {
-            if (slot.seen[@intFromEnum(arm)] != iters) complete = false;
-        }
-        if (!complete) {
-            // A row missing from any arm would otherwise be compared against a
-            // different number of samples -- exactly the min-of-N-vs-min-of-M
-            // mistake this tool exists to prevent.
+        // The Zig side is what BOTH modes need: the row itself and its same-code
+        // control. Without `ctl` there is no floor for either, so the row goes.
+        const zig_seen = slot.seen[@intFromEnum(Arm.zig)];
+        const ctl_seen = slot.seen[@intFromEnum(Arm.ctl)];
+        if (zig_seen != iters or ctl_seen != iters) {
+            // A row missing an expected sample would otherwise be compared
+            // against a different number of samples -- exactly the
+            // min-of-N-vs-min-of-M mistake this tool exists to prevent.
             std.debug.print(
-                "skipping {s}: samples per arm cpp={d} zig={d} ctl={d}, expected {d} each\n",
-                .{ slot.label, slot.seen[@intFromEnum(Arm.cpp)], slot.seen[@intFromEnum(Arm.zig)], slot.seen[@intFromEnum(Arm.ctl)], iters },
+                "skipping {s}: Zig side has zig={d} ctl={d}, expected {d} each\n",
+                .{ slot.label, zig_seen, ctl_seen, iters },
             );
             continue;
         }
-        var row = Row{ .label = slot.label, .best = @splat(0), .lo = @splat(0), .mid = @splat(0), .hi = @splat(0) };
+
+        // TWO CASES, and the difference matters. `cpp_seen == 0` means the C++
+        // harness has no such row at all -- the format has no kernel over there
+        // -- which is an ABSOLUTE row, reported with a band and no ratio. A
+        // non-zero count that is not `iters` means the two harnesses disagree
+        // about the row, and that is the loud skip above; it must never fall
+        // through to absolute mode, because "the reference disagrees with us"
+        // is not the same finding as "the reference does not have this".
+        const cpp_seen = slot.seen[@intFromEnum(Arm.cpp)];
+        const cppctl_seen = slot.seen[@intFromEnum(Arm.cppctl)];
+        const no_cpp_arm = cpp_seen == 0 and cppctl_seen == 0;
+        if (!no_cpp_arm and (cpp_seen != iters or cppctl_seen != iters)) {
+            std.debug.print(
+                "skipping {s}: C++ side has cpp={d} cppctl={d}, expected {d} each\n",
+                .{ slot.label, cpp_seen, cppctl_seen, iters },
+            );
+            continue;
+        }
+
+        var row = Row{
+            .label = slot.label,
+            .best = @splat(0),
+            .lo = @splat(0),
+            .mid = @splat(0),
+            .hi = @splat(0),
+            .rate = slot.rate[@intFromEnum(Arm.zig)],
+            .absolute = no_cpp_arm,
+        };
+        // Only the arms this row actually has; the rest stay 0 and are never
+        // read, because `report` branches on `absolute` before touching `cpp`.
         for (std.enums.values(Arm)) |arm| {
             const idx: usize = @intFromEnum(arm);
+            if (slot.seen[idx] == 0) continue;
             const s = slot.ms[idx].items;
             std.mem.sort(f64, s, {}, std.sort.asc(f64));
             row.lo[idx] = s[0];
@@ -288,20 +371,35 @@ pub fn main(init: std.process.Init) !void {
 /// The cost is conservatism, which is the correct direction to err. Per-side
 /// ranges compound, so two sides each varying 10% give a floor of 1.21x, and a
 /// claimed 1.10x win will be refused. That refusal is the feature.
+fn sideDev(row: Row, x: Arm, y: Arm) f64 {
+    var lo: f64 = std.math.inf(f64);
+    var hi: f64 = 0;
+    inline for (.{ x, y }) |arm| {
+        const idx: usize = @intFromEnum(arm);
+        lo = @min(lo, row.lo[idx]);
+        hi = @max(hi, row.hi[idx]);
+    }
+    return if (lo > 0) @max(hi / lo, 1.0) else 1.0;
+}
+
 fn floorFor(row: Row) f64 {
-    const sideDev = struct {
-        fn f(a: Row, x: Arm, y: Arm) f64 {
-            var lo: f64 = std.math.inf(f64);
-            var hi: f64 = 0;
-            inline for (.{ x, y }) |arm| {
-                const idx: usize = @intFromEnum(arm);
-                lo = @min(lo, a.lo[idx]);
-                hi = @max(hi, a.hi[idx]);
-            }
-            return if (lo > 0) @max(hi / lo, 1.0) else 1.0;
-        }
-    }.f;
     return @max(sideDev(row, .cpp, .cppctl) * sideDev(row, .zig, .ctl), 1.0);
+}
+
+/// Band for an ABSOLUTE row: `dev(zig, ctl)` and nothing else.
+///
+/// WHY ONE CONTROL IS ENOUGH HERE AND NOT IN `floorFor` — the distinction is
+/// worth keeping explicit, because collapsing it is the obvious "simplification"
+/// and it would be wrong in one direction and look merely tidy in the other.
+/// A RATIO is a quotient of two independently-measured minima (C++ and Zig), so
+/// each side contributes its own error and the two compound: that is why there
+/// are four arms and two controls. An ABSOLUTE figure is ONE measurement, so its
+/// only error term is that measurement's own spread, which is precisely what
+/// `zig` against `ctl` bounds — the same binary, the same code, the same pass.
+/// Adding the C++ side's spread to an absolute number would not make it more
+/// trustworthy; there is no C++ number in it to be wrong about.
+fn absoluteBand(row: Row) f64 {
+    return @max(sideDev(row, .zig, .ctl), 1.0);
 }
 
 const Verdict = enum { faster, slower, unmeasurable };
@@ -330,10 +428,16 @@ fn report(
     if (!raw) {
         if (self_test) {
             std.debug.print("# SELF-TEST — both arms are the same binary\n\n", .{});
-            std.debug.print("The true ratio is exactly 1.0, so **every row must read UNMEASURABLE**.\n", .{});
+            std.debug.print("The true ratio is exactly 1.0, so **every comparison row must read UNMEASURABLE**.\n", .{});
             std.debug.print("The floor printed below is this host's measured noise band for each row,\n", .{});
-            std.debug.print("re-derived here and now. A row that prints a ratio means the refusal\n", .{});
-            std.debug.print("logic is broken.\n\n", .{});
+            std.debug.print("re-derived here and now. A comparison row that prints a ratio means the\n", .{});
+            std.debug.print("refusal logic is broken.\n\n", .{});
+            std.debug.print("Rows with no C++ arm take the absolute path instead. There the self-test must\n", .{});
+            std.debug.print("print the band and REFUSE the figure: a mode that can emit a confident absolute\n", .{});
+            std.debug.print("number off one control and no cross-implementation check is the same quiet\n", .{});
+            std.debug.print("confidence this tool exists to remove, and it would be untested by the ratio\n", .{});
+            std.debug.print("rows above. A self-test that prints an absolute figure means this mode is\n", .{});
+            std.debug.print("unguarded.\n\n", .{});
         } else {
             std.debug.print("# C++ reference vs Zig port — resolvable ratios only\n\n", .{});
         }
@@ -353,7 +457,19 @@ fn report(
         std.debug.print("row\tcpp_ms\tzig_ms\tfloor\tratio\tverdict\n", .{});
     }
 
+    // ABSOLUTE rows are collected and printed as their own table, AFTER the
+    // ratio table, because they are a different KIND OF STATEMENT: not "the
+    // port is faster than the reference" but "here is what the port does, with
+    // the spread this host produced for it". Mixing the two in one table with
+    // empty cells is how a reader ends up treating a missing comparison as a
+    // measured one.
+    var absolute_rows: usize = 0;
+
     for (rows) |row| {
+        if (row.absolute) {
+            absolute_rows += 1;
+            continue;
+        }
         const cpp = row.best[@intFromEnum(Arm.cpp)];
         const zig = row.best[@intFromEnum(Arm.zig)];
         const floor = floorFor(row);
@@ -382,7 +498,52 @@ fn report(
         }
     }
 
-    std.debug.print("\n{d} of {d} rows resolved above the control's noise floor.\n", .{ resolved, rows.len });
+    if (absolute_rows > 0) {
+        std.debug.print("\n", .{});
+        if (!raw) {
+            std.debug.print("# No C++ arm — absolute figures, with this pass's band\n\n", .{});
+            std.debug.print("The C++ harness has no row for these, because it has no kernel for the format:\n", .{});
+            std.debug.print("there is nothing to compare against, so there is no ratio and no verdict, and no\n", .{});
+            std.debug.print("`UNMEASURABLE` either — that word means a comparison this pass could not resolve, and\n", .{});
+            std.debug.print("reusing it here would make a successful measurement read as a failed one.\n\n", .{});
+            std.debug.print("`band` is the spread of `zig_bench` against ITSELF in this pass (`dev(zig, ctl)`),\n", .{});
+            std.debug.print("which is the whole error budget of a single measurement: one code path, sampled\n", .{});
+            std.debug.print("`iters` times. It is NOT the ratio floor, which additionally carries the C++ side's\n", .{});
+            std.debug.print("spread because a ratio divides two measurements.\n\n", .{});
+            if (self_test) {
+                std.debug.print("**SELF-TEST: the figure column is withheld.** Both arms are the same binary, so\n", .{});
+                std.debug.print("nothing here has been validated against an independent implementation. The band\n", .{});
+                std.debug.print("is printed because the band is the part that must survive the self-test.\n\n", .{});
+            }
+            std.debug.print("| row | Zig ms | band | figure | note |\n", .{});
+            std.debug.print("|---|---|---|---|---|\n", .{});
+        }
+        for (rows) |row| {
+            if (!row.absolute) continue;
+            const zig = row.best[@intFromEnum(Arm.zig)];
+            const band = absoluteBand(row);
+            const figure = if (self_test)
+                "withheld (self-test)"
+            else if (row.rate > 0)
+                try std.fmt.allocPrint(arena, "{d:.2}", .{row.rate})
+            else
+                "not reported by the harness";
+            if (raw) {
+                std.debug.print("{s}\t{d:.4}\t{d:.3}\t{s}\tno C++ arm\n", .{ row.label, zig, band, figure });
+            } else {
+                std.debug.print("| {s} | {d:.4} | +-{d:.1}% | {s} | no C++ arm |\n", .{
+                    row.label, zig, (band - 1.0) * 100.0, figure,
+                });
+            }
+        }
+    }
+
+    const ratio_rows = rows.len - absolute_rows;
+    std.debug.print("\n{d} of {d} comparison rows resolved above the control's noise floor", .{ resolved, ratio_rows });
+    if (absolute_rows > 0) {
+        std.debug.print("; {d} row(s) have no C++ arm and are reported above as absolute figures", .{absolute_rows});
+    }
+    std.debug.print(".\n", .{});
     if (unresolved > 0) {
         std.debug.print(
             "The unresolved rows are not ties. They are rows where this pass could not\n" ++
@@ -393,7 +554,14 @@ fn report(
     }
 }
 
-/// Run one harness and parse its `KIND|label|ms|rate` lines.
+/// Everything one harness invocation reported.
+const Parsed = struct {
+    rows: []Reading,
+    setup: []Reading,
+};
+
+/// Run one harness and parse its `KIND|label|ms|rate` lines, plus any optional
+/// `SETUP|label|ms` lines.
 ///
 /// The Zig harness prints via std.debug.print (stderr) and the C++ one via
 /// printf (stdout), so both streams are scanned.
@@ -403,7 +571,7 @@ fn runHarness(
     arena: std.mem.Allocator,
     path: []const u8,
     out_dir: []const u8,
-) ![]Reading {
+) !Parsed {
     const argv = [_][]const u8{ path, out_dir };
     var env_map = std.process.Environ.Map.init(arena);
     try env_map.put("KT_BENCH_OUT", out_dir);
@@ -427,25 +595,44 @@ fn runHarness(
     }
 
     var out = std.ArrayList(Reading).empty;
-    try parseInto(arena, res.stdout, &out);
-    try parseInto(arena, res.stderr, &out);
-    return out.items;
+    var setup = std.ArrayList(Reading).empty;
+    try parseInto(arena, res.stdout, &out, &setup);
+    try parseInto(arena, res.stderr, &out, &setup);
+    return .{ .rows = out.items, .setup = setup.items };
 }
 
 fn parseInto(
     arena: std.mem.Allocator,
     text: []const u8,
     out: *std.ArrayList(Reading),
+    setup_out: ?*std.ArrayList(Reading),
 ) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         if (line.len == 0) continue;
         var parts = std.mem.splitScalar(u8, line, '|');
         const kind = parts.next() orelse continue;
+        if (std.mem.eql(u8, kind, "SETUP")) {
+            // Optional: `SETUP|label|ms`, how long this bench spent building
+            // inputs. Benches with trivial setup simply do not print it, and the
+            // tool then reports the ratio as unknown instead of inventing 1x.
+            const slabel = parts.next() orelse continue;
+            const sms = parts.next() orelse continue;
+            const v = std.fmt.parseFloat(f64, sms) catch continue;
+            try setup_out.?.append(arena, .{ .label = try arena.dupe(u8, slabel), .ms = v });
+            continue;
+        }
         if (!std.mem.eql(u8, kind, "GEMM") and !std.mem.eql(u8, kind, "ACT")) continue;
         const label = parts.next() orelse continue;
         const ms_str = parts.next() orelse continue;
         const ms = std.fmt.parseFloat(f64, ms_str) catch continue;
+        // The rate is the 4th field and is OPTIONAL: older harnesses and hand
+        // written rows may not print one. Its absence is not a parse failure —
+        // it only means absolute mode has no figure to show for that row.
+        const rate: f64 = if (parts.next()) |rate_str|
+            std.fmt.parseFloat(f64, rate_str) catch 0
+        else
+            0;
         // Both harnesses use the same labels; if they ever diverge, keying on
         // the label means a missing row is skipped rather than mismatched.
         //
@@ -456,7 +643,7 @@ fn parseInto(
         // printed the row as "  ode gate/up [m=1,n=2048,k=7168]", three
         // characters of a label read out of freed memory. A measurement tool
         // that can print a corrupted row label can print a corrupted row VALUE.
-        try out.append(arena, .{ .label = try arena.dupe(u8, label), .ms = ms });
+        try out.append(arena, .{ .label = try arena.dupe(u8, label), .ms = ms, .rate = rate });
     }
 }
 
