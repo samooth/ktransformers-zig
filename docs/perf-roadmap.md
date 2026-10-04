@@ -530,6 +530,46 @@ widened it into a range.
 What replaces the band is a better question: **do the five land at ~0.93 GB/s?**
 One measured point against one measured floor, which is well posed.
 
+### The five-format experiment, designed around a predicted exception
+
+The question is **not** "do the five land at ~0.93 GB/s". It is **"do the three
+unsigned ones land there, and do the two signed ones land somewhere else?"** — a
+prediction with a specific direction of failure, which a flat point comparison
+does not have. If IQ1_S and IQ1_M come in near 0.93 anyway, the signed unpack is
+free and Stream K's `grid8s` split was insurance rather than necessity. If they
+land low, the cost of signed magnitude is localised in a two-format experiment.
+
+All three premises verified in source (2026-10-04), because the first two change
+the design and the third nearly did not survive a sloppy check:
+
+**1. `grid8s` is signed, and only IQ1_S and IQ1_M use it.** Defined at
+`gemm_224_iq2_xxs.zig:287` — in an *unsigned* format's file. `gemm_224_iq1_s.zig:37`
+and `gemm_224_iq1_m.zig:33` both import it with the comment "import, never
+re-declare". Single-owner pattern working as intended: one file owns both unpacks
+and the 1-bit formats import across. Do not go looking for it in a 1-bit file.
+
+**2. IQ1_M's scale is structurally different, not mechanically.** The f16 global
+scale is "HIDDEN in" the scales-nibble shuffle (`scales: [QK_K/32]u8`, 3-bit
+scales plus hidden f16 nibbles) and the quantizer "ends with a GLOBAL d refit over
+the quantized scales". In the hot loop `dl1`/`dl2` are recomputed per 32-weight
+group, so it cannot be hoisted the way `iq3_xxs`'s `dsuper` is — that one is
+literally commented "per BLOCK, hoisted". This is a real inner-loop difference
+between the two 1-bit formats, not a detail.
+
+**3. The group scales differ — and the source says so itself.** `iq3_xxs`:
+`db = d * (0.5 + (aux32 >> 28)) * 0.5`, carrying the comment "**NOTE: 0.5 here,
+not the 0.25 the IQ2 formats use**"; `iq2_xxs` uses `* 0.25`. `iq3_s` uses
+`d * (1.0 + 2.0 * scale)`, with its scale at bit 8 so it is masked `0x100`, not
+`0x300`.
+
+Worth recording *how* premise 3 nearly failed: grepping the files for `0.25`/`0.5`
+literals shows both in all five of iq2_xxs/iq2_xs/iq2_s/iq3_xxs/iq3_s, and only
+`0.5` in the 1-bit pair — which looks like it contradicts the claim. It does not,
+because `0.5 +` appears in every one of them and only the *trailing* multiplier
+differs. A literal-presence grep cannot see the difference between a constant that
+is used and a constant that is used as a summand. The check that settles it is
+reading the expression.
+
 ### The bench that measures the harness — third instance, same shape
 
 Setup for these formats is ~1300x the measurement:

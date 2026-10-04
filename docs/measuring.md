@@ -108,6 +108,36 @@ Two further rules:
   statement about the baseline, not about the kernel. `1.26 GB/s at m=1` places a
   format correctly next to its siblings; `69x` places it nowhere.
 
+## A shared cost attributed to each consumer inflates by the number of consumers
+
+The IQ anchor bench times two formats' setup in one span and then reports the
+total against **each** format's row. Every row therefore carried roughly twice
+its own setup: the ratios read 4404x and 1398x when the truth was 914x and 1845x.
+Split per format, they changed by a factor of ~2.5 and ~3.
+
+This one is worth its own rule because **there is no arithmetic error in it**. The
+division is right, the units are right, the number has four significant figures and
+looks like a measurement. It survived three revisions of a table because every
+reviewer's instinct — check the formula, check the units, sanity-check the
+magnitude — passes it.
+
+- **Time each consumer's own cost.** If two things share a setup, either time them
+  separately or divide the shared part by the number of consumers, and say which
+  you did.
+- **The error is invisible to the very checks that catch other errors.** The
+  load-dependent floor (§ above) is wrong in a way you can see. This is wrong in a
+  way that looks right.
+- **It has a signature: a number that is suspiciously round, or suspiciously
+  stable across formats it should not resemble.** The fix is to ask what the
+  denominator counted, not whether the division is correct.
+
+The general form: **any per-row figure derived from a span that covers more than
+one row needs the attribution stated, not inferred.** Which is also the argument
+for printing `setup:meas` per row instead of noting it once — and the reason the
+ratio differs per format here (914x for IQ2_XXS, 1845x for IQ2_XS, because the
+512-entry grid init is the expensive one) rather than being a constant of the
+family.
+
 ## Adding an enum variant: iterate the enum, never a hand-written list
 
 This is a shape failure, not a review failure, and it is worth separating those
