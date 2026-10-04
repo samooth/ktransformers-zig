@@ -1760,3 +1760,95 @@ test "FP8 row scale is applied once, after the accumulation" {
     // The two must genuinely differ, or the assertion above proves nothing.
     try testing.expect(got[0] != scal[0]);
 }
+
+
+test "FP8 E4M3 encode∘decode round trips every encoding; saturation is 448, not NaN" {
+    const fp8 = kt.gemm_fp8;
+
+    // 1. All 256 encodings, through decode -> encode and back. 0x7F / 0xFF are
+    //    the single NaN hole and decode to 0, so they cannot come back — every
+    //    other byte must. This is the sweep that measures the old encoder at
+    //    14 real failures out of 256 (16 counting the NaN hole), worst case
+    //    100% relative: byte 0x01 (2^-9) encoded to 0x00, and 500.0 encoded to
+    //    0x7F which the decoder then maps to 0 — an over-range weight was
+    //    silently deleted rather than clipped.
+    var failures: usize = 0;
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        if (b == 0x7F or b == 0xFF) {
+            try testing.expectEqual(@as(f32, 0.0), fp8.fp8e4m3_to_f32(b));
+            continue;
+        }
+        const back = fp8.f32_to_fp8e4m3(fp8.fp8e4m3_to_f32(b));
+        if (back != b) failures += 1;
+    }
+    try testing.expectEqual(@as(usize, 0), failures);
+
+    // 2. Saturation clips to the largest FINITE encoding. 0x7E is 448; 0x7F is
+    //    NaN, and returning it is how the old encoder turned 500.0 into 0.
+    const sat = [_][2]f32{
+        .{ 500.0, 448.0 },
+        .{ -500.0, -448.0 },
+        .{ 1.0e9, 448.0 },
+        .{ -1.0e9, -448.0 },
+        .{ std.math.inf(f32), 448.0 },
+        .{ -std.math.inf(f32), -448.0 },
+        .{ 449.0, 448.0 },
+        .{ 448.0, 448.0 }, // the boundary itself is already representable
+    };
+    for (sat) |s| {
+        const enc = fp8.f32_to_fp8e4m3(s[0]);
+        try testing.expect(enc != 0x7F and enc != 0xFF);
+        try testing.expectEqual(s[1], fp8.fp8e4m3_to_f32(enc));
+    }
+
+    // 3. The mantissa carry. 3.875 is 1.1111b x 2^1: four mantissa bits, so it
+    //    rounds up out of the 3-bit field and into the exponent. Masking the
+    //    overflow gave 0x40 (2.0) — a 2x error on 1/16 of the normal range.
+    try testing.expectEqual(@as(u8, 0x48), fp8.f32_to_fp8e4m3(3.875));
+    try testing.expectEqual(@as(f32, 4.0), fp8.fp8e4m3_to_f32(fp8.f32_to_fp8e4m3(3.875)));
+
+    // 4. Round-to-nearest-EVEN on the exact halfway cases, which is where
+    //    round-half-up differs. 1.0625 is halfway between 1.0 (mantissa 0,
+    //    even) and 1.125 (mantissa 1, odd) -> 1.0. 1.1875 is halfway between
+    //    1.125 (odd) and 1.25 (even) -> 1.25. The old encoder returned 1.125
+    //    for both, i.e. always up.
+    try testing.expectEqual(@as(u8, 0x38), fp8.f32_to_fp8e4m3(1.0625)); // -> 1.0
+    try testing.expectEqual(@as(f32, 1.0), fp8.fp8e4m3_to_f32(fp8.f32_to_fp8e4m3(1.0625)));
+    try testing.expectEqual(@as(u8, 0x3A), fp8.f32_to_fp8e4m3(1.1875)); // -> 1.25
+    try testing.expectEqual(@as(f32, 1.25), fp8.fp8e4m3_to_f32(fp8.f32_to_fp8e4m3(1.1875)));
+
+    // 5. All seven subnormals. The old encoder flushed 1..4 to zero and encoded
+    //    5..7 as the [2^-7, 2^-6) band (0x02, 0x04, 0x06) — all seven wrong.
+    for (1..8) |man| {
+        const v = @as(f32, @floatFromInt(man)) * 0.001953125; // man * 2^-9
+        try testing.expectEqual(@as(u8, @intCast(man)), fp8.f32_to_fp8e4m3(v));
+        try testing.expectEqual(v, fp8.fp8e4m3_to_f32(fp8.f32_to_fp8e4m3(v)));
+        try testing.expectEqual(fp8.f32_to_fp8e4m3(v) | 0x80, fp8.f32_to_fp8e4m3(-v));
+    }
+    // Just below the smallest subnormal is a tie that goes to zero (even), and
+    // just above the largest rounds up into the normal band as 0x08 (2^-6).
+    try testing.expectEqual(@as(u8, 0x00), fp8.f32_to_fp8e4m3(0.001953125 / 2.0));
+    try testing.expectEqual(@as(u8, 0x08), fp8.f32_to_fp8e4m3(0.013671875 + 0.001953125 / 2.0));
+    try testing.expectEqual(@as(f32, 0.015625), fp8.fp8e4m3_to_f32(fp8.f32_to_fp8e4m3(0.013671875 + 0.001953125 / 2.0)));
+
+    // 6. Signed zero and NaN keep their encodings, so a sign or a NaN cannot be
+    //    lost by a round trip.
+    try testing.expectEqual(@as(u8, 0x00), fp8.f32_to_fp8e4m3(0.0));
+    try testing.expectEqual(@as(u8, 0x80), fp8.f32_to_fp8e4m3(-0.0));
+    try testing.expectEqual(@as(u32, 0x80000000), @as(u32, @bitCast(fp8.fp8e4m3_to_f32(fp8.f32_to_fp8e4m3(-0.0)))));
+    try testing.expectEqual(@as(u8, 0x7F), fp8.f32_to_fp8e4m3(std.math.nan(f32)));
+    try testing.expectEqual(@as(u8, 0xFF), fp8.f32_to_fp8e4m3(-std.math.nan(f32)));
+
+    // 7. The MX format must see the same codec, not a second copy: 254/256
+    //    encodings round trip identically through both entry points.
+    const mxfp8 = kt.gemm_mxfp8;
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        try testing.expectEqual(
+            @as(u32, @bitCast(fp8.fp8e4m3_to_f32(b))),
+            @as(u32, @bitCast(mxfp8.fp8e4m3_to_f32(b))),
+        );
+        try testing.expectEqual(fp8.f32_to_fp8e4m3(fp8.fp8e4m3_to_f32(b)), mxfp8.f32_to_fp8e4m3(mxfp8.fp8e4m3_to_f32(b)));
+    }
+}
