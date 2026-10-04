@@ -1075,6 +1075,49 @@ now and covered alongside E5M2.
 whoever has a caller. The kernel is emitted into the `.so` (via a root.zig
 comptime reference) and tested today.
 
+**Exactness is a GUARANTEE, not coverage — with its precondition stated so the
+next person knows what they may change.** With i8 activations and 4-bit weights,
+every product and every partial sum is an exact integer times `d`, and `d` is a
+bf16 (8-bit significand) against f32's 24. So the vector path is not
+"close to" the scalar one, it is the same integer arithmetic in a different
+order. The precondition is the only soft part:
+
+    exact  <=>  (running integer sum) < 2^16
+             <=>  k * 8 * max|a| < 65536
+
+which is why the bit-exact test holds activations to `|a| <= 8` and stops at
+k = 512 (`64 * 512 = 32768`). Three consequences worth writing down:
+
+- widen `|a|` or `k` past that bound and the assertion must become a relative
+  one, not because the kernel became wrong but because f32 stopped being exact.
+  The k = 7168 full-i8 test is exactly that case: 1.4e-6 relative, 0.011
+  absolute on a value of ~8000.
+- change the scale from bf16 to f32 and the budget drops by 2^16, i.e. to a
+  running sum under 1.0 — the exactness property dies immediately.
+- change the activations from i8 to bf16 (which is what raw-INT4 uses) and it
+  dies outright. Any future INT4-family oracle has to be a dequantize-and-dot,
+  not an integer computation. Worth stating before someone ports the test.
+
+**The `vpshufb` question, recorded as a CONSTRAINT on the shared-driver item
+rather than as a note.** The roadmap's shared primitive should expose a decode
+slot and let each format supply its own decode. Two reasons, both now measured
+rather than assumed: a table pays only for a NON-linear codebook (MXFP4's E2M1
+grid, the IQ lookup tables, and FP8's 256-entry table — all non-linear or
+positional), while GPTQ INT4 and the INT8 path are AFFINE (`(q-8)*d`, `i8*q*d`),
+and their decodes are 2-4 ALU ops with no memory at all. Nobody should read
+"share one primitive across all 16 formats" and reach for the shuffle.
+
+**The 47% decode share and the raw-INT4 ABI question are the same piece of
+code.** The two routes past INT4's decode share are (a) an integer
+`vpmaddubsw` dot product, which needs the per-group correction
+`-8 * sum(activations in the group)` because the multiply-accumulate works on
+u8 x i8, and (b) an AVX-512 `vpermb` path. Route (a)'s correction term IS the
+term raw-INT4's scale handling needs, because raw-INT4 also folds a per-group
+scale into an otherwise integer dot. So whoever takes the raw-INT4 ABI
+decision is holding the ~2x on GPTQ at the same time: the thing blocking it is
+the thing worth 2x. That makes the ABI question worth prioritising rather than
+deferring, which is the opposite of how this entry read an hour ago.
+
 **Stream K — IQ2_XXS GEMM. DONE. The earlier "weak result" entry was WRONG and
 is corrected below. CLAIMED (iq2xs-avx2) since 2026-10-04.**
 
