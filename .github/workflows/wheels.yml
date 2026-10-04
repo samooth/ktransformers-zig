@@ -57,8 +57,17 @@ jobs:
         run: python3 tools/verify_abi.py
       - name: "ABI gate: pybind11 struct layouts"
         run: python3 tools/audit_layout.py
+      # No test has a timeout, and `zig build test` drives every suite through
+      # `addRunArtifact`, so a suite that blocks forever stalls the job
+      # indefinitely instead of reporting a failure. That has happened: an
+      # intermittent hang in the Subpool pinning test (workers blocked on a
+      # condvar at 0% CPU, i.e. a deadlock rather than starvation) held a run
+      # for 22 minutes. It does not reproduce when the suite binaries are run
+      # one at a time, which is why it is worth bounding rather than chasing.
+      # 40 minutes is far above the healthy runtime on a CI runner and well
+      # below the GitHub Actions job limit, so a hang becomes a red build.
       - name: "Test suites"
-        run: zig build test
+        run: timeout 2400 zig build test
 
   build-wheel:
     name: Build Python Wheel
