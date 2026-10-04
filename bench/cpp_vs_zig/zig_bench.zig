@@ -150,9 +150,9 @@ fn benchGemm(alloc: std.mem.Allocator, outdir: []const u8, s: Shape) !void {
     std.debug.print("SETUP|{s}|{d:.4}\n", .{ label, @as(f64, @floatFromInt(nowNanos() - setup_t0)) / 1e6 });
 }
 
-/// Fill 8 bytes from one PRNG draw. Cheaper than a draw per byte by ~8x, and
-/// the distribution is the same: 64 bits of splitmix64 into eight bytes, versus
-/// eight separate draws truncated to the same width.
+/// Fill 8 bytes from one PRNG draw. Same distribution as eight separate draws
+/// truncated to the same width, ~8x fewer calls. Measured NOT to be what makes
+/// this row's setup expensive; see the call site.
 fn fillBytes(out: []u8, rng: *u64) void {
     const n = out.len / 8;
     for (0..n) |i| {
@@ -181,11 +181,13 @@ fn benchInt4Gemm(alloc: std.mem.Allocator, s: Shape) !void {
         // Complete blocks: every one of the 16 codes appears (the zero point 8
         // and both nibble halves), and a bf16 scale of realistic magnitude.
         blk.d = amx.f32_to_bf16(@as(f32, @floatFromInt(@as(i32, @intCast(splitmix64(&rng) % 1024)) + 1)) * 0.0078125);
-        // Filled a byte at a time this cost 30 ms against a 1.9 ms kernel, which
-        // made the process-per-arm sampler measure the SETUP: `setup:meas` was
-        // 16x and every band it produced was the harness's own overhead rather
-        // than the host's. Eight bytes per PRNG draw brings it back under the
-        // threshold; the bytes are identical in distribution, only cheaper.
+        // Filled a byte at a time this cost ~30 ms against a ~2 ms kernel. Eight
+        // bytes per PRNG draw did NOT fix that: setup:meas stayed at 15-18x, so
+        // the cost is not the PRNG — it is the allocation and first touch of the
+        // 8.26 MB weight matrix, which page-faults on every process. The draw is
+        // kept batched because it is free, but the honest conclusion is that this
+        // row stays setup-dominated under a process-per-arm sampler and needs
+        // in-process sampling to be measurable. See RESULTS.md.
         const raw: *[@sizeOf(gemm_int4.BlockQ4_0)]u8 = @ptrCast(blk);
         fillBytes(raw[0..], &rng);
     }
