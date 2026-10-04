@@ -1232,6 +1232,41 @@ IQ1_S / IQ1_M. The formats that have been measured (IQ2_XXS 1.26 GB/s at m=1,
 IQ2_XS 1.06) share the same unpack path, so these should land in the same range —
 an estimate, not a measurement.
 
+**Format-anchored tests for `grid8s` — the signedness trap is now pinned, not
+just self-consistent.** The IQ1 equivalence tests only prove `gemmAvx2` and
+`gemmIQ1_SScalar` agree with EACH OTHER; if both were built on the same wrong
+assumption about signedness they would agree perfectly and be worthless. Two
+tests close that:
+
+1. Sweeps `IQ1S_GRID` for entries containing a byte >= 0x80 and asserts, per
+   lane, that `grid8s` returns the **signed** reading while `grid8` returns the
+   **unsigned** one — including `0xFF -> -1.0` vs `255.0` — and that the two
+   helpers DISAGREE wherever the byte is negative. Pinning both behaviours is
+   deliberate: a future "cleanup" that merged them would break this test instead
+   of silently corrupting one format family. Asserts `found > 0` and
+   `any_negative` so it cannot pass vacuously if the table ever changes.
+2. Builds an IQ1_S block whose 32 sub-blocks all point at negative-magnitude
+   grid entries and asserts the full chain: `grid8s` equals the signed magnitude,
+   and `dequantizeRowIQ1_S` equals `dl * (q + 0.125)` from the format formula
+   (which the suite already pins by hand-tracing against the C reference).
+
+**Verified by mutation, not by inspection.** Making `grid8s` unsigned — exactly
+the mistake flagged in review — is caught by FOUR tests, and the new one names the
+failure outright: `expected -1, found 255`. Reverted and re-verified green.
+
+**A process note worth keeping.** The first attempt to verify this ran a STALE
+test binary and appeared to pass 64/64 while the test file had not compiled at
+all (`@floatCast must have a known result type`). The suite name and pass count
+looked entirely plausible. Now every verification here checks the build log for
+`error:` BEFORE running a binary, and cross-checks the binary mtime against the
+build. A green test count from a stale binary is worse than no result, because it
+is trusted.
+
+**`numa_pool_tests.Subpool` failed once mid-session and is a load flake**, not a
+regression: `expected 6400, found 6391` on a timing-sensitive worker-completion
+counter, with this stream touching neither `src/runtime/` nor the pool. Passes 3/3
+in isolation. Worth a retry bound if it ever reaches CI.
+
 **Stream K complete.** Next unclaimed work: roadmap P0.4's remaining INT4 families
 (raw-INT4 and GPTQ-INT4 kernels do not exist yet — another stream has claimed
 `gemm_224_int4.zig`), P1.2's dequant-to-BF16 paths, and P2.1's primitive

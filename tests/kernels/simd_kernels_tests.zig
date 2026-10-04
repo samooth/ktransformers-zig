@@ -3041,3 +3041,135 @@ test "INT4 AVX2 GEMM survives the full i8 range at k=7168" {
     std.debug.print("k=7168 full-i8: worst rel {e:.3}, worst abs {e:.3}\n", .{ worst, worst_abs });
     try testing.expect(worst < 1e-5);
 }
+
+test "grid8s decodes SIGNED magnitudes; grid8 stays UNSIGNED, and both are pinned" {
+    // The equivalence tests for IQ1_S / IQ1_M only prove `gemmAvx2` and
+    // `gemmIQ1_SScalar` agree with EACH OTHER. If both were built on the same
+    // wrong assumption about signedness they would agree perfectly and be
+    // useless. So this anchors `grid8s` to the format instead.
+    //
+    // The trap: the 1-bit formats' `gridBytes` returns `[8]i8`, so a magnitude
+    // byte of 0xFF is -1, not 255. The IQ2/IQ3 formats genuinely use UNSIGNED
+    // bytes. Reusing the unsigned `grid8` on a 1-bit block would be off by 256
+    // on every negative magnitude while the values stayed plausible.
+    //
+    // Both behaviours are asserted here on purpose. A future "cleanup" that
+    // merges the two helpers would break this test rather than silently
+    // corrupting one format family.
+    const iq1s = kt.gemm_iq1_s;
+    const grid8 = kt.gemm_iq2_xxs.grid8;
+    const grid8s = kt.gemm_iq2_xxs.grid8s;
+
+    // Deterministic sweep for entries carrying a byte with the high bit set.
+    var found: usize = 0;
+    var any_negative = false;
+    for (0..iq1s.IQ1S_GRID.len) |gi| {
+        const entry = iq1s.IQ1S_GRID[gi];
+        var has_high: ?usize = null;
+        for (0..8) |j| {
+            const raw: u8 = @truncate(entry >> @intCast(8 * j));
+            if (raw >= 0x80) {
+                has_high = j;
+                break;
+            }
+        }
+        if (has_high == null) continue;
+        found += 1;
+
+        const j = has_high.?;
+        const raw: u8 = @truncate(entry >> @intCast(8 * j));
+        const signed: i8 = @bitCast(raw);
+        try testing.expect(signed < 0); // precondition of the whole test
+
+        const as_signed: [8]f32 = grid8s(entry);
+        const as_unsigned: [8]f32 = grid8(entry, 0); // signs = 0 -> all +1
+        try testing.expectEqual(@as(f32, @floatFromInt(signed)), as_signed[j]);
+        try testing.expectEqual(@as(f32, @floatFromInt(raw)), as_unsigned[j]);
+        // The two helpers must DISAGREE wherever the byte is negative. If they
+        // ever agree on a negative byte, one of them has changed semantics.
+        if (signed < 0) {
+            try testing.expect(as_signed[j] != as_unsigned[j]);
+            any_negative = true;
+        }
+        // 0xFF specifically must be -1 in the signed view.
+        if (raw == 0xFF) try testing.expectEqual(@as(f32, -1.0), as_signed[j]);
+
+        // Every lane, both views, against a straight-from-the-bytes reading.
+        for (0..8) |t| {
+            const r: u8 = @truncate(entry >> @intCast(8 * t));
+            try testing.expectEqual(@as(f32, @floatFromInt(@as(i8, @bitCast(r)))), as_signed[t]);
+            try testing.expectEqual(@as(f32, @floatFromInt(r)), as_unsigned[t]);
+        }
+    }
+    // If the table had no negative byte the test would pass vacuously, which is
+    // exactly the failure mode this file keeps tripping over.
+    try testing.expect(found > 0);
+    try testing.expect(any_negative);
+}
+
+test "IQ1_S grid8s agrees with the format's own dequantizer on a negative-magnitude block" {
+    // Ties `grid8s` to `dequantizeRowIQ1_S`, which the suite already pins by
+    // hand-tracing against the C reference. This closes the loop: grid8s is not
+    // merely self-consistent, it is the same function the format specifies.
+    const iq1s = kt.gemm_iq1_s;
+    const grid8s = kt.gemm_iq2_xxs.grid8s;
+
+    // A block whose every sub-block points at grid entries containing a
+    // negative byte, so a signedness error cannot hide in the lanes we skip.
+    var blk: iq1s.BlockIQ1_S = undefined;
+    blk.d = @bitCast(@as(f16, 1.0)); // dl = d * (2*0 + 1) = 1.0
+    @memset(std.mem.asBytes(&blk.qs), 0);
+    @memset(std.mem.asBytes(&blk.qh), 0);
+    // qh[ib] = scale(0) | deltaSign(0) | 3 index-high bits per sub-block.
+    for (0..8) |ib| blk.qh[ib] = 0;
+
+    // Fill qs/qh so sub-block l of group ib selects a grid index with a
+    // negative byte. qs holds the low 8 bits, qh bits 3*l..3*l+2 the high 3.
+    var checked: usize = 0;
+    for (0..8) |ib| {
+        for (0..4) |l| {
+            // Find an index whose byte `t` is negative, and prefer t == l*2 so a
+            // misalignment between our lane order and the format's shows up.
+            var placed = false;
+            for (0..iq1s.IQ1S_GRID.len) |gi| {
+                const entry = iq1s.IQ1S_GRID[gi];
+                const t: usize = l * 2;
+                const raw: u8 = @truncate(entry >> @intCast(8 * t));
+                if (raw < 0x80) continue;
+                blk.qs[4 * ib + l] = @intCast(gi & 0xFF);
+                blk.qh[ib] |= @as(u16, @intCast((gi >> 8) & 7)) << @intCast(3 * l);
+                placed = true;
+                break;
+            }
+            if (placed) checked += 1;
+        }
+    }
+    try testing.expect(checked == 32); // all 32 sub-blocks placed
+
+    var w: [iq1s.QK_K]f32 = undefined;
+    iq1s.dequantizeRowIQ1_S(@as([*]const iq1s.BlockIQ1_S, @ptrCast(&blk)), w[0..], iq1s.QK_K);
+
+    // Independent expectation straight from the format's formula, using the
+    // SIGNED byte reading, with delta = +0.125 and dl = 1.0.
+    var negatives_seen: usize = 0;
+    for (0..8) |ib| {
+        const word: u16 = blk.qh[ib];
+        // dl = d * (2*scale3 + 1) with scale3 = 0 and d = 1.0, so dl = 1.0.
+        const dl: f32 = @as(f32, @floatCast(@as(f16, @bitCast(blk.d))));
+        for (0..4) |l| {
+            const gi = @as(usize, blk.qs[4 * ib + l]) |
+                (@as(usize, (word >> @intCast(3 * l)) & 7) << 8);
+            const got: [8]f32 = grid8s(iq1s.IQ1S_GRID[gi]);
+            for (0..8) |t| {
+                const raw: u8 = @truncate(iq1s.IQ1S_GRID[gi] >> @intCast(8 * t));
+                const q: f32 = @floatFromInt(@as(i8, @bitCast(raw)));
+                if (q < 0) negatives_seen += 1;
+                // grid8s must equal the SIGNED magnitude...
+                try testing.expectEqual(q, got[t]);
+                // ...and the format's formula must then hold on top of it.
+                try testing.expectEqual(dl * (q + 0.125), w[ib * 32 + l * 8 + t]);
+            }
+        }
+    }
+    try testing.expect(negatives_seen > 0); // the block must exercise negatives
+}
