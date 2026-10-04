@@ -1118,6 +1118,27 @@ decision is holding the ~2x on GPTQ at the same time: the thing blocking it is
 the thing worth 2x. That makes the ABI question worth prioritising rather than
 deferring, which is the opposite of how this entry read an hour ago.
 
+**Stream O — the measurement harness. CLAIMED (bench-harness) since 2026-10-04.**
+`bench/cpp_vs_zig/` in full: `measure.zig`, `zig_bench.zig`, `cpp_bench.cpp`,
+`RESULTS.md`, `README.md`, `compare.py`, `run.sh`, plus any new row added there.
+`tools/orphan_tests.sh` is a separate file written by another session — coordinate
+before touching it.
+
+This claim is late, and that is exactly why it matters: **`bench/cpp_vs_zig/` had
+no marker while three sessions were editing it, so nothing signalled a collision
+and `measure.zig` was swept by another commit three times — twice breaking the
+build rather than merely cross-contaminating it.** See "Claims" below for the
+enforceable check that now exists.
+
+Owns the repo's only measurement instrument, so it owns the rule that no ratio is
+published without its floor and no absolute figure is published without a band.
+Current state: control arms on both sides of every ratio, absolute mode for rows
+with no C++ arm (`--cpp-absent`, refused outside `--self-test`), a
+`setup:measurement` cell per row, and a two-kind `UNMEASURABLE`
+(`UNMEASURABLE:setup` for a floor the bench itself created). The ratio is printed
+as the spread across samples rather than min-of-N, because min-of-N flatters.
+
+
 **Stream K — IQ2_XXS GEMM. DONE. The earlier "weak result" entry was WRONG and
 is corrected below. CLAIMED (iq2xs-avx2) since 2026-10-04.**
 
@@ -1407,6 +1428,34 @@ there is a mechanism, measurement where there is not, and neither where the
 number is inside the floor. The *correctness* result stands — bit-exact against
 the scalar body on fuzzed scales — but the speedup is unknown until measured
 properly.
+
+**P2.1 as an actual list — the shared primitives that now exist.** The item had
+been described all session ("widen8 plus a matching RNE narrowing store to the
+arch layer so P0.1-P0.4 share one copy") without anyone writing down what
+already qualifies. It does now:
+
+| primitive | owner | consumers | status |
+|---|---|---|---|
+| `f32_to_bf16_store` (RNE narrow, 8 lanes) | `arch/amx.zig` | 4 files, growing to 17 | **done this session** |
+| `pshufb16` (16-entry byte LUT) | `arch/amx.zig` | IQ4_NL, IQ4_XS, MXFP4 | done |
+| `grid8` / `grid8s` (8-weight unpacks) | `gemm_224_iq2_xxs.zig` | 5 IQ formats | done |
+| `gemmBF16xQuant` (K-quant GEMM driver) | `gemm_224_kquant_simd.zig` | 6 K-quants | done |
+| `gemmAvx2With` (FP8 GEMM body) | `gemm_224_fp8.zig` | E4M3 + E5M2 | done |
+| `FP8_E4M3_LUT` | `gemm_224_fp8.zig` | `mxfp8` re-exports rather than re-declares | done |
+| `widen8` (bf16 -> f32, 8 lanes) | **per-format, 14 local copies** | every AVX2 GEMM | **NOT DONE — the remaining gap** |
+
+**`widen8` is the one still duplicated**, in 14 files. It is the last item P2.1
+names, and unlike the others it has a reason to be duplicated per format: it is
+three lines of `@bitCast` + shift. Moving it to the arch layer is worth doing for
+the same reason the FP8 codec de-dup was (the E4M3 encoder's four bugs got fixed
+once instead of twice) but it is low-risk rather than urgent — a wrong `widen8`
+would be caught by every GEMM equivalence test in the suite.
+
+The shared shape that has emerged, and which the roadmap never spelled out: **one
+correct implementation in a single owner, every format instantiates or imports
+it.** Four times this session that produced a measurable win — `grid8` alone took
+the IQ3 variants to zero unpack work and all five new formats to first-attempt
+green, and the narrowing store is about to be dropped into 13 wrappers.
 
 **Stream N RESULT — the narrowing store, and the wrapper-level gain was NOT
 small. Measured 4x end-to-end, bit-exact.**
