@@ -439,7 +439,15 @@ fn parseInto(
         const ms = std.fmt.parseFloat(f64, ms_str) catch continue;
         // Both harnesses use the same labels; if they ever diverge, keying on
         // the label means a missing row is skipped rather than mismatched.
-        try out.append(arena, .{ .label = label, .ms = ms });
+        //
+        // The label MUST be copied. It is a slice into `text`, which points at
+        // the child's stdout/stderr buffers, and `runHarness` frees those before
+        // returning -- so a slice kept here is a dangling pointer. This was not
+        // theoretical: the first version did exactly this and a full-table run
+        // printed the row as "  ode gate/up [m=1,n=2048,k=7168]", three
+        // characters of a label read out of freed memory. A measurement tool
+        // that can print a corrupted row label can print a corrupted row VALUE.
+        try out.append(arena, .{ .label = try arena.dupe(u8, label), .ms = ms });
     }
 }
 
