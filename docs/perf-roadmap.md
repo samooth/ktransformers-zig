@@ -395,25 +395,35 @@ this item and it is where the effort belongs.
 
 ---
 
-### P1.3 — SwiGLU activation (0.59x) — diagnosed, needs register pressure work
+### P1.3 — SwiGLU activation (0.68x) — **CLOSED as a measured negative result**
 
-Instruction counts for the 8-element body: **Zig 48, C++ 40.** Not
-algorithmic — both do `vpmovzxwd` + `vpslld` + an FMA polynomial. It is
-register allocation: `expVec` has ~13 simultaneously-live constants
-(7 polynomial coefficients + `INV_LN2`, `LN2_HI`, `LN2_LO`, `0.5`, `1.0`, two
-clamp bounds) against 16 ymm, so LLVM emits **6 `vbroadcastss` inside the
-loop** rematerializing constants, where C++ hoists all of them before it.
+**The register-pressure diagnosis that used to be recorded here was wrong, and
+fixing it does nothing.** Do not re-run steps 1-4 below. Measured 2026-10-04;
+full write-up in TODO.md under "Stream D".
 
-Zig also emits 8 FMAs to C++'s 6 — a deliberate accuracy choice (degree-6 vs
-degree-5: 1.0e-8 vs ~1e-6 relative truncation). Do not "fix" that by
-regressing accuracy.
+The corrected instruction counts for the 8-element body: **Zig 47, C++ 35** (not
+48/40), with **5 `vbroadcastss`** inside the Zig body (not 6). 9 of the 12
+instructions we spend over the reference are the price of reducing in exp
+space rather than log2 space — the explicit floor (4 ops against their 1) and
+the LN2_HI/LN2_LO split (3 ops they do not need). That reduction is what makes
+us ~1e-8 accurate against their ~1e-6, so it is not a defect. Only the 5
+broadcasts are register pressure.
 
-**Fix by cutting peak live constants, in this order:**
-1. Split `expVec` into two phases — split/floor/pow2, *then* the polynomial —
-   so the first group's constants are dead before the second's are born.
-2. Hoist the clamp bounds out of the per-vector path (clamp once per call).
-3. Fold `0.5` and `1.0` into fewer live values by algebraic rearrangement.
-4. *(Last resort)* drop to degree-5 and give up the accuracy margin.
+Fix 1 below was implemented for real and measured: broadcasts **5 → 5** (no
+change), body 47 → 49 instructions (worse), Zig timing 0.2038 ms → 0.2038 ms
+(unchanged to four significant figures). A controlled probe confirmed the rest:
+removing the divide, removing the clamp, and manual 2x/4x/8x unrolling are all
+indistinguishable from baseline. Only deleting arithmetic outright moves the
+number. The activation is bound by the bf16 widen, the narrowing store, and FP
+vector throughput — not by register allocation.
+
+**Noise floor, stated so nobody mistakes a future null result for a bug:** on
+this shared host an activation change must beat ~25% to be measurable at all. A
+byte-identical copy of the baseline differed from it by 14-23% across runs.
+
+Reopen this only if you are willing to adopt the reference's own
+`exp_avx2` (log2 space, ~1e-6) and give up the accuracy margin. That is a
+different trade from the one this item asked for.
 
 **Tried and reverted — do not repeat.** Replacing the `[VEC_LEN]f32` array
 staging in `applySwiGLU` with direct `*align(1)` vector loads plus a

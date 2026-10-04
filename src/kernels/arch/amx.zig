@@ -1,6 +1,3 @@
-// CLAIM: swiglu-regalloc — expVec/expScalar register-pressure work — 2026-10-04
-// — holds src/kernels/arch/amx.zig until committed (roadmap P1.3, TODO Stream D)
-//
 // AMX intrinsics and tile configuration for ktransformers-zig
 // Provides Zig-friendly wrapper around Intel AMX instructions
 
