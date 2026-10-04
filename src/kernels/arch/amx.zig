@@ -1,10 +1,6 @@
-// CLAIM: widen8-move — hoist the 14 duplicated bf16->f32 widen8 helpers to the
-// arch layer — roadmap P2.1 — 2026-10-05
-// Holds src/kernels/arch/amx.zig until committed.
-// (Supersedes the bf16-narrow-store claim, which landed in bb87a69.)
-//
-// ARCH-EDIT NOTICE: this file is imported by every kernel AND by bench/. A
-// measurement in flight breaks if it is edited unclaimed. Claim it first.
+// ARCH-EDIT NOTICE: this file is imported by every kernel AND by bench/, so an
+// unclaimed edit here is the one thing that can break a measurement mid-run.
+// Claim it before touching it; release the marker in the commit that lands the work.
 // AMX intrinsics and tile configuration for ktransformers-zig
 // Provides Zig-friendly wrapper around Intel AMX instructions
 
