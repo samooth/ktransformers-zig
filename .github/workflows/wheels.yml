@@ -77,6 +77,18 @@ jobs:
       # below the GitHub Actions job limit, so a hang becomes a red build.
       - name: "Test suites"
         run: timeout 2400 zig build test
+      # Compiling aarch64 and gating its exports cannot catch a wrong ANSWER,
+      # and `zig build test` only ever runs the host target — so every
+      # aarch64 code path had no execution coverage at all. That is how
+      # `amx.pshufb16`'s scalar fallback shipped untested: no x86 run can
+      # reach it, and no aarch64 test existed. This runs the ARM suites for
+      # real under qemu-user. qemu-user-static is installed rather than assumed,
+      # and a missing emulator must not be silently skipped into a green build.
+      - name: Run the ARM suites under emulation
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-user-static
+          timeout 1200 zig build test-aarch64
 
   build-wheel:
     name: Build Python Wheel

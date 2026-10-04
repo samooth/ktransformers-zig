@@ -213,6 +213,80 @@ pub fn build(b: *std.Build) void {
     });
     test_step.dependOn(&b.addRunArtifact(neon_kernel_test_obj).step);
 
+    // --- aarch64 emulated test step ---
+    //
+    // WHY THIS EXISTS. The neon CI leg (09660de) proves aarch64 COMPILES and
+    // exports the right symbols. Neither can catch a wrong ANSWER. `zig build
+    // test` only ever runs the suites for the host target, so every aarch64
+    // code path — including `amx.pshufb16`'s scalar FALLBACK, which no x86 run
+    // can ever execute — had zero coverage. This step closes that.
+    //
+    // Requires qemu-user (`qemu-aarch64-static`; Debian/Ubuntu package
+    // `qemu-user-static`). It is a separate step rather than part of `test`
+    // because the emulator is not always installed, and a missing emulator
+    // must not turn a plain `zig build test` red.
+    //
+    // aarch64-linux-musl, not -gnu: musl is self-contained, so the cross-build
+    // needs no aarch64 sysroot and the binary runs under qemu-user without a
+    // dynamic loader.
+    const qemu_opt = b.option([]const u8, "qemu", "aarch64 user-mode emulator (default qemu-aarch64-static)") orelse "qemu-aarch64-static";
+    const arm_step = b.step("test-aarch64", "Cross-build + run the ARM suites under qemu (needs qemu-user-static)");
+    const arm_target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl });
+
+    const ArmTest = struct {
+        fn run(bld: *std.Build, step: *std.Build.Step, test_src: []const u8, kt_src: []const u8, tgt: anytype, opt: anytype, qemu: []const u8) void {
+            const tmod = bld.createModule(.{
+                .root_source_file = bld.path(test_src),
+                .target = tgt,
+                .optimize = opt,
+            });
+            const ktmod = bld.createModule(.{ .root_source_file = bld.path(kt_src), .target = tgt, .optimize = opt });
+            ktmod.link_libc = true;
+            tmod.addImport("kt", ktmod);
+            const tobj = bld.addTest(.{
+                .root_module = tmod,
+                .test_runner = .{ .path = bld.path("tools/test_runner.zig"), .mode = .simple },
+            });
+            // Run through the emulator explicitly rather than relying on
+            // binfmt_misc, which is registered on some developer machines and
+            // absent in CI. addFileArg on the emitted test binary keeps the
+            // path handling to the build system.
+            const qemu_run = bld.addSystemCommand(&.{qemu});
+            qemu_run.addFileArg(tobj.getEmittedBin());
+            qemu_run.setName(bld.fmt("qemu: {s}", .{test_src}));
+            step.dependOn(&qemu_run.step);
+        }
+    };
+
+    // Verified green under emulation before being wired here (2026-10-04):
+    // 49 + 7 + 4 tests. The SIMD suite is the important one — it is the only
+    // place `pshufb16`'s scalar fallback and the arch-portable `gemmAvx2`
+    // bodies (called unconditionally by gemmQuant for IQ2_XXS/IQ2_XS, so they
+    // DO run on ARM) are ever executed.
+    ArmTest.run(b, arm_step, "tests/kernels/simd_kernels_tests.zig", "src/root.zig", arm_target, optimize, qemu_opt);
+    ArmTest.run(b, arm_step, "tests/kernels/aarch64_detect_test.zig", "src/root.zig", arm_target, optimize, qemu_opt);
+    ArmTest.run(b, arm_step, "tests/kernels/neon_kernel_test.zig", "src/root.zig", arm_target, optimize, qemu_opt);
+
+    // Two suites are deliberately NOT run here, and both exclusions are
+    // deliberate rather than accidental:
+    //
+    // 1. `neon_arch_test.zig` asserts `NeonFeatures.available == false`, i.e.
+    //    it exists to prove the comptime gate is OFF on x86_64. Cross-compiled
+    //    to aarch64 that assertion is false by construction, so the suite
+    //    cannot pass there. It is an x86-only suite, not an ARM one.
+    //
+    // 2. `test_kernels.zig` (148 tests) aborts under emulation at test 8,
+    //    "CPU detection", inside `detectCpuLinux` -> `parseFlag`, with a
+    //    fault address inside the TEXT segment (a wild instruction fetch,
+    //    not a bad store at the reported line). The read path itself is
+    //    sound: a 1 MB buffer, `readPositionalAll`, and every write is
+    //    length-checked; the same parser runs the same code on x86 against
+    //    the same /proc/cpuinfo and passes. So this is very likely an
+    //    emulation artifact rather than a defect, and wiring it in would
+    //    hand CI a red that may be meaningless. It needs either real ARM
+    //    hardware or a dedicated investigation — tracked, not swept under
+    //    the rug. It is the single biggest hole left in aarch64 coverage.
+
     // --- Bench step (B2) ---
     //
     // `zig build -Doptimize=ReleaseFast bench` runs both micro-benchmarks
