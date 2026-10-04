@@ -182,7 +182,10 @@ this repo:
   **documented semantics** (e.g. "the exponent nibble comes out of `aux1`'s top
   4 bits"), not against a reimplementation of the format that happens to agree.
 
-**An exhaustive value-space sweep cannot pin a rounding mode.** This is the
+**An exhaustive value-space sweep cannot pin a rounding mode.** (Also recorded as
+`LESSONS_ZIG.md` 6c, next to the other numerics gotchas; the full treatment is
+here because this is the section someone writing a test will actually read.) This
+is the
 sharpest version of the trap above, and it is worth stating on its own because
 exhaustive is exactly what feels rigorous.
 
