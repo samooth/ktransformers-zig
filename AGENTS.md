@@ -90,17 +90,18 @@ stale snapshots. (MXFP4/MXFP8 ARE wired into root.zig now.)
 
 ## Status (see TODO.md for details)
 
-- Build: working; 6 x86 variants. The aarch64 neon cross-build
-  (`zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu`) **is currently
-  broken** — `amx.pshufb16` (commit `2416b68`) has no comptime target guard, so
-  the x86 inline assembly fails to assemble for aarch64 ("couldn't allocate
-  output register for constraint 'x'"). A guard with an exact scalar fallback
-  has been written and verified, and is waiting on the file's current claim
-  holder (roadmap P1.3) to land it. Until then treat the neon variant as
-  unavailable, and note that **no CI job builds aarch64 at all** — the matrix
-  is six x86 variants and `zig build all-variants` is x86-only — which is how
-  this regression reached `main` with a green pipeline. An aarch64 leg has been
-  added to the abi-gate job so the next one fails the build.
+- Build: working; 6 x86 variants **and** the aarch64 neon cross-build
+  (`zig build -Dvariant=neon -Dtarget=aarch64-linux-gnu`), which is now
+  green. It was broken from `2416b68` until `amx.pshufb16` got the comptime
+  target guard it needed: `asm` is not lazily analysed, so its `"x"`
+  constraint had no register class on aarch64 and the build died with
+  "couldn't allocate output register for constraint 'x'" while all six x86
+  variants and the whole test suite passed. The guard keeps the instruction on
+  x86 and falls back to a lane-exact scalar lookup elsewhere, so the asm path
+  is unchanged and the round-trip test covers both. **No CI job built aarch64
+  at all** while this was broken — the matrix is six x86 variants and
+  `zig build all-variants` is x86-only — which is how it reached `main` green.
+  `09660de` added an aarch64 leg to the abi-gate job so the next one fails.
  - C API: **112 symbols** gated by `verify_abi.py` triple gate (exports +
   arity + layout via audit_layout.py). All operator families implemented:
   MoE (incl. SFT/LoRA forward+backward), MLA, Gate (DeepSeek-V3

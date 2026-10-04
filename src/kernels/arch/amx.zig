@@ -1,3 +1,6 @@
+// CLAIM: swiglu-regalloc — expVec/expScalar register-pressure work — 2026-10-04
+// — holds src/kernels/arch/amx.zig until committed (roadmap P1.3, TODO Stream D)
+//
 // AMX intrinsics and tile configuration for ktransformers-zig
 // Provides Zig-friendly wrapper around Intel AMX instructions
 
@@ -280,22 +283,49 @@ pub const ByteVec = @Vector(32, u8);
 
 /// 32 parallel byte lookups in `table[0..16]`.
 pub fn pshufb16(table: ByteVec, idx: ByteVec) ByteVec {
-    // AT&T operand order reverses Intel's. Intel reads
-    //   VPSHUFB ymm_data, ymm_index, ymm_dst      (dst = shuffle(index, data))
-    // so AT&T must write the DATA operand second:
-    //   vpshufb %[i], %[t], %[r]                  means r = shuffle(t, i)
-    // Getting this the other way round still compiles and still emits bytes —
-    // it just emits zeros whenever the table bytes happen to have bit 7 SET,
-    // because the table would then be acting as the index, and pshufb writes
-    // zero for any index with bit 7 set. That is a silent wrong answer, not a
-    // compile error, so the round-trip test in
-    // tests/kernels/simd_kernels_tests.zig is load-bearing rather than
-    // decorative: it is what caught the swap the first time.
-    return asm ("vpshufb %[i], %[t], %[r]"
-        : [r] "=x" (-> ByteVec),
-        : [t] "x" (table),
-          [i] "x" (idx),
-    );
+    // The x86 path is the one that matters; every other target takes an
+    // EXACTLY equivalent scalar fallback. This guard is not optional
+    // decoration: `asm` is not lazily analysed, so on aarch64 the `"x"`
+    // constraint below has no register class to allocate from and the build
+    // dies with "couldn't allocate output register for constraint 'x'" —
+    // which is how the neon variant stayed broken for a whole pipeline cycle
+    // while six x86 variants stayed green. Every other asm in this file has
+    // carried an `AmxFeatures.available` guard for that reason; this one was
+    // added later without it.
+    if (comptime builtin.cpu.arch == .x86_64) {
+        // AT&T operand order reverses Intel's. Intel reads
+        //   VPSHUFB ymm_data, ymm_index, ymm_dst      (dst = shuffle(index, data))
+        // so AT&T must write the DATA operand second:
+        //   vpshufb %[i], %[t], %[r]                  means r = shuffle(t, i)
+        // Getting this the other way round still compiles and still emits bytes —
+        // it just emits zeros whenever the table bytes happen to have bit 7 SET,
+        // because the table would then be acting as the index, and pshufb writes
+        // zero for any index with bit 7 set. That is a silent wrong answer, not a
+        // compile error, so the round-trip test in
+        // tests/kernels/simd_kernels_tests.zig is load-bearing rather than
+        // decorative: it is what caught the swap the first time.
+        return asm ("vpshufb %[i], %[t], %[r]"
+            : [r] "=x" (-> ByteVec),
+            : [t] "x" (table),
+              [i] "x" (idx),
+        );
+    } else {
+        // vpshufb indexes WITHIN EACH 128-bit lane: byte k of the result reads
+        // table[(k & 16) + (idx[k] & 15)], and writes 0 when idx[k] has bit 7
+        // set. The `k & 16` is not a detail — dropping it makes the upper lane
+        // read table[0..16] instead of table[16..32], which only stays correct
+        // while callers happen to build their table with `pshufbTable` (which
+        // duplicates it into both lanes). Keeping the lane offset makes the
+        // fallback equal to the instruction for ANY input, which is what lets a
+        // single test cover both paths.
+        const t: [32]u8 = table;
+        const i: [32]u8 = idx;
+        var out: [32]u8 = undefined;
+        for (0..32) |k| {
+            out[k] = if (i[k] & 0x80 != 0) 0 else t[(k & 16) + (i[k] & 15)];
+        }
+        return out;
+    }
 }
 
 /// Broadcast a 16-byte table into both 128-bit lanes of a `ByteVec`, so one
