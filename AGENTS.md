@@ -242,6 +242,21 @@ rework the Zig port is **1.21x-1.34x the reference** on BF16 GEMM and
 **0.68x** on SwiGLU (with bit-identical output). Four rules carry almost all of
 it.
 
+**That range is NOT currently reproducible, and the harness now says so itself.**
+A consolidated control-armed pass on 2026-10-04 (`zig run
+bench/cpp_vs_zig/measure.zig -- --iters 5 --pin 9`, no filter, commit `add41d5`
+lineage) resolved **0 of 7 comparison rows**, every one of them reported as
+`UNMEASURABLE — setup-dominated`: `zig_bench` spends 16x-68x longer building its
+inputs than timing the kernel, so a process-per-arm sampler is mostly measuring
+the setup and the resulting floors are 2.0x-18.4x wide. A 1.2x effect is
+untestable through that sampler, so the range above stands as a record of what
+was measured on a filtered pass, not as a claim the harness can currently
+confirm. The remedy is in the harness, not on this host: hoist the setup out of
+the process or sample in-process (`SETUP_DOMINATED` in
+`bench/cpp_vs_zig/measure.zig`, which prints `setup:meas` and names which kind
+of unresolvable each row is). Do not re-quote the range until a pass resolves
+the BF16 rows.
+
 That range was previously written up here as 1.13x-1.88x, and it was wrong: it
 accumulated across mixed load conditions and most of the spread was the host, not
 the kernels. The 1.88x was a real measurement of a run at load 74 where the same
@@ -432,9 +447,18 @@ of the above.** Three options, in order of preference:
    Run it before committing. It collects the claim handles in every staged file
    and requires each to be declared in your message as `Handles: <handle>`, so a
    commit that sweeps someone else's work cannot land silently. A marker documents
-   intent; this enforces it. (Not installed as a git hook — `.git/hooks/` is shared
-   by every session on this clone, so a blocking hook would break sessions
-   mid-flight. Wire it into your own workflow.)
+   intent; this enforces it.
+
+   Installed here as an **advisory** `prepare-commit-msg` hook, which appends the
+   warning to your message and always exits 0 — so every session sees it and none
+   is blocked. A blocking hook would break other sessions mid-flight, because
+   `.git/hooks/` is per-*repository*, not per-user: there is no per-session hook,
+   which is worth knowing before you ask for one. Re-install with:
+
+       cp tools/prepare-commit-msg .git/hooks/ && chmod +x .git/hooks/prepare-commit-msg
+
+   (`.git/hooks/` is not versioned, so the hook is kept at
+   `tools/prepare-commit-msg` and copied in.)
 
 If a shared file is held and you cannot wait: put your write-up in your own notes
 file and hand the text to the coordinator to fold in. If you are the coordinator,
