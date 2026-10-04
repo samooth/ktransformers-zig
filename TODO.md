@@ -142,30 +142,28 @@ also the same fix as the NR-tiling item under "actually open" below. Secondary:
 super-block, and the four `@reduce(.Add)` horizontal reductions per 64 weights
 dominate the rest.
 
-**Stream B — FP8 E4M3/E5M2. UNCLAIMED — needs an owner before anyone edits.**
-`src/kernels/amx/gemm_224_fp8.zig`, `gemmFullTileScalar` (line ~317). The C++
+**Stream B — FP8 E4M3/E5M2. CLAIMED (fp8-gemm-avx2) since 2026-10-04.**
+`src/kernels/amx/gemm_224_fp8.zig`, `gemmFullTileScalar` (line ~355). The C++
 reference has `operators/avx2/fp8-moe.hpp` + `fp8_dequant.hpp`, so this is a
 direct port target with a reference to diff against. Acceptance: the existing
 FP8 tests pass, plus `gemmFullTileScalar`'s new vectorized sibling matches it
 to f32 rounding on random blocks.
 
-**State of the file right now (2026-10-03, 19:28):** 49 insertions, 11
-deletions, uncommitted, written by a session that left no claim. It replaces
-`fp8e4m3_to_f32` with a comptime 256-entry lookup table that is bit-identical
-to the reference's own `FP8LUT::init`, and it fixes two real decode bugs: E4M3
-subnormals (exponent field 0, mantissa 1-7) were being decoded as normal,
+**The decode fix is committed (1e8369a, 2026-10-04).** The hunk that was sitting
+uncommitted is now its own commit — the 256-entry `FP8_E4M3_LUT`, bit-identical
+to the reference's `FP8LUT::init`, adopted as written. It fixed two real decode
+bugs: E4M3 subnormals (exponent field 0, mantissa 1-7) were decoded as normal,
 yielding about 1.0-2.0 instead of 2^-9 .. 7*2^-9, and `0x7F`, the single NaN
 encoding, was decoded to 480.0, which is above `E4M3_MAX` = 448 and therefore
-not representable. The diff is one hunk in one function; `gemmFullTileScalar`
-is still the naive triple loop, so no two sessions have actually written to the
-same place yet.
+not representable. Committed separately so it can no longer be lost to a
+`git checkout`.
 
-**Recommended resolution:** assign one owner to the file, have them commit the
-existing lookup table as-is (it is strictly better than what it replaces), then
-do the GEMM vectorization. Do not revert it — that would discard a correct fix
-for two decode bugs. Until an owner is named, leave the file alone: an
-uncommitted hunk in a file several sessions have open is one `git checkout`
-away from being lost.
+**E5M2 is NOT in this stream.** There is no E5M2 anywhere in the tree — no
+codec, no type id in `src/main.zig` or `include/kt_kernel.h` — and none in the
+reference (`fp8_dequant.hpp` is E4M3-only), so roadmap P0.2's "E5M2 adds the
+sign bit" has nothing to add to yet. Adding a type id is a change to the C ABI
+contract that Python and the pybind11 shim both depend on, so it needs its own
+claim on `include/kt_kernel.h`, not a kernel detail.
 
 **Stream C — K-quants Q2_K/Q3_K/Q4_K/Q5_K/Q6_K/Q8_K. DONE (6.3x–15.7x).**
 `src/kernels/amx/gemm_224_{q2_k,q3_k,q4_k,q5_k,q6_k,q8_k}.zig` + the new shared

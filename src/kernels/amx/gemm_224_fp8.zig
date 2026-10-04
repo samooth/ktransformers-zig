@@ -1,3 +1,4 @@
+// CLAIM: fp8-gemm-avx2 — FP8 GEMM — 2026-10-04
 // GEMM Kernel 224 FP8 E4M3 for AMX/AVX512
 // Ported from ktransformers kt-kernel/operators/amx/la/amx_kernels.hpp
 // FP8 E4M3 weights with BF16 activations
