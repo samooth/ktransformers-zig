@@ -1842,6 +1842,55 @@ This is ggml-impl.h's rule and matches the C++ reference's
 disagrees with both. `bf16 -> f32 -> bf16` round-trips exactly under RNE for
 all 65536 patterns (good invariant to test).
 
+### 6b. `if (comptime ...)` must WRAP the `builtin.cpu` switch, not precede it
+
+```zig
+// WRONG - "unable to evaluate comptime expression"
+const have_wide = switch (builtin.cpu.arch) {
+    .x86_64 => std.Target.x86.featureSetHas(builtin.cpu.features, .avx2),
+    else => false,
+};
+if (comptime !have_wide) { ...scalar fallback...; return; }
+
+// RIGHT
+if (comptime switch (builtin.cpu.arch) {
+    .x86_64 => !std.Target.x86.featureSetHas(builtin.cpu.features, .avx2),
+    else => true,
+}) { ...scalar fallback...; return; }
+```
+
+Binding the switch to a plain `const` looks equivalent and is not: the `const` is
+a *runtime* local, so reading `builtin.cpu` from it is a comptime-only field read
+from runtime context and fails to evaluate. The `switch` has to sit inside the
+`if (comptime ...)` so it is evaluated in a comptime context. Same API-rot class
+as §8 — the type checker accepts the wrong form and only instantiation catches
+it.
+
+Hit while adding the vectorized RNE f32->bf16 narrowing store (§6's formula, 8
+lanes). Note that store is **integer-only and needs no AVX512BF16** — it is add,
+shift and mask on 32-bit lanes, which plain AVX2 does. Reaching for
+`vcvtneps2bf16` would have produced a store that cannot run on most of the
+hardware this tree targets.
+
+### 6c. An exhaustive value-space test CANNOT pin a rounding mode
+
+The narrowing store above is pinned three ways, and the division of labour is the
+lesson:
+
+| test | pins | fails under truncation? |
+|---|---|---|
+| bf16->f32->bf16 identity, all 65536 values | value space (subnormals, -0, inf) | **NO - passes** |
+| ties round to the even neighbour, exhaustively | the rounding MODE | YES |
+| bit-exact on specials, every tail length 0..17 | boundaries | YES |
+
+The identity sweep passes under truncation because a bf16 widened to f32 has 15
+low mantissa bits that are **already zero**, so narrowing back cannot lose
+anything. It is exhaustive, it covers the whole encoding space, and it is blind to
+the one thing that matters. Only ties discriminate: 1.5 must go to 2, 2.5 to 2.
+
+So "exhaustive" is not a proxy for "rigorous" — an exhaustive sweep over the wrong
+quantity is decoration. Ask what a test would have to be *wrong about* to pass it.
+
 ### 7. F16C does nothing for bf16 on AVX2
 
 F16C converts IEEE **f16**. bf16 needs AVX512_BF16, or AVX512VL+VBMI2's

@@ -1411,10 +1411,26 @@ properly.
 **Stream N RESULT — the narrowing store, and the wrapper-level gain was NOT
 small. Measured 4x end-to-end, bit-exact.**
 
-| wrapper (k=7168) | scalar | vectorized | speedup | bit-exact |
+**Measured, three consecutive runs, raw nanoseconds — the ratio and the absolutes
+come from one source this time:**
+
+| wrapper (k=7168) | scalar | vectorized | ratio | bit-exact |
 |---|---|---|---|---|
-| `dequantizeRowQ4_KToBF16` | 11 us | **2 us** | **4x** | 7168/7168 |
-| `dequantizeRowQ8_KToBF16` | 7 us | **1 us** | **4x** | 7168/7168 |
+| `dequantizeRowQ4_KToBF16` | 7794 / 10180 / 7614 ns | 1973 / 2815 / 2424 ns | 3.95x / 3.62x / 3.14x | 7168/7168 |
+| `dequantizeRowQ8_KToBF16` | 7013 / 10119 / 7495 ns | 1472 / 2896 / 2064 ns | 4.76x / 3.49x / 3.63x | 7168/7168 |
+
+**So: 3-4x, and the ratio itself moves ~30% run to run on this contended host.**
+The µs column is deliberately absent — at 1.5-2.9 us these are inside timer
+overhead and cache state, and a rounded µs column next to a measured ratio reads
+as two numbers disagreeing when the real problem is that one of them lost its
+precision. That is exactly what the previous version of this table did: it
+published "11 us -> 2 us, 4x", where 11/2 is 5.5x, not 4x, and then added a
+reconciliation sentence (14,336 B / 2 us = 7.2 GB/s "against the 5 GB/s the raw
+timing implies") that reconciled nothing. Both errors came from rounding µs to one
+significant figure and then treating them as if they carried the ratio.
+
+**What is trustworthy:** the ratio, because it is measured back-to-back in one
+binary. **What is not:** the absolutes. The idle-box harness is the arbiter.
 
 **The prediction that this would come out at ~1.1x was wrong, and the reason is
 worth recording.** The reasoning was "vectorizing the dequant is invisible while
@@ -1433,6 +1449,28 @@ restating a withdrawn number here — the Q4_K *dequant-only* figure stays withd
 because its arithmetic did not reconcile; these wrapper figures do reconcile
 (7168 bf16 outputs = 14,336 B, and 14,336 B / 2 us = 7.2 GB/s against the 5 GB/s
 the raw timing implies), so they stand as ratios and not as absolutes.
+
+**Attribution — is the win SIMD or "stop staging"? SIMD, and here is the
+audit that establishes it.** 13 of the 18 `*ToBF16` wrappers in the tree stage
+through a scratch buffer (`var f: [QK_K]f32`) and then convert; 5 write direct
+(fp8, int8, iq4_nl, iq4_xs, q8_0). **The three wrappers I changed still stage** —
+they keep the scratch and call the vectorized dequant into it — so their 3-4x is
+attributable entirely to the narrowing store being vectorized, with **no
+loop-structure change in the diff**. Recording that explicitly because the two
+easily blur: a "stop staging" fix and a "vectorise the store" fix both look like
+"the ToBF16 path got faster", and the next reader will otherwise read a
+loop-order fix as a SIMD result.
+
+**The leverage number: 13 wrappers, one primitive.** The remaining staging
+wrappers — IQ1_M, IQ1_S, IQ2_S, IQ2_XS, IQ2_XXS, IQ3_S, IQ3_XXS, Q2_K, Q3_K, Q6_K
+— need only `amx.f32_to_bf16_store` swapped in for their conversion loop to get
+the same class of win. That is P2.1's argument made concrete.
+
+**Deliberately NOT done yet: fusing away the staging.** It is a separate,
+genuine optimization (a 256-float write + read per block that never needs to
+exist) but folding it into the same change would make the attribution
+unreadable, which is the exact failure this note exists to prevent. It wants its
+own commit and its own measurement.
 
 **What was built:**
 - `amx.f32_to_bf16_store` — 8 lanes of RNE narrowing, integer-only, so **no
