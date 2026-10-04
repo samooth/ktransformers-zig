@@ -527,6 +527,39 @@ pub const GemmKernel224Int4 = struct {
         c: [*]f32, ldc: usize,
         m: usize, n: usize, k: usize
     ) void {
+        gemmAvx2With(decodeGroup, tailDot, a, lda, b, ldb, c, ldc, m, n, k);
+    }
+
+    /// The AVX2 GEMM body, parameterised on the two format-specific steps, in
+    /// the same shape `gemm_224_fp8.zig::gemmAvx2With` uses.
+    ///
+    /// `decode_group` turns one 32-weight group (one `BlockQ4_0`) into the
+    /// group's four 8-lane weight vectors with the scale already folded in;
+    /// `tail` handles the ragged k tail. Everything else lives here exactly
+    /// once: the MR-row blocking that lets MR rows of A share one decoded weight
+    /// vector, the single horizontal reduction per output element, the loop
+    /// order, and the ragged-group handling.
+    ///
+    /// Why this shape rather than a private body: the roadmap's shared-driver
+    /// item wants a driver with a decode slot, and a format that has to be
+    /// REWRITTEN into it does not get moved for free. This file, `fp8` and the
+    /// MX files are then three instantiations of one structure rather than three
+    /// hand-written GEMM bodies — the third hand-written one is what the E4M3
+    /// codec duplication and `gemmAvx2E5M2` already cost this tree twice.
+    ///
+    /// One structural difference from FP8's version, forced by the format
+    /// rather than chosen: FP8's scale is per ROW of B, so its body ends with
+    /// `sum * b_scales[j]`. INT4's scale is per GROUP and is folded into the
+    /// weight vectors inside `decode_group` — see the note there for why that is
+    /// exact rather than an approximation.
+    inline fn gemmAvx2With(
+        comptime decode_group: anytype,
+        comptime tail: anytype,
+        a: *const i8, lda: usize,
+        b: *const BlockQ4_0, ldb: usize,
+        c: [*]f32, ldc: usize,
+        m: usize, n: usize, k: usize,
+    ) void {
         if (m == 0 or n == 0) return;
         const kb_full = k / GROUP_SIZE; // complete 32-weight groups
         const rem = k - kb_full * GROUP_SIZE; // ragged tail, 0..31
@@ -539,23 +572,21 @@ pub const GemmKernel224Int4 = struct {
             const brow: [*]const BlockQ4_0 = @as([*]const BlockQ4_0, @ptrCast(b)) + j * ldb;
 
             var i: usize = 0;
-            // Main path: MR rows of A share every unpacked weight vector.
+            // Main path: MR rows of A share every decoded weight vector.
             while (i + MR <= m) : (i += MR) {
                 var acc = [_]Vec{@splat(0.0)} ** MR;
                 for (0..kb_full) |g| {
-                    const blk = &brow[g];
-                    const d = amx.bf16_to_f32(blk.d);
+                    const ws = decode_group(&brow[g]);
                     const kb0 = g * GROUP_SIZE;
                     inline for (0..GROUP_SIZE / 8) |v| { // 4 chunks of 8 weights
-                        const w = nibble8(&blk.qs[v * 4], d);
                         inline for (0..MR) |r| {
-                            acc[r] = @mulAdd(Vec, i8x8(arow + (i + r) * lda + kb0 + v * 8), w, acc[r]);
+                            acc[r] = @mulAdd(Vec, i8x8(arow + (i + r) * lda + kb0 + v * 8), ws[v], acc[r]);
                         }
                     }
                 }
                 inline for (0..MR) |r| {
                     var sum = @reduce(.Add, acc[r]); // ONE hsum per output element
-                    if (rem != 0) sum += tailDot(arow + (i + r) * lda, &brow[kb_full], kb_full * GROUP_SIZE, rem);
+                    if (rem != 0) sum += tail(arow + (i + r) * lda, &brow[kb_full], kb_full * GROUP_SIZE, rem);
                     c[(i + r) * ldc + j] = sum;
                 }
             }
@@ -563,18 +594,41 @@ pub const GemmKernel224Int4 = struct {
             while (i < m) : (i += 1) {
                 var acc: Vec = @splat(0.0);
                 for (0..kb_full) |g| {
-                    const blk = &brow[g];
-                    const d = amx.bf16_to_f32(blk.d);
+                    const ws = decode_group(&brow[g]);
                     const kb0 = g * GROUP_SIZE;
                     inline for (0..GROUP_SIZE / 8) |v| {
-                        acc = @mulAdd(Vec, i8x8(arow + i * lda + kb0 + v * 8), nibble8(&blk.qs[v * 4], d), acc);
+                        acc = @mulAdd(Vec, i8x8(arow + i * lda + kb0 + v * 8), ws[v], acc);
                     }
                 }
                 var sum = @reduce(.Add, acc);
-                if (rem != 0) sum += tailDot(arow + i * lda, &brow[kb_full], kb_full * GROUP_SIZE, rem);
+                if (rem != 0) sum += tail(arow + i * lda, &brow[kb_full], kb_full * GROUP_SIZE, rem);
                 c[i * ldc + j] = sum;
             }
         }
+    }
+
+    /// The format-specific decode: one `BlockQ4_0` (32 weights, one scale) to
+    /// four 8-lane f32 vectors of `(q - ZERO_POINT) * d`.
+    ///
+    /// This is where INT4's per-group scale is applied, and it is folded into
+    /// the weights rather than applied to the accumulator because the scale is
+    /// CONSTANT across the group's 32 weights, which makes the two formulations
+    /// identical — and the fold is EXACT rather than merely close: `(q - 8) * d`
+    /// needs at most 12 bits of the 24 an f32 has, since `q - 8` needs 4 and `d`
+    /// is a bf16. It also means no accumulator ever spans a group boundary
+    /// unscaled, which is the trap `applyScales` exists for on the AMX path
+    /// where the INT32 accumulator does span a K-block.
+    ///
+    /// A raw-INT4 (Kimi native) decode is this function with `d = 1` and the
+    /// scale hoisted out; `nibble8` is already
+    /// `rawint4_dequant_8x4bit_unscaled`. TODO.md Stream L records why that
+    /// kernel does not exist yet: no type id and no in-tree consumer, so it
+    /// would be unreferenced code.
+    pub inline fn decodeGroup(blk: *const BlockQ4_0) [GROUP_SIZE / 8]Vec {
+        const d = amx.bf16_to_f32(blk.d);
+        var out: [GROUP_SIZE / 8]Vec = undefined;
+        inline for (0..GROUP_SIZE / 8) |v| out[v] = nibble8(&blk.qs[v * 4], d);
+        return out;
     }
 
     /// Scalar fallback for non-AMX hosts, and the oracle the AVX2 path is
