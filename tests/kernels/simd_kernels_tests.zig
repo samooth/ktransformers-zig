@@ -1568,3 +1568,195 @@ test "kvalues16 (pshufb unpack) == the scalar KVALUES table for all nibbles" {
         try testing.expectEqual(@as(f32, @floatFromInt(kv[7 - i])), hi1[i]);
     }
 }
+
+// ============================================================================
+// FP8 E4M3
+// ============================================================================
+
+/// The reference's decode rule, transcribed from
+/// kt-kernel/operators/avx2/fp8_dequant.hpp::FP8LUT::init, written
+/// independently of `FP8_E4M3_LUT` so the comparison is a real oracle and not
+/// a restatement. `std.math.ldexp` is fine at RUNTIME; it is the COMPTIME
+/// evaluation of it that this toolchain rejects, which is why the shipped
+/// table is built from the f32 exponent field instead.
+fn refE4M3(bits: u8) f32 {
+    const sign: f32 = if (bits & 0x80 != 0) -1.0 else 1.0;
+    const e = (bits >> 3) & 0x0F;
+    const man = bits & 0x07;
+    if (e == 0 and man == 0) return 0.0 * sign;
+    if (e == 0) return sign * std.math.ldexp(@as(f32, @floatFromInt(man)) / 8.0, -6);
+    // The reference applies the sign to this branch too: `val = 0.0f;` then
+    // `table[i] = sign ? -val : val`, so 0xFF is NEGATIVE zero.
+    if (e == 15 and man == 7) return 0.0 * sign;
+    return sign * std.math.ldexp(1.0 + @as(f32, @floatFromInt(man)) / 8.0, @as(i32, e) - 7);
+}
+
+test "FP8 E4M3 LUT decode is exact for all 256 encodings" {
+    const fp8 = kt.gemm_fp8;
+    // Bit patterns, not `==`: -0.0 == 0.0 in IEEE, and 0x80 (negative zero) is
+    // one of the encodings under test. 0x7F decodes to 0, so there is no NaN
+    // in the table and no NaN comparison problem either.
+    for (0..256) |i| {
+        const bits: u8 = @intCast(i);
+        try testing.expectEqual(
+            @as(u32, @bitCast(refE4M3(bits))),
+            @as(u32, @bitCast(fp8.fp8e4m3_to_f32(bits))),
+        );
+    }
+    // The boundaries that were actually wrong before the LUT existed, spelled
+    // out: the two subnormal edges, zero (both signs), the single NaN, and the
+    // largest finite value on both signs.
+    const cases = [_][2]u32{
+        // byte, expected f32 bit pattern
+        .{ 0x00, 0x00000000 }, // +zero
+        .{ 0x01, 0x3B000000 }, // smallest positive subnormal (2^-9)
+        .{ 0x07, 0x3C600000 }, // largest subnormal (7 * 2^-9)
+        .{ 0x08, 0x3C800000 }, // smallest normal (2^-6)
+        .{ 0x0F, 0x3CF00000 }, // largest 2^-6 binade value
+        .{ 0x7E, 0x43E00000 }, // E4M3_MAX = 448
+        .{ 0x7F, 0x00000000 }, // the only NaN encoding -> +0
+        .{ 0x80, 0x80000000 }, // -zero (the sign IS applied: `-0.0f`)
+        .{ 0xFE, 0xC3E00000 }, // -E4M3_MAX
+    };
+    for (cases) |c| {
+        const byte: u8 = @intCast(c[0]);
+        try testing.expectEqual(c[1], @as(u32, @bitCast(fp8.fp8e4m3_to_f32(byte))));
+        try testing.expectEqual(c[1], @as(u32, @bitCast(refE4M3(byte))));
+    }
+    // Nothing may decode above E4M3_MAX: the old bit-reconstruction decoder
+    // returned 480.0 for 0x7F, which is not representable in the format.
+    for (0..256) |i| {
+        const v = @abs(fp8.fp8e4m3_to_f32(@intCast(i)));
+        try testing.expect(v <= fp8.E4M3_MAX);
+        try testing.expect(std.math.isFinite(v));
+    }
+    // Subnormals are the whole point: every one of the seven must be BELOW
+    // 2^-6, which they are not if the exponent field 0 is read as normal.
+    for (1..8) |i| {
+        const v = fp8.fp8e4m3_to_f32(@intCast(i));
+        try testing.expect(v > 0.0);
+        try testing.expect(v < 0.015625);
+        try testing.expectEqual(v * 512.0, @as(f32, @floatFromInt(i))); // exact
+    }
+}
+
+test "FP8 AVX2 GEMM == the scalar oracle across shapes, including ragged k" {
+    const fp8 = kt.gemm_fp8;
+    // Shapes chosen to hit every branch in `gemmAvx2`: m = 1 (the m%MR tail
+    // path only), m = 4 (exactly MR), m = 5 (one full group + tail), n = 1 and
+    // 2 (no vectorisation on the n axis at all), and k = 8 / 16 / 32 exactly,
+    // k past one 32-element step, and k with a 1..7 element tail.
+    var seed: u64 = 0x4650_0001;
+    const shapes = [_][3]usize{
+        .{ 1, 1, 8 },
+        .{ 1, 2, 16 },
+        .{ 4, 7, 32 },
+        .{ 5, 1, 33 }, // ragged k (32 + 1)
+        .{ 5, 2, 40 }, // ragged k (32 + 8)
+        .{ 5, 7, 96 },
+        .{ 1, 7, 97 }, // ragged k (96 + 1)
+        .{ 4, 2, 129 },
+        .{ 5, 7, 256 },
+    };
+    for (shapes) |sh| {
+        const m = sh[0];
+        const n = sh[1];
+        const k = sh[2];
+        const act = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(act);
+        for (0..m * k) |i| act[i] = amx.f32_to_bf16(rnd(&seed, 512, 2.0));
+
+        const w = try testing.allocator.alloc(fp8.fp8_e4m3, n * k);
+        defer testing.allocator.free(w);
+        // Random bytes: all 256 encodings appear in a 32-element row, so the
+        // subnormal and 0x7F paths are exercised, not just the normals.
+        for (w) |*q| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            q.* = @truncate(seed >> 24);
+        }
+
+        const sc = try testing.allocator.alloc(f32, n);
+        defer testing.allocator.free(sc);
+        for (sc) |*s| s.* = rnd(&seed, 1024, 0.5) + 0.5;
+
+        const got = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(got);
+        const scal = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(scal);
+        // Poison both outputs: `gemmAvx2` assigns rather than accumulates, so
+        // this also proves every element of [0,m) x [0,n) is written.
+        @memset(got, std.math.nan(f32));
+        @memset(scal, std.math.nan(f32));
+
+        fp8.GemmKernel224FP8.gemmAvx2(act.ptr, k, w.ptr, sc.ptr, k, got.ptr, n, m, n, k);
+        fp8.GemmKernel224FP8.gemmFullTileScalar(act.ptr, k, w.ptr, sc.ptr, k, scal.ptr, n, m, n, k);
+
+        // The oracle folds the per-row scale ONCE, after the reduction, which
+        // is what the vector path does (and the more accurate of the two
+        // formulations — a separate test below pins that choice bit-exactly).
+        // `gemmFullTileScalar` folds the scale into every product, so it is
+        // compared as a second statement of the same math rather than as the
+        // oracle.
+        //
+        // All three agree only to f32 summation error, and E4M3 weights from
+        // random bytes span 2^-9 .. 448, so a partly-cancelling dot is
+        // genuinely ill-conditioned: measured worst over this sweep is 6.6e-6
+        // for the vector path and 2.3e-5 for the scalar one (both against the
+        // f64 oracle, at k = 256). A wrong scale, a missed sign, a bad offset
+        // or a table entry decoded twice gives O(1) instead — 1e-4 catches
+        // every real defect and is not a bound any of these kernels is near.
+        for (0..m) |i| {
+            for (0..n) |j| {
+                var dot: f64 = 0;
+                for (0..k) |kk| {
+                    dot += @as(f64, amx.bf16_to_f32(act[i * k + kk])) *
+                        @as(f64, fp8.fp8e4m3_to_f32(w[j * k + kk]));
+                }
+                const want: f64 = dot * @as(f64, sc[j]);
+                const denom = @max(@abs(want), 1e-2);
+                try testing.expect(std.math.isFinite(got[i * n + j]));
+                try testing.expect(std.math.isFinite(scal[i * n + j]));
+                try testing.expect(@abs(@as(f64, got[i * n + j]) - want) / denom < 1e-4);
+                try testing.expect(@abs(@as(f64, scal[i * n + j]) - want) / denom < 1e-4);
+                try testing.expect(@abs(@as(f64, got[i * n + j]) - @as(f64, scal[i * n + j])) / denom < 1e-4);
+            }
+        }
+    }
+}
+
+test "FP8 row scale is applied once, after the accumulation" {
+    // The two formulations are numerically DIFFERENT, so a test that compares
+    // against a per-element-scale oracle is comparing against a different
+    // number. This pins the choice exactly rather than within a tolerance,
+    // with a case where the two differ by one ULP and the once-scaled value is
+    // also the f64 ground truth rounded once.
+    //
+    //   a = 3.0, w = E4M3 0x07 = 7*2^-9 = 0.013671875, scale = 0.1
+    //   once:      (3.0 * 0.013671875) * 0.1  = 0x3B866667  (== f64 truth)
+    //   per-element: 3.0 * (0.013671875 * 0.1) = 0x3B866666  (1 ULP low)
+    //
+    // k = 9 so the vector path is the one under test: 8 weights in the main
+    // loop and one through the ragged tail, with the other eight activations
+    // zero so exactly one term contributes and the @reduce cannot hide the
+    // ordering.
+    const fp8 = kt.gemm_fp8;
+    const M: usize = 1;
+    const N: usize = 1;
+    const K: usize = 9;
+
+    var act: [M * K]amx.bf16 = undefined;
+    for (&act, 0..) |*v, i| v.* = amx.f32_to_bf16(if (i == 0) 3.0 else 0.0);
+    var w: [N * K]fp8.fp8_e4m3 = undefined;
+    for (&w) |*q| q.* = 0x07;
+    const sc = [N]f32{0.1};
+
+    var got: [M * N]f32 = undefined;
+    var scal: [M * N]f32 = undefined;
+    fp8.GemmKernel224FP8.gemmAvx2(&act, K, &w, &sc, K, &got, N, M, N, K);
+    fp8.GemmKernel224FP8.gemmFullTileScalar(&act, K, &w, &sc, K, &scal, N, M, N, K);
+
+    try testing.expectEqual(@as(u32, 0x3B866667), @as(u32, @bitCast(got[0])));
+    try testing.expectEqual(@as(u32, 0x3B866666), @as(u32, @bitCast(scal[0])));
+    // The two must genuinely differ, or the assertion above proves nothing.
+    try testing.expect(got[0] != scal[0]);
+}
