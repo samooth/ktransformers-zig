@@ -2060,6 +2060,208 @@ test "activation matches the C++ reference act_fn after the bf16 round trip" {
     }
 }
 
+test "FP8 E5M2: the LUT is exact for all 256 encodings, against an independent computation" {
+    const fp8 = kt.gemm_fp8;
+
+    // The LUT is built by bit placement (exponent bias +112, mantissa << 21),
+    // which is exact by construction but only if the placement is right. This
+    // recomputes every entry the slow, obvious way — exponent and mantissa
+    // arithmetic, and the subnormal band as man * 2^-16 — and demands bit
+    // equality. A sign-bit or shift mistake cannot hide, because all 256
+    // entries are compared rather than a sample.
+    var checked: usize = 0;
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        const got = fp8.FP8_E5M2_LUT[b];
+
+        const neg = b & 0x80 != 0;
+        const e: u8 = (b >> 2) & 0x1F;
+        const m: u8 = b & 0x03;
+
+        if (e == 31) {
+            // No infinity in E5M2: the whole top exponent is NaN. An
+            // implementation that decoded 0x7C as 57344 would pass a
+            // round-trip test and still be wrong, so assert NaN explicitly.
+            try testing.expect(std.math.isNan(got));
+            try testing.expect(std.math.isNan(fp8.fp8e5m2_to_f32(b)));
+        } else if (e == 0) {
+            const mag = fp8.E5M2_SUBNORMALS[m];
+            const want = if (neg) -mag else mag;
+            try testing.expectEqual(want, got);
+            try testing.expectEqual(want, fp8.fp8e5m2_to_f32(b));
+            // Signed zero is a VALUE distinction here: 0x80 must decode to
+            // -0.0, not +0.0, or it re-encodes to 0x00 and the byte is lost.
+            if (m == 0) try testing.expectEqual(neg, std.math.signbit(got));
+        } else {
+            const mag = (1.0 + @as(f32, @floatFromInt(m)) / 4.0) *
+                std.math.ldexp(@as(f32, 1.0), @as(i32, e) - 15);
+            const want = if (neg) -mag else mag;
+            try testing.expectEqual(want, got);
+            try testing.expectEqual(want, fp8.fp8e5m2_to_f32(b));
+        }
+        checked += 1;
+    }
+    try testing.expectEqual(@as(usize, 256), checked);
+
+    // The documented range endpoints, pinned as bytes. 0x7B is the largest
+    // finite encoding; 0x7C is already NaN, so an encoder that "saturates" to
+    // 0x7C would delete the value instead of clipping it.
+    try testing.expectEqual(@as(f32, 57344.0), fp8.fp8e5m2_to_f32(0x7B));
+    try testing.expectEqual(@as(f32, -57344.0), fp8.fp8e5m2_to_f32(0xFB));
+    try testing.expect(std.math.isNan(fp8.fp8e5m2_to_f32(0x7C)));
+    try testing.expectEqual(@as(f32, 2.0 / 65536.0), fp8.fp8e5m2_to_f32(0x02)); // 2^-15
+    try testing.expectEqual(@as(f32, 1.0 / 65536.0), fp8.fp8e5m2_to_f32(0x01)); // 2^-16
+    try testing.expectEqual(@as(f32, 0.00006103515625), fp8.fp8e5m2_to_f32(0x04)); // 2^-14
+}
+
+test "FP8 E5M2 encode∘decode round trips all 252 finite encodings" {
+    const fp8 = kt.gemm_fp8;
+
+    // 1. The sweep: decode -> encode -> decode must be byte-stable for every
+    //    encoding except the eight NaN holes (0x7C..0x7F and 0xFC..0xFF),
+    //    which have no value to round-trip.
+    var failures: usize = 0;
+    var nan_holes: usize = 0;
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        if ((b >> 2) & 0x1F == 31) {
+            nan_holes += 1;
+            try testing.expect(std.math.isNan(fp8.fp8e5m2_to_f32(b)));
+            continue;
+        }
+        const back = fp8.f32_to_fp8e5m2(fp8.fp8e5m2_to_f32(b));
+        if (back != b) {
+            failures += 1;
+            std.debug.print("  E5M2 0x{X:0>2} -> {e} -> 0x{X:0>2}\n", .{ b, fp8.fp8e5m2_to_f32(b), back });
+        }
+    }
+    try testing.expectEqual(@as(usize, 0), failures);
+    try testing.expectEqual(@as(usize, 8), nan_holes);
+
+    // 2. Signed zero must keep its sign rather than collapsing: the LUT puts
+    //    the sign on the zero subnormal, and an encoder that compares `a == 0`
+    //    would return +0x00 for -0.0.
+    try testing.expectEqual(@as(u8, 0x80), fp8.f32_to_fp8e5m2(-0.0));
+    try testing.expectEqual(@as(u8, 0x00), fp8.f32_to_fp8e5m2(0.0));
+    try testing.expect(std.math.signbit(fp8.fp8e5m2_to_f32(0x80)));
+    try testing.expect(!std.math.signbit(fp8.fp8e5m2_to_f32(0x00)));
+
+    // 3. Saturation clips to 57344, NOT to a NaN encoding. This is the E5M2
+    //    counterpart of the E4M3 bug where 500.0 became 0x7F and decoded to 0.
+    const sat = [_][2]f32{
+        .{ 57344.0, 57344.0 },
+        .{ 60000.0, 57344.0 },
+        .{ 1.0e30, 57344.0 },
+        .{ std.math.inf(f32), 57344.0 },
+        .{ -57344.0, -57344.0 },
+        .{ -60000.0, -57344.0 },
+        .{ -std.math.inf(f32), -57344.0 },
+    };
+    for (sat) |c| {
+        const enc = fp8.f32_to_fp8e5m2(c[0]);
+        try testing.expect(enc != 0x7C and enc != 0x7D and enc != 0x7E and enc != 0x7F);
+        try testing.expectEqual(c[1], fp8.fp8e5m2_to_f32(enc));
+    }
+    try testing.expectEqual(@as(u8, 0x7B), fp8.f32_to_fp8e5m2(1.0e30));
+    try testing.expectEqual(@as(u8, 0xFB), fp8.f32_to_fp8e5m2(-1.0e30));
+
+    // 4. NaN keeps a NaN encoding and its sign.
+    try testing.expectEqual(@as(u8, 0x7F), fp8.f32_to_fp8e5m2(std.math.nan(f32)));
+    try testing.expectEqual(@as(u8, 0xFF), fp8.f32_to_fp8e5m2(-std.math.nan(f32)));
+
+    // 5. The exponent bias is 15, not E4M3's 7. Every power of two pins it:
+    //    an off-by-8 bias shifts the whole format by 256x and would still pass
+    //    a self-consistent round-trip.
+    const Pow2 = struct { v: f32, byte: u8 };
+    const pow2 = [_]Pow2{
+        .{ .v = 1.0, .byte = 0x3C }, // exp 15
+        .{ .v = 2.0, .byte = 0x40 },
+        .{ .v = 0.5, .byte = 0x38 }, // exp 14
+        .{ .v = 1024.0, .byte = 0x64 }, // 2^10, exp 25
+        .{ .v = 32768.0, .byte = 0x78 }, // 2^15, exp 30
+        .{ .v = 0.00006103515625, .byte = 0x04 }, // 2^-14, exp 1
+        .{ .v = 0.0001220703125, .byte = 0x08 }, // 2^-13
+    };
+    for (pow2) |c| {
+        try testing.expectEqual(c.byte, fp8.f32_to_fp8e5m2(c.v));
+        try testing.expectEqual(c.v, fp8.fp8e5m2_to_f32(c.byte));
+    }
+
+    // 6. The mantissa carry. With a 2-bit mantissa the round-up still belongs
+    //    to the exponent: 1.9 sits in [1.75, 2.0) and must become 2.0 (0x40),
+    //    not 1.75 (0x3F). This is the E4M3 3.875 bug in E5M2 clothing, and it
+    //    is a 2x error when it happens.
+    try testing.expectEqual(@as(u8, 0x40), fp8.f32_to_fp8e5m2(1.9));
+    try testing.expectEqual(@as(f32, 2.0), fp8.fp8e5m2_to_f32(fp8.f32_to_fp8e5m2(1.9)));
+    // 3.9375 = 1.96875 * 2 also carries, landing on exp 17 -> 0x44 = 4.0. The
+    // byte is NOT 0x40: that is 2.0, and writing it would mean the carry
+    // skipped the exponent entirely.
+    try testing.expectEqual(@as(u8, 0x44), fp8.f32_to_fp8e5m2(3.9375));
+    try testing.expectEqual(@as(f32, 4.0), fp8.fp8e5m2_to_f32(fp8.f32_to_fp8e5m2(3.9375)));
+    // ...and the other side: 1.8 is below the midpoint and must round DOWN.
+    try testing.expectEqual(@as(u8, 0x3F), fp8.f32_to_fp8e5m2(1.8));
+    try testing.expectEqual(@as(f32, 1.75), fp8.fp8e5m2_to_f32(0x3F));
+
+    // 7. Round-to-nearest-even on the exact halfway cases, where round-half-up
+    //    gives a different answer. Two mantissa bits means the representable
+    //    neighbours in [1,2) are 1.00, 1.01, 1.10, 1.11, so the three
+    //    midpoints are 1.125, 1.375 and 1.625, and "even" is decided by the
+    //    last retained bit: 1.125 -> 1.00, but 1.375 and 1.625 both -> 1.10.
+    // A tie must go to EVEN, not up. 1.125 sits exactly between 1.00 and 1.01,
+    // so round-half-up gives 1.25 and this assertion fails — which is the
+    // signature of a sticky mask that wrongly includes the round bit.
+    try testing.expectEqual(@as(u8, 0x3C), fp8.f32_to_fp8e5m2(1.125));
+    try testing.expectEqual(@as(f32, 1.0), fp8.fp8e5m2_to_f32(fp8.f32_to_fp8e5m2(1.125)));
+    try testing.expectEqual(@as(f32, 1.5), fp8.fp8e5m2_to_f32(fp8.f32_to_fp8e5m2(1.375)));
+    try testing.expectEqual(@as(f32, 1.5), fp8.fp8e5m2_to_f32(fp8.f32_to_fp8e5m2(1.625)));
+
+    // 8. The subnormal band reaches 2^-16 across four encodings, and the ties
+    //    at its boundaries round to even, including the one that rounds out of
+    //    the subnormals into the smallest normal.
+    try testing.expectEqual(@as(u8, 0x01), fp8.f32_to_fp8e5m2(1.0 / 65536.0));
+    try testing.expectEqual(@as(u8, 0x02), fp8.f32_to_fp8e5m2(2.0 / 65536.0));
+    try testing.expectEqual(@as(u8, 0x03), fp8.f32_to_fp8e5m2(3.0 / 65536.0));
+    try testing.expectEqual(@as(u8, 0x00), fp8.f32_to_fp8e5m2(0.5 / 65536.0)); // tie 0<->1, even is 0
+    try testing.expectEqual(@as(u8, 0x02), fp8.f32_to_fp8e5m2(1.5 / 65536.0)); // tie 1<->2, even is 2
+    try testing.expectEqual(@as(u8, 0x02), fp8.f32_to_fp8e5m2(2.5 / 65536.0)); // tie 2<->3, even is 2
+    try testing.expectEqual(@as(u8, 0x04), fp8.f32_to_fp8e5m2(3.5 / 65536.0)); // rounds out to 2^-14
+    try testing.expectEqual(@as(f32, 0.00006103515625), fp8.fp8e5m2_to_f32(fp8.f32_to_fp8e5m2(3.5 / 65536.0)));
+}
+
+test "FP8 E5M2 encode stays within half an ULP over the whole range" {
+    const fp8 = kt.gemm_fp8;
+
+    // Property check rather than a table: with 2 mantissa bits the spacing is
+    // 2^-2 relative, so half an ULP is 1/8 = 0.125. Sweep exponents across the
+    // entire format and mantissas across a range, and require the decoded value
+    // to be within that bound — or saturated, if the input is out of range.
+    var state: u64 = 0x5EED_1234;
+    var worst: f32 = 0.0;
+    for (0..20000) |_| {
+        const v = rnd(&state, 2048, 1.0);
+        if (v == 0.0) continue;
+        const a = @abs(v);
+        const dec = @abs(fp8.fp8e5m2_to_f32(fp8.f32_to_fp8e5m2(v)));
+        if (a >= fp8.E5M2_MAX) {
+            try testing.expectEqual(fp8.E5M2_MAX, dec);
+            continue;
+        }
+        const rel = @abs(dec - a) / a;
+        if (rel > worst) worst = rel;
+    }
+    // Subnormals below 2^-14 have absolute, not relative, spacing, so this
+    // bound only holds for the normal band; 0.125 is the normal-band limit.
+    try testing.expect(worst <= 0.1251);
+
+    // And the reverse direction: every encoding's own value must survive the
+    // encoder unchanged, which is what makes the LUT and the encoder agree.
+    for (0..256) |i| {
+        const b: u8 = @intCast(i);
+        if ((b >> 2) & 0x1F == 31) continue;
+        try testing.expectEqual(b, fp8.f32_to_fp8e5m2(fp8.fp8e5m2_to_f32(b)));
+    }
+}
+
 test "FP8 E4M3 encode∘decode round trips every encoding; saturation is 448, not NaN" {
     const fp8 = kt.gemm_fp8;
 
@@ -2351,6 +2553,125 @@ test "IQ3_S AVX2 GEMM == the scalar oracle, across super-blocks and m tails" {
 
         g.gemmAvx2(a.ptr, w.ptr, c_avx.ptr, m, n, k, k, nb, n);
         g.gemmIQ3_SScalar(a.ptr, w.ptr, c_ref.ptr, m, n, k, k, nb, n);
+
+        for (0..m * n) |i| {
+            const av = c_avx[i];
+            const rf = c_ref[i];
+            if (std.math.isNan(rf)) {
+                try testing.expect(std.math.isNan(av));
+            } else if (std.math.isInf(rf)) {
+                try testing.expectEqual(std.math.isInf(av), std.math.isInf(rf));
+            } else {
+                try testing.expect(std.math.isFinite(av));
+                const denom = @max(@abs(rf), 1e-2);
+                try testing.expect(@abs(av - rf) / denom < 1e-3);
+            }
+        }
+    }
+}
+test "IQ1_S AVX2 GEMM == the scalar oracle, across super-blocks and m tails" {
+    // Oracle is the scalar GEMM. k sweeps 1..3 super-blocks so a missing
+    // `blk * QK_K` (the e6372ee bug class) cannot hide, and `nb > 0` keeps any
+    // case from being vacuous.
+    //
+    // NB these two are the 1-bit formats: grid magnitudes are SIGNED bytes and
+    // there is no per-element sign, so the unpack is `grid8s` + a group-wide
+    // delta. Using the unsigned `grid8` here would read -1 as 255.
+    const g = kt.gemm_iq1_s;
+    var seed: u64 = 0x1B1B_0001;
+
+    for ([_]usize{ 1, 2, 3 }) |blocks| {
+        const k = blocks * g.QK_K;
+        const nb = blocks;
+        try testing.expect(nb > 0);
+        const m: usize = 5;
+        const n: usize = 3;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 64, 2.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ1_S, n * nb);
+        defer testing.allocator.free(w);
+        // IQ1_M's hidden f16 scale comes out of the scales bytes, so random ones
+        // can be NaN -> the comparison is NaN-aware (see below).
+        const wb: [*]u8 = @ptrCast(@alignCast(w.ptr));
+        for (0..n * nb * @sizeOf(g.BlockIQ1_S)) |i| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            wb[i] = @truncate(seed >> 24);
+        }
+        if (@hasField(g.BlockIQ1_S, "d")) {
+            for (w) |*blk| blk.d = @bitCast(@as(f16, 0.05));
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        g.gemmAvx2(a.ptr, w.ptr, c_avx.ptr, m, n, k, k, nb, n);
+        g.gemmIQ1_SScalar(a.ptr, w.ptr, c_ref.ptr, m, n, k, k, nb, n);
+
+        for (0..m * n) |i| {
+            const av = c_avx[i];
+            const rf = c_ref[i];
+            if (std.math.isNan(rf)) {
+                try testing.expect(std.math.isNan(av));
+            } else if (std.math.isInf(rf)) {
+                try testing.expectEqual(std.math.isInf(av), std.math.isInf(rf));
+            } else {
+                try testing.expect(std.math.isFinite(av));
+                const denom = @max(@abs(rf), 1e-2);
+                try testing.expect(@abs(av - rf) / denom < 1e-3);
+            }
+        }
+    }
+}
+
+test "IQ1_M AVX2 GEMM == the scalar oracle, across super-blocks and m tails" {
+    // Oracle is the scalar GEMM. k sweeps 1..3 super-blocks so a missing
+    // `blk * QK_K` (the e6372ee bug class) cannot hide, and `nb > 0` keeps any
+    // case from being vacuous.
+    //
+    // NB these two are the 1-bit formats: grid magnitudes are SIGNED bytes and
+    // there is no per-element sign, so the unpack is `grid8s` + a group-wide
+    // delta. Using the unsigned `grid8` here would read -1 as 255.
+    const g = kt.gemm_iq1_m;
+    var seed: u64 = 0x1B1B_0001;
+
+    for ([_]usize{ 1, 2, 3 }) |blocks| {
+        const k = blocks * g.QK_K;
+        const nb = blocks;
+        try testing.expect(nb > 0);
+        const m: usize = 5;
+        const n: usize = 3;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 64, 2.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ1_M, n * nb);
+        defer testing.allocator.free(w);
+        // IQ1_M's hidden f16 scale comes out of the scales bytes, so random ones
+        // can be NaN -> the comparison is NaN-aware (see below).
+        const wb: [*]u8 = @ptrCast(@alignCast(w.ptr));
+        for (0..n * nb * @sizeOf(g.BlockIQ1_M)) |i| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            wb[i] = @truncate(seed >> 24);
+        }
+        if (@hasField(g.BlockIQ1_M, "d")) {
+            for (w) |*blk| blk.d = @bitCast(@as(f16, 0.05));
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        g.gemmAvx2(a.ptr, w.ptr, c_avx.ptr, m, n, k, k, nb, n);
+        g.gemmIQ1_MScalar(a.ptr, w.ptr, c_ref.ptr, m, n, k, k, nb, n);
 
         for (0..m * n) |i| {
             const av = c_avx[i];

@@ -995,6 +995,27 @@ either added or recorded as deliberately out of scope with the reason. The
 `_avxvnni` variant is out of scope: this host has no VNNI and the scalar path
 stays the fallback for it.
 
+**Stream M — FP8 E5M2. CLAIMED (fp8-e5m2) since 2026-10-04.**
+`src/kernels/amx/gemm_224_fp8.zig`, `src/main.zig`, `include/kt_kernel.h`,
+`src/kernels/moe/llamafile_moe.zig`, and **`tests/kernels/simd_kernels_tests.zig`
+— the SIMD suite is claimed, it is shared with Stream K.** Wait for it or hand
+your test additions over; do not stage it while this claim stands.
+
+E5M2 is the last unclaimed piece of roadmap P0.2 and the only FP8 format with
+**no encoder, no decoder, no enum value and no dispatch arm anywhere in the
+tree** — E4M3 was complete, so "FP8 E4M3/E5M2" was half a deliverable. Closes
+with: the codec in the file that already owns E4M3 (one owner per codec — the
+lesson of the E4M3/MXFP8 duplication), exhaustive tests, then the C API and the
+vectorized sibling.
+
+The format differs from E4M3 in ways that are all easy to get wrong, and the
+E4M3 encoder's bug list is the checklist: bias 15 not 7, **no infinities** (the
+whole exponent-31 field is NaN, so the largest finite value is `0x7B` = 57344,
+not 0x7E), **subnormals down to 2^-16** across four encodings rather than seven
+down to 2^-9, and a 2-bit mantissa whose round-up carry lands in the exponent
+just the same. Nothing here may be inferred from the E4M3 code by analogy.
+
+
 **Stream K — IQ2_XXS GEMM. DONE. The earlier "weak result" entry was WRONG and
 is corrected below. CLAIMED (iq2xs-avx2) since 2026-10-04.**
 

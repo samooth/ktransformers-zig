@@ -1,4 +1,5 @@
-// CLAIM: fp8-gemm-avx2 — FP8 GEMM — 2026-10-04
+// CLAIM: fp8-e5m2 — FP8 E5M2 codec + C API + vectorized sibling — 2026-10-04
+// (supersedes the closed fp8-gemm-avx2 claim; E4M3 GEMM work is committed)
 // GEMM Kernel 224 FP8 E4M3 for AMX/AVX512
 // Ported from ktransformers kt-kernel/operators/amx/la/amx_kernels.hpp
 // FP8 E4M3 weights with BF16 activations
@@ -149,6 +150,167 @@ pub fn fp8e4m3_to_f32(x: fp8_e4m3) f32 {
 /// Convert FP8 E4M3 to BF16
 pub fn fp8e4m3_to_bf16(x: fp8_e4m3) amx.bf16 {
     return amx.f32_to_bf16(fp8e4m3_to_f32(x));
+}
+
+// ============================================================================
+// FP8 E5M2 Type
+// ============================================================================
+//
+// 1 sign bit, 5 exponent bits, 2 mantissa bits, bias 15. This is the second
+// OCP FP8 format and the one DeepSeek-style FP8 transports use for activations,
+// where the extra exponent range matters more than mantissa precision.
+//
+// IT IS NOT E4M3 WITH WIDER FIELDS, and every difference below is a place a
+// by-analogy port goes wrong. The E4M3 encoder in this file carried four real
+// bugs and the list is the checklist for this one:
+//
+//   1. **There are no infinities.** The entire exponent-31 field is NaN, so
+//      `E5M2_MAX` is `0x7B` (exp 30, man 3) = 1.75 * 2^15 = 57344, NOT 0x7E.
+//      Encoding saturation to 0x7E would produce a NaN, and the decoder maps
+//      NaN to 0 — which is how the E4M3 encoder deleted every weight above
+//      range instead of clipping it.
+//   2. **Bias is 15, not 7.** Getting this wrong shifts every value by 2^8.
+//   3. **Subnormals reach 2^-16** across four encodings (1..3 * 2^-16 plus
+//      zero), not 2^-9 across seven. A guard that flushes them deletes real
+//      small values.
+//   4. **The mantissa carry still lands in the exponent.** 2-bit mantissa or
+//      not: rounding 1.75 up gives 2.0, which is an exponent bump, not a
+//      mantissa mask. Masking it is the 2x bug E4M3 had at 3.875.
+///
+/// Rounding is round-to-nearest-even throughout, matching E4M3 and matching the
+/// C++ reference.
+
+/// FP8 E5M2 format: 1 sign bit, 5 exponent bits, 2 mantissa bits
+/// Range: 2^-16 to 57344.0
+pub const fp8_e5m2 = u8;
+
+/// Largest finite E5M2 value: 0x7B = 1.75 * 2^15. There is no infinity.
+pub const E5M2_MAX: f32 = 57344.0;
+
+/// Smallest positive normal: 2^-14.
+pub const E5M2_MIN_NORMAL: f32 = 0.00006103515625; // 2^-14
+
+/// Smallest positive subnormal: 2^-16.
+pub const E5M2_MIN_SUBNORMAL: f32 = 0.0000152587890625; // 2^-16
+
+/// The four subnormal magnitudes, exactly representable in f32 (each is a
+/// small multiple of 2^-16, needing at most 2 mantissa bits).
+pub const E5M2_SUBNORMALS: [4]f32 = .{
+    0.0,
+    1.0 / 65536.0, // 2^-16
+    2.0 / 65536.0, // 2^-15
+    3.0 / 65536.0,
+};
+
+/// The NaN encoding. E5M2's NaN field is the whole top exponent (0x7C..0x7F
+/// and their signed twins); 0x7F is quiet NaN with both mantissa bits set.
+pub const E5M2_NAN: fp8_e5m2 = 0x7F;
+
+/// Encode f32 to FP8 E5M2, saturating rather than producing NaN.
+pub fn f32_to_fp8e5m2(x: f32) fp8_e5m2 {
+    if (std.math.isNan(x)) return if (std.math.signbit(x)) 0xFF else E5M2_NAN;
+
+    const s: u8 = if (std.math.signbit(x)) 0x80 else 0x00;
+    const a = @abs(x);
+
+    // 0x7B = 57344 is the largest finite encoding. Everything at or above it
+    // clips there; the NaN encodings are NOT reachable by saturation.
+    if (a >= E5M2_MAX) return s | 0x7B;
+
+    // Subnormal band: value = man * 2^-16 with man in 0..3. 2^-16 is exactly
+    // representable, so scaling by 65536 is exact and the rounding below is
+    // exact too. A result of 4 means it rounded up past the subnormals and
+    // belongs in the normal band as 0x04 (2^-14).
+    if (a < E5M2_MIN_NORMAL) {
+        const scaled = a * 65536.0;
+        const fl = @floor(scaled);
+        var man: u8 = @intFromFloat(fl);
+        const frac = scaled - fl;
+        if (frac > 0.5 or (frac == 0.5 and (man & 1) == 1)) man += 1;
+        return s | (if (man >= 4) 0x04 else man);
+    }
+
+    const u: u32 = @bitCast(a);
+    const exp = @as(i32, @intCast((u >> 23) & 0xFF)) - 127;
+    const mant = u & 0x007FFFFF;
+
+    var e_out: u8 = @intCast(exp + 15); // bias 15, NOT 7
+    const m2 = (mant >> 21) & 0x3;
+    const round_bit = (mant >> 20) & 1;
+    // Sticky is the bits STRICTLY BELOW the round bit, so it must mask off
+    // bit 20 as well — `mant & 0x1FFFFF` includes the round bit itself, which
+    // makes `sticky` true whenever `round_bit` is, and silently degrades
+    // round-to-nearest-even into round-half-up. The E4M3 encoder above keeps 3
+    // bits with the round bit at 19 and masks 0x7FFFF (bits 0-18) for the same
+    // reason: with 2 retained bits the mask is bits 0-19.
+    const sticky = mant & 0x000FFFFF != 0;
+    var mm: u8 = @intCast(m2);
+    // Round-to-nearest-even, same rule as E4M3.
+    if (round_bit == 1 and (sticky or (m2 & 1) == 1)) mm += 1;
+    // The carry into the exponent. 1.75 rounds up to 2.0, which lives in the
+    // exponent field; masking it here is the 2x error E4M3 had at 3.875.
+    if (mm == 4) {
+        mm = 0;
+        e_out += 1;
+    }
+    if (e_out > 30) return s | 0x7B; // 2^15 and up saturate to max finite
+    return s | (e_out << 2) | mm;
+}
+
+/// FP8 E5M2 -> F32 lookup table, built at comptime.
+///
+/// Same shape as the E4M3 table, and for the same reason: a LUT is what the
+/// GEMM gathers from, and building it once at comptime keeps the decode path
+/// branch-free.
+///
+/// The normal band is assembled by bit placement rather than arithmetic, so it
+/// is exact by construction: E5M2's 5 exponent bits and 2 mantissa bits fit
+/// f32's 8 and 23 with a +112 bias shift and a 21-bit mantissa shift, with no
+/// rounding anywhere. The subnormal band cannot be bit-assembled (it is a
+/// different encoding, not a small exponent), so it comes from the exact
+/// constant table.
+pub const FP8_E5M2_LUT: [256]f32 = blk: {
+    var t: [256]f32 = undefined;
+    for (0..256) |i| {
+        const sign: u1 = @intCast((i >> 7) & 1);
+        const e: u8 = (i >> 2) & 0x1F;
+        const m: u8 = i & 0x03;
+
+        var v: f32 = undefined;
+        if (e == 31) {
+            // No infinity in E5M2: the whole top exponent is NaN.
+            v = std.math.nan(f32);
+        } else if (e == 0) {
+            // Index 0 is +0.0; the sign is applied below, which is what keeps
+            // 0x80 decoding to NEGATIVE zero rather than +0.0. Folding the sign
+            // into the value instead — `if (m == 0) 0.0` — silently drops it,
+            // and then 0x80 fails to round-trip through the encoder. The
+            // 256-encoding sweep is what caught that.
+            v = E5M2_SUBNORMALS[m];
+        } else {
+            // Built straight into the f32 fields rather than with ldexp, for
+            // the reason spelled out in the E4M3 table above: ldexp cannot be
+            // evaluated at comptime in Zig 0.16. Here it does not need to be,
+            // because exponent +112 is exactly (e - 15) + 127 and m << 21 is
+            // exactly the 2-bit mantissa, so the normal band is bit-exact with
+            // no rounding at all.
+            const bits: u32 = (@as(u32, e + 112) << 23) | (@as(u32, m) << 21);
+            v = @bitCast(bits);
+        }
+        // Applied last, so -0.0 survives. NaN keeps its sign too, harmlessly.
+        t[i] = if (sign == 1) -v else v;
+    }
+    break :blk t;
+};
+
+/// Decode FP8 E5M2 to F32.
+pub fn fp8e5m2_to_f32(x: fp8_e5m2) f32 {
+    return FP8_E5M2_LUT[x];
+}
+
+/// Convert FP8 E5M2 to BF16.
+pub fn fp8e5m2_to_bf16(x: fp8_e5m2) amx.bf16 {
+    return amx.f32_to_bf16(fp8e5m2_to_f32(x));
 }
 
 // ============================================================================
