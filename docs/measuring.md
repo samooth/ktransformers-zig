@@ -199,6 +199,24 @@ Shape coverage matters too: if a kernel vectorises over **k** (not n), a small
 `n` is harmless and the vector body still runs. Check which axis is vectorised
 before calling a shape a gap.
 
+**A literal-presence grep cannot verify a constant, and grepping for it will
+"correct" a true claim into a false one.** Verifying that IQ3_XXS uses a group
+scale of 0.5 where the IQ2 formats use 0.25 by grepping the five files for `0.25`
+and `0.5` returns both literals in **all five** — and only `0.5` in the 1-bit
+pair, which looks like a contradiction of the claim. It is not: `0.5 +` appears
+everywhere and only the *trailing multiplier* differs. Presence of a literal says
+nothing about whether it is the value, a summand, or an unrelated constant
+elsewhere in the file.
+
+The failure mode is worse than a missed check, because it is an active one: a
+reviewer who trusts the grep would **rewrite a correct premise as an incorrect
+one**, and then design an experiment around the error. Every verification method
+here has that shape — a checksum cannot prove ordering, an exhaustive value sweep
+cannot prove a rounding mode, and a literal grep cannot prove a coefficient. In
+each case read the **expression**, not an index of its parts.
+
+Rule of thumb: **a grep proves presence, never role.**
+
 ## Numerical acceptance is a budget, not a zero
 
 Pinning a test to "bit-identical" can fail on legitimate data. Two examples from
