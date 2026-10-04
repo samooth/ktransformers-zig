@@ -68,13 +68,35 @@ jobs:
         run: python3 tools/audit_layout.py
       # No test has a timeout, and `zig build test` drives every suite through
       # `addRunArtifact`, so a suite that blocks forever stalls the job
-      # indefinitely instead of reporting a failure. That has happened: an
-      # intermittent hang in the Subpool pinning test (workers blocked on a
-      # condvar at 0% CPU, i.e. a deadlock rather than starvation) held a run
-      # for 22 minutes. It does not reproduce when the suite binaries are run
-      # one at a time, which is why it is worth bounding rather than chasing.
-      # 40 minutes is far above the healthy runtime on a CI runner and well
-      # below the GitHub Actions job limit, so a hang becomes a red build.
+      # indefinitely instead of reporting a failure.
+      #
+      # WHAT IS ACTUALLY KNOWN, because the earlier version of this comment was
+      # not. It used to assert that "an intermittent hang in the Subpool pinning
+      # test held a run for 22 minutes". That was never reproduced and the
+      # attribution was a guess dressed as a finding. What was actually observed
+      # is worse and less visible: a test binary outlived the build runner by
+      # 4.5 hours with two threads in futex_wait_queue, holding a CPU the whole
+      # time and inflating the host load average that everything else was being
+      # measured against. It was invisible in the log — a hung run looks like a
+      # slow run, and an orphan looks like nothing at all.
+      #
+      # So the mechanism to record is: an aborted run leaves an orphan, the
+      # orphan is invisible, and a suite binary that outlives the build runner IS
+      # the failure even though nothing says so. The suite it belonged to could
+      # not be identified, because a `.zig-cache` wipe had removed the only entry
+      # describing it.
+      #
+      # Two deadlocks were found and fixed separately by inspection (a subpool
+      # with zero threads hanging forever, and a worker that could skip a job's
+      # tasks and still mark it complete). Either could have produced that
+      # futex signature; neither is proven to be what the orphan was. Treat the
+      # fixes as real and the link as unproven.
+      #
+      # 40 minutes is far above the healthy runtime on a CI runner and well below
+      # the GitHub Actions job limit, so a hang becomes a red build. If it fires,
+      # also check for a surviving test process before drawing any conclusion
+      # from the log.
+
       - name: "Test suites"
         run: timeout 2400 zig build test
       # Compiling aarch64 and gating its exports cannot catch a wrong ANSWER,

@@ -182,7 +182,78 @@ this repo:
   **documented semantics** (e.g. "the exponent nibble comes out of `aux1`'s top
   4 bits"), not against a reimplementation of the format that happens to agree.
 
+## Comparing two formats: bytes per second, never milliseconds
+
+Formats carry different bits per weight, so **millisecond comparisons across
+formats are meaningless** and will manufacture a gap that does not exist. It has
+now happened twice, in both directions:
+
+- **IQ2_XXS vs IQ2_XS.** 66 vs 74 bytes per 256-weight block — 12% more weight to
+  move. In ms the two looked 1.15x apart; in GB/s they are 1.01x apart, i.e. a
+  tie. The entire apparent gap was the byte count. And the *reported* gap was
+  1.19x, so a comparison in the wrong unit produced a difference two orders of
+  magnitude larger than the truth.
+- **Q8_0 vs Q8_K.** 1.0625 vs 2.25 bytes per weight, quoted 300 lines apart in the
+  roadmap with both labelled "Q8", so a Q8_0 control got compared against the
+  Q8_K figure and the host was read as 5x slower than it was.
+
+Rules: quote **GB/s** for anything cross-format, name the format in every table
+row, and include bytes/weight beside the throughput. A ratio is only meaningful
+between two implementations of the **same** format at the same shape.
+
+## A floor you cannot interpret is not a result
+
+Print the **setup:measurement ratio** beside any floor. A bench whose per-process
+setup is large relative to what it times reports a floor dominated by that setup,
+not by the host: the IQ bench spends 5.1 s quantizing plus 249 ms of init against
+a ~4 ms kernel — a ratio of ~1300x — and each process-level sample therefore
+carries the whole quantizer's cache and page state. An early pass reported floors
+of 2.9-15.8x there, which reads as absurd host noise and is not noise at all.
+
+So there are **two kinds of UNMEASURABLE**, and only one is actionable:
+
+- **host-dominated** — the box is busy; fix by finding a quieter one
+- **setup-dominated** — the instrument is measuring its own setup; fix by hoisting
+  setup out of the timed region, or by sampling in-process instead of per-process
+
+Printing the same word for both hides a real effect indefinitely, which is the
+failure mode of a tool that always refuses.
+
+Note also that the harness's floor (the widest spread over identical-code samples)
+is an **upper bound**: correct, but pessimistic when there are few process-level
+samples each carrying the whole setup. The *direction* is safe — a too-wide floor
+only makes "unresolvable" easier to reach, and that is the claim being made — but
+the cost is lost power. A floor that is too narrow manufactures findings; a floor
+that is too wide loses them. Only the second is acceptable in a refusing tool.
+
+## Before you touch shared state, check who is building
+
+`.zig-cache`, `zig-out` and the global Zig cache are shared by every session in the
+tree. **Check for a running compile before deleting any of them** (`ps` for a live
+`zig`), and leave them alone if one is running. The cost of waiting is a few
+minutes of rebuild; the cost of not checking is not just that rebuild.
+
+The sharper version: **deleting the cache can destroy the only evidence of a past
+failure.** A `.zig-cache` wipe removed the entry for a test binary that had been
+stuck for 4.5 hours, which meant the suite it belonged to could never be
+identified. Prefer `rm` on the artifact, not on the record.
+
+Corollary for shared builds: an aborted run leaves an **orphan** that keeps a CPU
+busy and is invisible in the log. A process outliving the build runner is itself
+the failure, even though nothing in the output says so.
+
+## Grep the build log before you trust a test count
+
+A stale test binary reports a green count and a plausible suite name. `zig test`
+emits the binary **and** runs it, so a compile error in the test file leaves the
+previous binary in place and the previous binary's pass count on screen. Before
+running any test binary: **grep the build output for `error:`, and cross-check the
+binary's mtime against the build.** A green count from a stale binary is worse
+than no result, because it gets trusted.
+
+
 ## Where these numbers came from
+
 
 | finding | session |
 |---|---|
@@ -190,3 +261,7 @@ this repo:
 | fragment microbenchmark inverted by 165x; latency-vs-throughput; `perf` locked down | IQ2_XXS |
 | accuracy test missing entirely on the vector path every activation runs; 1-in-100000 budget | SwiGLU / P1.3 |
 | SIMD numbers in Debug are meaningless; pin and interleave | earlier |
+| setup:measurement ratio printed beside every floor; two kinds of UNMEASURABLE | IQ anchor pass |
+| cross-format comparison only in bytes/second, never milliseconds | IQ anchor pass |
+| a stale test binary reports a green count; grep the build log for `error:` first | dequant session |
+| check for a running compile before deleting `.zig-cache`; the cache holds failure evidence | dequant session |
