@@ -2209,3 +2209,161 @@ test "IQ2_XS AVX2 GEMM == the scalar oracle, across super-blocks and m tails" {
         }
     }
 }
+
+test "IQ2_S AVX2 GEMM == the scalar oracle, across super-blocks and m tails" {
+    // Oracle is the scalar GEMM, not a clean-room reading of the GGUF layout.
+    // k sweeps 1..3 super-blocks: a block-0-only test cannot catch a missing
+    // `blk * QK_K`, which is the e6372ee bug class (all nine IQ scalar GEMMs).
+    // That was verified by mutation on this test pattern.
+    const g = kt.gemm_iq2_s;
+    var seed: u64 = 0x5EED_0001;
+
+    for ([_]usize{ 1, 2, 3 }) |blocks| {
+        const k = blocks * g.QK_K;
+        const nb = blocks;
+        try testing.expect(nb > 0); // a 0-block case would be vacuous
+        const m: usize = 5; // m % MR != 0, so the row tail runs
+        const n: usize = 3;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 64, 2.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ2_S, n * nb);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = @bitCast(@as(f16, 0.05));
+            for (&blk.qs) |*q| { seed = seed *% 6364136223846793005 +% 1442695040888963407; q.* = @truncate(seed >> 24); }
+            for (&blk.qh) |*q| { seed = seed *% 6364136223846793005 +% 1442695040888963407; q.* = @truncate(seed >> 24); }
+            for (&blk.scales) |*q| { seed = seed *% 6364136223846793005 +% 1442695040888963407; q.* = @truncate(seed >> 24); }
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        g.gemmAvx2(a.ptr, w.ptr, c_avx.ptr, m, n, k, k, nb, n);
+        g.gemmIQ2_SScalar(a.ptr, w.ptr, c_ref.ptr, m, n, k, k, nb, n);
+
+        for (0..m * n) |i| {
+            const av = c_avx[i];
+            const rf = c_ref[i];
+            if (std.math.isNan(rf)) {
+                try testing.expect(std.math.isNan(av));
+            } else if (std.math.isInf(rf)) {
+                try testing.expectEqual(std.math.isInf(av), std.math.isInf(rf));
+            } else {
+                try testing.expect(std.math.isFinite(av));
+                const denom = @max(@abs(rf), 1e-2);
+                try testing.expect(@abs(av - rf) / denom < 1e-3);
+            }
+        }
+    }
+}
+
+test "IQ3_XXS AVX2 GEMM == the scalar oracle, across super-blocks and m tails" {
+    // Oracle is the scalar GEMM, not a clean-room reading of the GGUF layout.
+    // k sweeps 1..3 super-blocks: a block-0-only test cannot catch a missing
+    // `blk * QK_K`, which is the e6372ee bug class (all nine IQ scalar GEMMs).
+    // That was verified by mutation on this test pattern.
+    const g = kt.gemm_iq3_xxs;
+    var seed: u64 = 0x5EED_0001;
+
+    for ([_]usize{ 1, 2, 3 }) |blocks| {
+        const k = blocks * g.QK_K;
+        const nb = blocks;
+        try testing.expect(nb > 0); // a 0-block case would be vacuous
+        const m: usize = 5; // m % MR != 0, so the row tail runs
+        const n: usize = 3;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 64, 2.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ3_XXS, n * nb);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = @bitCast(@as(f16, 0.05));
+            for (&blk.qs) |*q| { seed = seed *% 6364136223846793005 +% 1442695040888963407; q.* = @truncate(seed >> 24); }
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        g.gemmAvx2(a.ptr, w.ptr, c_avx.ptr, m, n, k, k, nb, n);
+        g.gemmIQ3_XXSScalar(a.ptr, w.ptr, c_ref.ptr, m, n, k, k, nb, n);
+
+        for (0..m * n) |i| {
+            const av = c_avx[i];
+            const rf = c_ref[i];
+            if (std.math.isNan(rf)) {
+                try testing.expect(std.math.isNan(av));
+            } else if (std.math.isInf(rf)) {
+                try testing.expectEqual(std.math.isInf(av), std.math.isInf(rf));
+            } else {
+                try testing.expect(std.math.isFinite(av));
+                const denom = @max(@abs(rf), 1e-2);
+                try testing.expect(@abs(av - rf) / denom < 1e-3);
+            }
+        }
+    }
+}
+
+test "IQ3_S AVX2 GEMM == the scalar oracle, across super-blocks and m tails" {
+    // Oracle is the scalar GEMM, not a clean-room reading of the GGUF layout.
+    // k sweeps 1..3 super-blocks: a block-0-only test cannot catch a missing
+    // `blk * QK_K`, which is the e6372ee bug class (all nine IQ scalar GEMMs).
+    // That was verified by mutation on this test pattern.
+    const g = kt.gemm_iq3_s;
+    var seed: u64 = 0x5EED_0001;
+
+    for ([_]usize{ 1, 2, 3 }) |blocks| {
+        const k = blocks * g.QK_K;
+        const nb = blocks;
+        try testing.expect(nb > 0); // a 0-block case would be vacuous
+        const m: usize = 5; // m % MR != 0, so the row tail runs
+        const n: usize = 3;
+        const a = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(a);
+        for (0..m * k) |i| a[i] = amx.f32_to_bf16(rnd(&seed, 64, 2.0));
+
+        const w = try testing.allocator.alloc(g.BlockIQ3_S, n * nb);
+        defer testing.allocator.free(w);
+        for (w) |*blk| {
+            blk.d = @bitCast(@as(f16, 0.05));
+            for (&blk.qs) |*q| { seed = seed *% 6364136223846793005 +% 1442695040888963407; q.* = @truncate(seed >> 24); }
+            for (&blk.qh) |*q| { seed = seed *% 6364136223846793005 +% 1442695040888963407; q.* = @truncate(seed >> 24); }
+            for (&blk.signs) |*q| { seed = seed *% 6364136223846793005 +% 1442695040888963407; q.* = @truncate(seed >> 24); }
+            for (&blk.scales) |*q| { seed = seed *% 6364136223846793005 +% 1442695040888963407; q.* = @truncate(seed >> 24); }
+        }
+
+        const c_avx = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_avx);
+        const c_ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(c_ref);
+        @memset(c_avx, std.math.nan(f32));
+        @memset(c_ref, std.math.nan(f32));
+
+        g.gemmAvx2(a.ptr, w.ptr, c_avx.ptr, m, n, k, k, nb, n);
+        g.gemmIQ3_SScalar(a.ptr, w.ptr, c_ref.ptr, m, n, k, k, nb, n);
+
+        for (0..m * n) |i| {
+            const av = c_avx[i];
+            const rf = c_ref[i];
+            if (std.math.isNan(rf)) {
+                try testing.expect(std.math.isNan(av));
+            } else if (std.math.isInf(rf)) {
+                try testing.expectEqual(std.math.isInf(av), std.math.isInf(rf));
+            } else {
+                try testing.expect(std.math.isFinite(av));
+                const denom = @max(@abs(rf), 1e-2);
+                try testing.expect(@abs(av - rf) / denom < 1e-3);
+            }
+        }
+    }
+}

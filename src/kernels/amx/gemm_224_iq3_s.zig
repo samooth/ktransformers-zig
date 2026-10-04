@@ -29,6 +29,8 @@
 // group gets the grid-byte re-derivation.
 
 const std = @import("std");
+// grid8 is owned by gemm_224_iq2_xxs.zig; import, never re-declare.
+const grid8 = @import("gemm_224_iq2_xxs.zig").grid8;
 const amx = @import("../arch/amx.zig");
 
 // ============================================================================
@@ -223,6 +225,118 @@ pub fn dequantizeRowIQ3_SToBF16(x: [*]const BlockIQ3_S, y: [*]amx.bf16, k: usize
 // ============================================================================
 // Scalar GEMM (BF16 activations x IQ3_S weights -> F32)
 // ============================================================================
+
+// ============================================================================
+// AVX2 GEMM
+// ============================================================================
+//
+// Same four rules as everywhere else: n-outer so the weight block streams from
+// DRAM once, MR=4 so four activation rows share one unpacked weight vector,
+// explicit `@mulAdd` because FP contraction is off in this toolchain, and one
+// `@reduce` per output element.
+//
+// WRITE THE UNPACK WITH EXPLICIT VECTOR OPS FROM THE START. `iq2xxs.grid8`
+// originally used `inline for` + array staging, i.e. eight scalar 64-bit shifts
+// (AVX2 has none), and cost a factor of ~100 on IQ2_XXS. Every unpack here
+// delegates to it rather than re-deriving bytes.
+//
+// // Same `g1 | (g2 << 32)` packing as IQ3_XXS, so `grid8` does the whole unpack.
+
+// Three things unique to IQ3_S and all easy to get wrong: the group scale is
+// `1 + 2*scale` (NOT `0.5 + scale` scaled by 0.25 like the IQ2 formats), `qh`
+// advances 2 bytes per group PAIR rather than per group, and the index-high bit
+// lives at bit 8 so it is masked with 0x100, not 0x300.
+
+const MR: usize = 4;
+const Vec: type = @Vector(8, f32);
+
+/// 8 bf16 -> 8 f32, unaligned.
+inline fn widen8(p: [*]const amx.bf16) Vec {
+    const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+    return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+}
+
+/// AVX2 GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
+/// `k` must be a multiple of QK_K, as for the scalar version.
+pub fn gemmAvx2(
+    a: [*]const amx.bf16,
+    b: [*]const BlockIQ3_S,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    const nb = k / QK_K;
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        const brow = b + j * ldb;
+        var i: usize = 0;
+        while (i + MR <= m) : (i += MR) {
+            var acc = [_]Vec{@splat(0.0)} ** MR;
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                const dsuper = f16_to_f32(blk_ptr.d); // per BLOCK, hoisted
+                const abase = blk * QK_K;
+                var qh_base: usize = 0;
+                var signs_base: usize = 0;
+                for (0..QK_K / 32) |ib32| {
+                    const db1 = dsuper * (1.0 + 2.0 * @as(f32, @floatFromInt(blk_ptr.scales[ib32 / 2] & 0xf)));
+                    const db2 = dsuper * (1.0 + 2.0 * @as(f32, @floatFromInt(blk_ptr.scales[ib32 / 2] >> 4)));
+                    const qh_byte = blk_ptr.qh[qh_base + (ib32 % 2)];
+                    inline for (0..4) |l| {
+                        const db: f32 = if (ib32 % 2 == 0) db1 else db2;
+                        const lo1: usize = blk_ptr.qs[ib32 * 8 + 2 * l];
+                        const hi1: usize = (@as(usize, qh_byte) << @intCast(8 - 2 * l)) & 256;
+                        const lo2: usize = blk_ptr.qs[ib32 * 8 + 2 * l + 1];
+                        const hi2: usize = (@as(usize, qh_byte) << @intCast(7 - 2 * l)) & 256;
+                        const grid_pair: u64 = @as(u64, IQ3S_GRID[lo1 | hi1]) | (@as(u64, IQ3S_GRID[lo2 | hi2]) << 32);
+                        const w = grid8(grid_pair, blk_ptr.signs[signs_base + l]) * @as(Vec, @splat(db));
+                        const koff = abase + ib32 * 32 + l * 8;
+                        inline for (0..MR) |r| {
+                            acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + koff), w, acc[r]);
+                        }
+                    }
+                    if (ib32 % 2 == 1) qh_base += 2;
+                    signs_base += 4;
+                }
+            }
+            inline for (0..MR) |r| c[(i + r) * ldc + j] = @reduce(.Add, acc[r]);
+        }
+        // Row tail (m % MR), one row at a time.
+        while (i < m) : (i += 1) {
+            var acc: Vec = @splat(0.0);
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                const dsuper = f16_to_f32(blk_ptr.d); // per BLOCK, hoisted
+                const abase = blk * QK_K;
+                var qh_base: usize = 0;
+                var signs_base: usize = 0;
+                for (0..QK_K / 32) |ib32| {
+                    const db1 = dsuper * (1.0 + 2.0 * @as(f32, @floatFromInt(blk_ptr.scales[ib32 / 2] & 0xf)));
+                    const db2 = dsuper * (1.0 + 2.0 * @as(f32, @floatFromInt(blk_ptr.scales[ib32 / 2] >> 4)));
+                    const qh_byte = blk_ptr.qh[qh_base + (ib32 % 2)];
+                    inline for (0..4) |l| {
+                        const db: f32 = if (ib32 % 2 == 0) db1 else db2;
+                        const lo1: usize = blk_ptr.qs[ib32 * 8 + 2 * l];
+                        const hi1: usize = (@as(usize, qh_byte) << @intCast(8 - 2 * l)) & 256;
+                        const lo2: usize = blk_ptr.qs[ib32 * 8 + 2 * l + 1];
+                        const hi2: usize = (@as(usize, qh_byte) << @intCast(7 - 2 * l)) & 256;
+                        const grid_pair: u64 = @as(u64, IQ3S_GRID[lo1 | hi1]) | (@as(u64, IQ3S_GRID[lo2 | hi2]) << 32);
+                        const w = grid8(grid_pair, blk_ptr.signs[signs_base + l]) * @as(Vec, @splat(db));
+                        const koff = abase + ib32 * 32 + l * 8;
+                        acc = @mulAdd(Vec, widen8(a + i * lda + koff), w, acc);
+                    }
+                    if (ib32 % 2 == 1) qh_base += 2;
+                    signs_base += 4;
+                }
+            }
+            c[i * ldc + j] = @reduce(.Add, acc);
+        }
+    }
+}
 
 pub fn gemmIQ3_SScalar(
     a: [*]const amx.bf16,

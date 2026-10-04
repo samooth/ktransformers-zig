@@ -136,6 +136,7 @@ comptime {
     _ = &gemm_iq3_xxs.dequantizeRowIQ3_XXS;
     _ = &gemm_iq3_xxs.dequantizeRowIQ3_XXSToBF16;
     _ = &gemm_iq3_xxs.gemmIQ3_XXSScalar;
+    _ = &gemm_iq3_xxs.gemmAvx2;
     _ = &iq2xs_init.initIq2XsData;
     _ = &iq2xs_init.freeIq2XsData;
     _ = &iq2xs_init.KGRID_2BIT_256;
@@ -155,6 +156,7 @@ comptime {
     _ = &gemm_iq2_s.dequantizeRowIQ2_S;
     _ = &gemm_iq2_s.dequantizeRowIQ2_SToBF16;
     _ = &gemm_iq2_s.gemmIQ2_SScalar;
+    _ = &gemm_iq2_s.gemmAvx2;
     _ = &gemm_iq2_s.quantizeRowIQ2_S_WithInit;
     _ = &iq2xs_init.KGRID_2BIT_1024;
     _ = &iq2xs_init.initIq2SData;
@@ -163,6 +165,7 @@ comptime {
     _ = &gemm_iq3_s.dequantizeRowIQ3_S;
     _ = &gemm_iq3_s.dequantizeRowIQ3_SToBF16;
     _ = &gemm_iq3_s.gemmIQ3_SScalar;
+    _ = &gemm_iq3_s.gemmAvx2;
     _ = &gemm_iq3_s.quantizeRowIQ3_S_WithInit;
     _ = &iq3xs_init.KGRID_Q3XS_512;
     _ = &iq3xs_init.initIq3SData;

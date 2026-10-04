@@ -22,6 +22,8 @@
 // are the SAME tables as IQ2_XXS (shared sign palette + mask).
 
 const std = @import("std");
+// grid8 is owned by gemm_224_iq2_xxs.zig; import, never re-declare.
+const grid8 = @import("gemm_224_iq2_xxs.zig").grid8;
 const amx = @import("../arch/amx.zig");
 
 // ============================================================================
@@ -204,6 +206,124 @@ pub fn dequantizeRowIQ3_XXSToBF16(x: [*]const BlockIQ3_XXS, y: [*]amx.bf16, k: u
 // ============================================================================
 // Scalar GEMM (BF16 activations x IQ3_XXS weights -> F32)
 // ============================================================================
+
+// ============================================================================
+// AVX2 GEMM
+// ============================================================================
+//
+// Same four rules as everywhere else: n-outer so the weight block streams from
+// DRAM once, MR=4 so four activation rows share one unpacked weight vector,
+// explicit `@mulAdd` because FP contraction is off in this toolchain, and one
+// `@reduce` per output element.
+//
+// WRITE THE UNPACK WITH EXPLICIT VECTOR OPS FROM THE START. `iq2xxs.grid8`
+// originally used `inline for` + array staging, i.e. eight scalar 64-bit shifts
+// (AVX2 has none), and cost a factor of ~100 on IQ2_XXS. Every unpack here
+// delegates to it rather than re-deriving bytes.
+//
+// // Two u32 grid words per sub-block (4 magnitude bytes each). Packing them as
+// `g1 | (g2 << 32)` into a single u64 puts g1's bytes at lanes 0..3 and g2's at
+// lanes 4..7, and `dequantizeRow` applies signs bit j to lane j — which is exactly
+// what `grid8` already does. So the 8-weight unpack needs no new helper at all.
+
+// Two differences from the IQ2 formats that are easy to get wrong: the group scale
+// uses **0.5** where IQ2 uses 0.25, and the grid/scale areas are two slices of one
+// `qs` array (first 64 bytes grid indices, last 32 scale+sign).
+
+const MR: usize = 4;
+const Vec: type = @Vector(8, f32);
+
+/// 8 bf16 -> 8 f32, unaligned.
+inline fn widen8(p: [*]const amx.bf16) Vec {
+    const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
+    return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+}
+
+/// AVX2 GEMM. `c` is OVERWRITTEN on every element of [0,m) x [0,n).
+/// `k` must be a multiple of QK_K, as for the scalar version.
+pub fn gemmAvx2(
+    a: [*]const amx.bf16,
+    b: [*]const BlockIQ3_XXS,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+    lda: usize,
+    ldb: usize,
+    ldc: usize,
+) void {
+    const nb = k / QK_K;
+    var j: usize = 0;
+    while (j < n) : (j += 1) {
+        const brow = b + j * ldb;
+        var i: usize = 0;
+        while (i + MR <= m) : (i += MR) {
+            var acc = [_]Vec{@splat(0.0)} ** MR;
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                const dsuper = f16_to_f32(blk_ptr.d); // per BLOCK, hoisted
+                const abase = blk * QK_K;
+                const grid_area = blk_ptr.qs[0..].ptr;
+                const scale_area = blk_ptr.qs[64..].ptr;
+                for (0..N_GROUPS) |ib32| {
+                    var aux32: u32 = undefined;
+                    const sa: [*]u8 = @ptrCast(&aux32);
+                    @memcpy(sa[0..4], scale_area[ib32 * 4 .. ib32 * 4 + 4]);
+                    // NOTE: 0.5 here, not the 0.25 the IQ2 formats use.
+                    const db: f32 = dsuper * (0.5 + @as(f32, @floatFromInt(aux32 >> 28))) * 0.5;
+                    inline for (0..4) |l| {
+                        const signs: u8 = KSIGNS_IQ2XS[(aux32 >> @intCast(7 * l)) & 127];
+                        const g1: u32 = IQ3XXS_GRID[grid_area[ib32 * 8 + 2 * l]];
+                        const g2: u32 = IQ3XXS_GRID[grid_area[ib32 * 8 + 2 * l + 1]];
+                        // Two u32 grid words are exactly a u64 of 8 magnitude
+                        // bytes with g1 in lanes 0..3 and g2 in lanes 4..7, and
+                        // signs bit j applies to lane j — so grid8 does the whole
+                        // unpack with no new helper.
+                        const grid_pair: u64 = @as(u64, g1) | (@as(u64, g2) << 32);
+                        const w = grid8(grid_pair, signs) * @as(Vec, @splat(db));
+                        const koff = abase + ib32 * 32 + l * 8;
+                        inline for (0..MR) |r| {
+                            acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + koff), w, acc[r]);
+                        }
+                    }
+                }
+            }
+            inline for (0..MR) |r| c[(i + r) * ldc + j] = @reduce(.Add, acc[r]);
+        }
+        // Row tail (m % MR), one row at a time.
+        while (i < m) : (i += 1) {
+            var acc: Vec = @splat(0.0);
+            for (0..nb) |blk| {
+                const blk_ptr = &brow[blk];
+                const dsuper = f16_to_f32(blk_ptr.d); // per BLOCK, hoisted
+                const abase = blk * QK_K;
+                const grid_area = blk_ptr.qs[0..].ptr;
+                const scale_area = blk_ptr.qs[64..].ptr;
+                for (0..N_GROUPS) |ib32| {
+                    var aux32: u32 = undefined;
+                    const sa: [*]u8 = @ptrCast(&aux32);
+                    @memcpy(sa[0..4], scale_area[ib32 * 4 .. ib32 * 4 + 4]);
+                    // NOTE: 0.5 here, not the 0.25 the IQ2 formats use.
+                    const db: f32 = dsuper * (0.5 + @as(f32, @floatFromInt(aux32 >> 28))) * 0.5;
+                    inline for (0..4) |l| {
+                        const signs: u8 = KSIGNS_IQ2XS[(aux32 >> @intCast(7 * l)) & 127];
+                        const g1: u32 = IQ3XXS_GRID[grid_area[ib32 * 8 + 2 * l]];
+                        const g2: u32 = IQ3XXS_GRID[grid_area[ib32 * 8 + 2 * l + 1]];
+                        // Two u32 grid words are exactly a u64 of 8 magnitude
+                        // bytes with g1 in lanes 0..3 and g2 in lanes 4..7, and
+                        // signs bit j applies to lane j — so grid8 does the whole
+                        // unpack with no new helper.
+                        const grid_pair: u64 = @as(u64, g1) | (@as(u64, g2) << 32);
+                        const w = grid8(grid_pair, signs) * @as(Vec, @splat(db));
+                        const koff = abase + ib32 * 32 + l * 8;
+                        acc = @mulAdd(Vec, widen8(a + i * lda + koff), w, acc);
+                    }
+                }
+            }
+            c[i * ldc + j] = @reduce(.Add, acc);
+        }
+    }
+}
 
 pub fn gemmIQ3_XXSScalar(
     a: [*]const amx.bf16,

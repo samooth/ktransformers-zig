@@ -1123,13 +1123,43 @@ Checksums agree on all three (e.g. 10216204.0 vs 10215942.0 at m=1).
 references are kept** as the readable statement of the math and the oracle the
 vector paths are diffed against.
 
-**Remaining IQ: 5 formats** — IQ2_S, IQ3_XXS, IQ3_S, IQ1_S, IQ1_M. The 3-bit pair
-and IQ2_S are codebook-based rather than grid-based; the two 1-bit formats add a
-sequential delta code and are the least tractable. **Apply this stream's lesson
-to all of them: write the unpack with explicit vector ops from the start.** The
-`inline for` + array-staging version of `grid8` cost a factor of ~100 on IQ2_XXS
-and the only reason it was caught is that the end-to-end ratio looked implausible
-— it did not look like a bug, it looked like a weak format.
+**IQ2_S, IQ3_XXS and IQ3_S DONE — 7 of 9 IQ formats now on `gemmAvx2`.**
+
+All three reuse `iq2xxs.grid8` **unchanged**, which is the payoff for putting the
+unpack in one owner:
+
+- **IQ2_S** is structurally IQ2_XS: a u64 grid word of 8 magnitude bytes and a
+  RAW signs byte. Only the index construction differs (`lo | hi`, two bits lifted
+  out of `qh`).
+- **IQ3_XXS / IQ3_S** each need **two** u32 grid words per sub-block (4 magnitude
+  bytes each). Packing them as `g1 | (g2 << 32)` puts g1's bytes at lanes 0..3 and
+  g2's at lanes 4..7, and both dequantizers apply signs bit *j* to lane *j* — which
+  is exactly what `grid8` already does. So the 8-weight unpack needed **no new
+  helper at all**. That is the single best argument for the shared-owner rule.
+
+Three per-format traps, each of which would have been a silent wrong answer:
+- IQ3_XXS's group scale uses **0.5**; the IQ2 formats use 0.25.
+- IQ3_S's group scale is `1 + 2*scale`, a completely different formula again.
+- IQ3_S's index-high bit sits at **bit 8** (masked 0x100, not 0x300), and `qh`
+  advances **2 bytes per group pair** while the signs area advances 4 per group.
+
+Each got a comment naming the trap next to the code.
+
+All three passed their equivalence test **on the first attempt** (SIMD suite
+49 -> 52), which is what the shared-ownership discipline buys: the unpack was
+written once, correctly, and the two IQ3 variants needed no unpack work at all.
+Tests sweep k = 256/512/768 with m = 5 so both the MR path and the row tail run,
+and `nb > 0` is asserted so no case is vacuous.
+
+**Not benchmarked** — the host is at load 4-51 and a full benchmark is scheduled
+for an idle box, so no ratios are claimed here for these three. Absolute
+throughput will be ~1 GB/s at m=1 based on the IQ2_XXS/IQ2_XS results, but that is
+an estimate, not a measurement.
+
+**Remaining: IQ1_S and IQ1_M** — the two 1-bit formats, and the least tractable.
+Both need a grid lookup *plus* a delta / second-difference code across elements,
+which is inherently sequential rather than a per-element table. Expect these to
+need a different treatment from everything above, and budget accordingly.
 
 
 `src/kernels/amx/gemm_224_{iq2_xxs,iq2_xs}.zig`. The next real DeepSeek formats;
