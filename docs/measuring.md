@@ -182,6 +182,28 @@ this repo:
   **documented semantics** (e.g. "the exponent nibble comes out of `aux1`'s top
   4 bits"), not against a reimplementation of the format that happens to agree.
 
+**An exhaustive value-space sweep cannot pin a rounding mode.** This is the
+sharpest version of the trap above, and it is worth stating on its own because
+exhaustive is exactly what feels rigorous.
+
+bf16 has 8 mantissa bits. Widen a bf16 to f32 and the low 15 mantissa bits are
+**zero**, so narrowing it back — by RNE *or by truncation* — is exact. A test that
+sweeps all 65,536 bf16 patterns through a narrowing store therefore **passes
+identically under a truncating implementation**. It is a real test of the value
+space (subnormals, `-0`, infinities) and a complete non-test of the rounding
+mode.
+
+Only **ties** can distinguish them, because a tie is the only input where RNE and
+truncation disagree: 1.5 must become 2 and 2.5 must become 2. Mutation-testing
+this store confirmed it — swapping RNE for truncation was caught by the tie test
+(`expected 2, found 1`) and by a tail-length test, and **not** by the exhaustive
+sweep.
+
+So the three jobs need three tests: **value space** (exhaustive, cheap, catches
+subnormals/`-0`/inf), **rounding mode** (exhaustive over ties, asserting the even
+neighbour), and **boundaries** (every tail length with specials mixed in). Ship
+only the first and you will ship a truncating store with a green test suite.
+
 ## Comparing two formats: bytes per second, never milliseconds
 
 Formats carry different bits per weight, so **millisecond comparisons across

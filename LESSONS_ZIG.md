@@ -1921,6 +1921,20 @@ odd offset has type `*align(1) const T`, which does **not** coerce to a
   outside module path". Import such suites through the `kt` hub instead.
 - Nested arrays need a real initializer: `@splat` is a *vector* splat and will
   not fill `[MR][4]VecF32`. Use `[_][4]VecF32{[_]VecF32{zero} ** 4} ** MR`.
+- A `builtin.cpu` feature check must be **inside `if (comptime ...)`**. Writing
+  ```zig
+  const has = std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3); // WRONG
+  if (has) { ... }
+  ```
+  fails with "unable to resolve comptime value" / a comptime-only field read from
+  runtime context, because `builtin.cpu` is comptime-only and the intermediate
+  `const` is a runtime binding. Write it as
+  ```zig
+  if (comptime std.Target.x86.featureSetHas(builtin.cpu.features, .ssse3)) { ... }
+  ```
+  This is the same class as the `ldexp` gotcha below: a generic that wants
+  `comptime_float` cannot be called with a literal float at runtime. Both bite on
+  the vector-store / scalar-tail work, which is exactly where feature gates go.
 - `std.fs.cwd()` is gone. Use the `Io` interface:
   `std.Io.Dir.cwd().createFile(io.io(), path, ...)` then
   `std.Io.File.writePositionalAll(file, io.io(), bytes, 0)`.

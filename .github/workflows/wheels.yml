@@ -98,6 +98,24 @@ jobs:
       # from the log.
 
       - name: "Test suites"
+      # A suite binary that outlives the build runner IS the failure, even though
+      # nothing in the log says so: the runner is killed, the suite keeps a CPU,
+      # and an orphan is invisible (a hung run looks like a slow run). One was
+      # observed alive 4.5 hours later, inflating the load average every other
+      # measurement on the box was compared against.
+      #
+      # The script REPORTS and does not kill — killing is a separate, deliberate
+      # step, because signalling a process group here would take the runner and
+      # every later step with it.
+      - name: Check for orphaned test binaries
+        run: |
+          chmod +x tools/orphan_tests.sh
+          # Reports only; it never signals. Non-fatal here so the detection is
+          # visible in the log without masking the suite result above — a red
+          # suite is already red, and this explains the runs that were NOT red.
+          tools/orphan_tests.sh 2>&1 | tee orphan.log
+          echo "--- orphan check ---"
+          cat orphan.log
         run: timeout 2400 zig build test
       # Compiling aarch64 and gating its exports cannot catch a wrong ANSWER,
       # and `zig build test` only ever runs the host target — so every
