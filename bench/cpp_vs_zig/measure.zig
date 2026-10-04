@@ -423,12 +423,32 @@ fn absoluteBand(row: Row) f64 {
 /// time, because wall time also contains every rep: 62 reps of a 4.5 ms kernel is
 /// ~280 ms and would be indistinguishable from real setup. A bench that does not
 /// print `SETUP|label|ms` gets "not reported", not an assumed 1x.
+/// A CALIBRATION, not a constant of the instrument.
+///
+/// The boundary this guards is itself load-dependent, because the quantity it
+/// reads moves with the host: identical IQ bench code measured 926x-12696x at
+/// load 18 and 1113x-8736x at load 56. So where "setup-dominated" begins drifts
+/// with the box. Set from observed passes, printed in every header so a reader
+/// sees the value actually used rather than trusting a literal in source, and the
+/// per-row distance from it is printed with the verdict.
+///
+/// Recalibrate when the pass disagrees with it, and say in the commit which pass
+/// moved it. Do not harden it into a law: a refusal threshold that drifts is
+/// still the right instrument, provided it admits it drifts.
 const SETUP_DOMINATED: f64 = 3.0;
 
 /// Band width at which the instrument can no longer see a sub-`x` effect, and
 /// the summary says so out loud. Set just under 2.0 because a 2x band already
 /// hides the 1.2x class of claim this repo publishes; a tool that refuses should
 /// also be loud about being unable to see.
+/// A CALIBRATION, not a constant of the instrument.
+///
+/// Chosen from the floors this host actually produces, which are themselves
+/// load-dependent: ~1.04x at load 2-4, ~1.17x at 17-27, ~1.25x at 80. So 1.9x is
+/// "about 1.5x worse than the worst floor this box has shown", not a property of
+/// the code. On a quiet box it will rarely fire; on a loaded one it should. If it
+/// fires on every pass, the correct response is fewer concurrent jobs, not a
+/// larger threshold.
 const INSTRUMENT_BLIND: f64 = 1.9;
 
 /// Why a row is unresolvable, and whether that is anybody's fault.
@@ -480,6 +500,27 @@ const Domination = enum {
 fn setupCell(row: Row) []const u8 {
     const r = setupRatio(row) orelse return "not reported";
     return std.fmt.allocPrint(row.arena, "{d:.0}x", .{r}) catch "err";
+}
+
+/// The range of setup:measurement ratios actually seen this pass, or "not
+/// reported by any bench". Printing the observed spread next to the threshold it
+/// is judged against is the difference between a calibration and a claim.
+fn observedSetupRow(rows: []const Row) []const u8 {
+    var lo: f64 = std.math.inf(f64);
+    var hi: f64 = 0;
+    var any = false;
+    for (rows) |row| {
+        const r = setupRatio(row) orelse continue;
+        any = true;
+        lo = @min(lo, r);
+        hi = @max(hi, r);
+    }
+    if (!any) return "not reported by any bench";
+    return std.fmt.allocPrint(
+        rows[0].arena,
+        "{d:.0}x .. {d:.0}x",
+        .{ lo, hi },
+    ) catch "err";
 }
 
 fn setupRatio(row: Row) ?f64 {
@@ -539,7 +580,15 @@ fn report(
         std.debug.print("| load average (1/5/15) | {d:.2} / {d:.2} / {d:.2} |\n", .{ loadavg[0], loadavg[1], loadavg[2] });
         std.debug.print("| pin | {s} |\n", .{if (pin) |c| std.fmt.allocPrint(arena, "cpu {d}", .{c}) catch "?" else "none"});
         std.debug.print("| iterations per arm | {d} (interleaved, min-of-{d} across process invocations; each harness does its own min-of-9 in-process) |\n", .{ iters, iters });
-        std.debug.print("| control | `zig_bench` run twice per iteration; its deviation from 1.0 sets the floor |\n\n", .{});
+        std.debug.print("| control | `zig_bench` run twice per iteration; its deviation from 1.0 sets the floor |\n", .{});
+        std.debug.print(
+            "| thresholds (CALIBRATIONS, not instrument constants) | setup-dominated at >= {d:.1}x, blind at >= {d:.1}x |\n",
+            .{ SETUP_DOMINATED, INSTRUMENT_BLIND },
+        );
+        std.debug.print(
+            "| setup:meas observed this pass | {s} |\n\n",
+            .{ observedSetupRow(rows) },
+        );
         std.debug.print("`floor` is the multiplicative noise band this pass measured for that row. A ratio is\n", .{});
         std.debug.print("printed ONLY when it falls outside it; otherwise the row reads UNMEASURABLE and no\n", .{});
         std.debug.print("number is offered. Ratio is C++ ms / Zig ms, so >1 means the Zig port is faster.\n\n", .{});

@@ -87,7 +87,15 @@
 //      noted once.
 //
 // Agreement against each format's own scalar reference is checked on every run
-// and printed. Blocks are quantized from real data with the format's own
+// and printed at nine decimals, which resolves it either way.
+//
+// Note the shape dependence, because the two numbers are not interchangeable and
+// reading either as the other is the same error twice. At the small k the
+// per-format SIMD tests use, the summation orders agree and the vector and scalar
+// paths are identical within 1e-3 element-wise. Here, at k=7168 with several
+// accumulators live, they differ by ~1e-6 relative L2 — ordinary f32 reassociation,
+// not a defect. Neither figure invalidates the other, and the earlier "bit-exact"
+// claim was true of the test shapes and false of these. Blocks are quantized from real data with the format's own
 // `_WithInit` quantizer; a zeroed or randomly-byte-filled block would leave the
 // unpack on a path real weights never take.
 //
