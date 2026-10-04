@@ -215,8 +215,7 @@ pub const GemmKernel224MXFP8 = struct {
     /// 8 bf16 -> 8 f32. Single pointer parameter and `align(1)`: an
     /// activation row can start at any offset.
     inline fn widen8(p: [*]const amx.bf16) Vec {
-        const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
-        return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+        return amx.widen8(p);
     }
 
     /// 8 E4M3 -> 8 f32 via the table. Single pointer parameter because

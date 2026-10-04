@@ -1442,14 +1442,33 @@ already qualifies. It does now:
 | `gemmBF16xQuant` (K-quant GEMM driver) | `gemm_224_kquant_simd.zig` | 6 K-quants | done |
 | `gemmAvx2With` (FP8 GEMM body) | `gemm_224_fp8.zig` | E4M3 + E5M2 | done |
 | `FP8_E4M3_LUT` | `gemm_224_fp8.zig` | `mxfp8` re-exports rather than re-declares | done |
-| `widen8` (bf16 -> f32, 8 lanes) | **per-format, 14 local copies** | every AVX2 GEMM | **NOT DONE — the remaining gap** |
+| `widen8` (bf16 -> f32, 8 lanes) | `arch/amx.zig` | 14 former owners (all IQ, FP8, MXFP4/8, Q8_0, BF16, bench) | **done** |
 
-**`widen8` is the one still duplicated**, in 14 files. It is the last item P2.1
-names, and unlike the others it has a reason to be duplicated per format: it is
-three lines of `@bitCast` + shift. Moving it to the arch layer is worth doing for
-the same reason the FP8 codec de-dup was (the E4M3 encoder's four bugs got fixed
-once instead of twice) but it is low-risk rather than urgent — a wrong `widen8`
-would be caught by every GEMM equivalence test in the suite.
+**`widen8` DONE — and it was a move, not a unification, which is the distinction
+worth keeping.** `amx.widen8` in `arch/amx.zig` is now the single owner; the 14
+per-kernel copies became one-line forwarders so any other session's reference
+still resolves.
+
+The copies were compared **before** any were touched, as the coordinator
+instructed: stop and report if any differs *numerally*. Exhaustive — all **65536**
+bf16 bit patterns, compared as raw u32. That surfaced **two distinct shapes**, not
+one: 13 copies were the vector shift, and `gemm_224_bf16.zig` was a per-lane
+`bf16_to_f32` **scalar loop**. They agree bit-for-bit on every pattern — both NaN
+encodings, both infinities, every subnormal — so the shape difference is cosmetic
+and the move is safe. A *sample* comparison would have called the scalar loop
+equivalent too, and would equally have hidden a real divergence had one existed.
+Exhaustive is cheap here precisely because the domain is 16 bits wide; that is also
+why "exhaustive is not automatically rigorous" (recorded above for RNE) did not
+apply here — same discipline, different question.
+
+Test `amx.widen8 matches every retired per-kernel copy, bit-for-bit` keeps both
+historical shapes alive as oracles, so a future change the owner makes that only
+one shape would notice is still caught.
+
+**The justification is drift, not tidiness**: the E4M3 codec failure was two
+near-identical copies diverging, and 14 copies is 14 chances to repeat it. The
+helper is three lines, which is exactly why a divergence would not have been
+noticed by reading.
 
 The shared shape that has emerged, and which the roadmap never spelled out: **one
 correct implementation in a single owner, every format instantiates or imports

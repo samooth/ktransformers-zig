@@ -3782,3 +3782,43 @@ fn expectBf16BitExact(want: []const amx.bf16, got: []const amx.bf16, label: []co
         }
     }
 }
+
+test "amx.widen8 matches every retired per-kernel copy, bit-for-bit" {
+    // P2.1: the single arch-layer `widen8` replaced 14 identical private copies.
+    // The copies were retired on an EXHAUSTIVE proof, not a sample: all 65536
+    // bf16 bit patterns, compared as raw u32, which covers both NaN encodings,
+    // both infinities and every subnormal. This test keeps that guarantee live by
+    // re-deriving the two historical SHAPES and comparing them against the owner.
+    //
+    // The scalar-loop shape is the one that lived in `gemm_224_bf16.zig` and is the
+    // most valuable to keep as an oracle: it is a different implementation (a
+    // per-lane `bf16_to_f32` loop, not a vector shift) that provably agrees, so it
+    // would catch a future change to `amx.widen8` that only one shape would see.
+    var buf: [8]amx.bf16 = undefined;
+    var base: usize = 0;
+    var checked: usize = 0;
+    while (base < 65536) : (base += 8) {
+        for (0..8) |l| buf[l] = @intCast(base + l);
+
+        // shape 1: the vector shift (13 of the 14 copies)
+        const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(&buf)).*;
+        const want_vec: @Vector(8, f32) = @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+        // shape 2: the scalar loop (gemm_224_bf16.zig)
+        var tmp: [8]f32 = undefined;
+        for (0..8) |l| tmp[l] = amx.bf16_to_f32(buf[l]);
+        const want_scalar: @Vector(8, f32) = tmp;
+
+        const got: @Vector(8, f32) = amx.widen8(&buf);
+        const gv: [8]u32 = @bitCast(got);
+        const wv: [8]u32 = @bitCast(want_vec);
+        const ws: [8]u32 = @bitCast(want_scalar);
+        for (0..8) |l| {
+            if (gv[l] != wv[l] or gv[l] != ws[l]) {
+                std.debug.print("\nwiden8 mismatch at bf16 0x{X:0>4}: got u32=0x{X:0>8}\n", .{ buf[l], gv[l] });
+                return error.Widen8Mismatch;
+            }
+        }
+        checked += 8;
+    }
+    try testing.expectEqual(65536, checked);
+}

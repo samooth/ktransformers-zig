@@ -195,8 +195,7 @@ pub const GemmKernel224MXFP4 = struct {
 
     /// 8 bf16 -> 8 f32, unaligned.
     inline fn widen8(p: [*]const amx.bf16) Vec {
-        const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(p)).*;
-        return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+        return amx.widen8(p);
     }
 
     /// 4 bytes -> 8 FP4 E2M1 values, LOW nibble first.

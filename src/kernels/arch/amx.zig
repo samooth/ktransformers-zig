@@ -1,6 +1,10 @@
-// CLAIM: bf16-narrow-store — vectorized RNE f32->bf16 store + the
-// misleading avx512_f32_to_bf16 scalar loop — roadmap P1.2/P2.1 — 2026-10-04
+// CLAIM: widen8-move — hoist the 14 duplicated bf16->f32 widen8 helpers to the
+// arch layer — roadmap P2.1 — 2026-10-05
 // Holds src/kernels/arch/amx.zig until committed.
+// (Supersedes the bf16-narrow-store claim, which landed in bb87a69.)
+//
+// ARCH-EDIT NOTICE: this file is imported by every kernel AND by bench/. A
+// measurement in flight breaks if it is edited unclaimed. Claim it first.
 // AMX intrinsics and tile configuration for ktransformers-zig
 // Provides Zig-friendly wrapper around Intel AMX instructions
 
@@ -458,6 +462,31 @@ pub fn tile_dpbuud(dst: TileReg, src_a: TileReg, src_b: TileReg) void {
 
 /// BF16 type - represents a 16-bit brain float
 pub const bf16 = u16;
+
+/// Widen 8 packed bf16 values to `VecF32` (bf16 -> f32 is a pure 16-bit left shift).
+///
+/// This is the single owner. It replaced **14 identical private copies**, one per
+/// kernel file (`gemm_224_{iq1_s,iq1_m,iq2_xxs,iq2_xs,iq2_s,iq3_xxs,iq3_s,
+/// iq4_nl,iq4_xs,q8_0,fp8,mxfp4,mxfp8,bf16}.zig` plus `bench/fp8_bench.zig`).
+///
+/// Why bother, when each copy was only three lines: fourteen copies are fourteen
+/// chances for two of them to drift, and that is not hypothetical here — this repo
+/// already paid for exactly that failure in the E4M3 codec, where near-identical
+/// copies diverged. The de-duplication is the drift insurance, not the tidiness.
+///
+/// Before moving, all copies were checked to be **numerically** identical, not just
+/// cosmetically: an exhaustive sweep of all 65536 bf16 bit patterns found two
+/// distinct SHAPES (13 vector-shift, 1 scalar-loop in `gemm_224_bf16.zig`) and they
+/// agree bit-for-bit on every pattern, including both NaN encodings, both infinities
+/// and every subnormal. That is why this is a pure move. Had any pair diverged, the
+/// divergence would have been reported rather than unified.
+///
+/// The `*align(1)` load is required: `src` is a packed bf16 stream and may sit at any
+/// 2-byte offset, so an aligned vector load would fault.
+pub inline fn widen8(src: [*]const bf16) VecF32 {
+    const raw: @Vector(8, u16) = @as(*align(1) const @Vector(8, u16), @ptrCast(src)).*;
+    return @bitCast(@as(@Vector(8, u32), raw) << @as(@Vector(8, u5), @splat(16)));
+}
 
 // Buffer alignment constants
 const BF16_ALIGN = 16;

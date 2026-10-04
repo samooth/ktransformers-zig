@@ -384,9 +384,7 @@ const MR: usize = 4;
 /// `vpmovzxwd` + `vpslld $16` (the AVX2 bf16 widening trick); there is no F16C
 /// instruction for bf16, which is why F16C is irrelevant to this path.
 inline fn widen8(p: [*]const amx.bf16) amx.VecF32 {
-    var tmp: [amx.VEC_LEN]f32 = undefined;
-    for (0..amx.VEC_LEN) |l| tmp[l] = amx.bf16_to_f32(p[l]);
-    return tmp;
+    return amx.widen8(p);
 }
 
 /// Dot the 32-element k-block at `a_k` against the already-widened weight chunk
