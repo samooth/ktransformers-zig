@@ -649,19 +649,49 @@ pub const GemmKernel224FP8 = struct {
     /// (see the report in TODO.md Stream B). `gemmAvx2Gather` below is the
     /// asm-gather experiment against that cost.
     inline fn fp8x8(p: [*]const fp8_e4m3) Vec {
-        const raw: @Vector(8, u8) = @as(*align(1) const @Vector(8, u8), @ptrCast(p)).*;
-        var out: [8]f32 = undefined;
-        inline for (0..8) |i| out[i] = FP8_E4M3_LUT[raw[i]];
-        return out;
+        return lut8(&FP8_E4M3_LUT, p);
     }
 
     /// Scalar dot over the ragged tail of a k that is not a multiple of 8.
     /// Deliberately does NOT apply the row scale: the caller folds that in
     /// once, after the reduction, exactly as the vector path does.
     inline fn tailDot(a_row: [*]const amx.bf16, brow: [*]const fp8_e4m3, kbase: usize, rem: usize) f32 {
+        return tailDotLut(a_row, brow, kbase, rem, &FP8_E4M3_LUT);
+    }
+
+    /// 8 E5M2 bytes -> 8 f32, from the E5M2 table. Identical shape to `fp8x8`:
+    /// both formats are one byte per weight, so only the table differs.
+    inline fn fp8x8E5M2(p: [*]const fp8_e5m2) Vec {
+        return lut8(&FP8_E5M2_LUT, p);
+    }
+
+    /// Scalar dot over a ragged tail, for E5M2.
+    inline fn tailDotE5M2(a_row: [*]const amx.bf16, brow: [*]const fp8_e5m2, kbase: usize, rem: usize) f32 {
+        return tailDotLut(a_row, brow, kbase, rem, &FP8_E5M2_LUT);
+    }
+
+    /// The two codec-specific steps, factored out so the GEMM body below is
+    /// written ONCE and instantiated per format. A second hand-written copy of
+    /// that loop is exactly the duplication that let the E4M3 and MXFP8 codecs
+    /// drift apart, and a GEMM loop drifting from its scalar oracle is the same
+    /// failure with a worse blast radius.
+    inline fn lut8(comptime lut: *const [256]f32, p: [*]const u8) Vec {
+        const raw: @Vector(8, u8) = @as(*align(1) const @Vector(8, u8), @ptrCast(p)).*;
+        var out: [8]f32 = undefined;
+        inline for (0..8) |i| out[i] = lut[raw[i]];
+        return out;
+    }
+
+    inline fn tailDotLut(
+        a_row: [*]const amx.bf16,
+        brow: [*]const u8,
+        kbase: usize,
+        rem: usize,
+        comptime lut: *const [256]f32,
+    ) f32 {
         var acc: f32 = 0;
         for (0..rem) |t| {
-            acc += amx.bf16_to_f32(a_row[kbase + t]) * FP8_E4M3_LUT[brow[kbase + t]];
+            acc += amx.bf16_to_f32(a_row[kbase + t]) * lut[brow[kbase + t]];
         }
         return acc;
     }
@@ -680,6 +710,39 @@ pub const GemmKernel224FP8 = struct {
         c: [*]f32, ldc: usize,
         m: usize, n: usize, k: usize
     ) void {
+        gemmAvx2With(fp8x8, tailDot, a, lda, b, b_scales, ldb, c, ldc, m, n, k);
+    }
+
+    /// The same kernel for E5M2 weights. Separate symbol, identical arithmetic
+    /// with the E5M2 table substituted — see `gemmAvx2With` for why the body is
+    /// shared rather than copied.
+    pub noinline fn gemmAvx2E5M2(
+        a: [*]const amx.bf16, lda: usize,
+        b: [*]const fp8_e5m2, b_scales: [*]const f32, ldb: usize,
+        c: [*]f32, ldc: usize,
+        m: usize, n: usize, k: usize
+    ) void {
+        gemmAvx2With(fp8x8E5M2, tailDotE5M2, a, lda, b, b_scales, ldb, c, ldc, m, n, k);
+    }
+
+    /// The AVX2 GEMM body, parameterised on the two codec-specific steps.
+    ///
+    /// `decode8` turns 8 weight bytes into 8 f32 lanes; `tail` handles the
+    /// ragged k tail. Everything else — the MR-row blocking that lets MR rows of
+    /// A share one decoded weight vector, the single horizontal reduction per
+    /// output element, the scale applied once after the reduction — is
+    /// identical for both formats and lives here exactly once.
+    ///
+    /// Both formats are one byte per weight, so `b` is `[*]const u8` here and
+    /// the typed wrappers above keep the public signatures honest.
+    inline fn gemmAvx2With(
+        comptime decode8: anytype,
+        comptime tail: anytype,
+        a: [*]const amx.bf16, lda: usize,
+        b: [*]const u8, b_scales: [*]const f32, ldb: usize,
+        c: [*]f32, ldc: usize,
+        m: usize, n: usize, k: usize,
+    ) void {
         if (m == 0 or n == 0) return;
         const kv = k / 8; // full 8-weight vectors
         const rem = k - kv * 8; // ragged tail, < 8
@@ -693,7 +756,7 @@ pub const GemmKernel224FP8 = struct {
             while (i + MR <= m) : (i += MR) {
                 var acc = [_]Vec{@splat(0.0)} ** MR;
                 for (0..kv) |v| {
-                    const w = fp8x8(brow + v * 8);
+                    const w = decode8(brow + v * 8);
                     const kb = v * 8;
                     inline for (0..MR) |r| {
                         acc[r] = @mulAdd(Vec, widen8(a + (i + r) * lda + kb), w, acc[r]);
@@ -701,7 +764,7 @@ pub const GemmKernel224FP8 = struct {
                 }
                 inline for (0..MR) |r| {
                     var sum = @reduce(.Add, acc[r]); // ONE hsum per output element
-                    if (rem != 0) sum += tailDot(a + (i + r) * lda, brow, kv * 8, rem);
+                    if (rem != 0) sum += tail(a + (i + r) * lda, brow, kv * 8, rem);
                     c[(i + r) * ldc + j] = sum * b_scales[j];
                 }
             }
@@ -709,10 +772,10 @@ pub const GemmKernel224FP8 = struct {
             while (i < m) : (i += 1) {
                 var acc: Vec = @splat(0.0);
                 for (0..kv) |v| {
-                    acc = @mulAdd(Vec, widen8(a + i * lda + v * 8), fp8x8(brow + v * 8), acc);
+                    acc = @mulAdd(Vec, widen8(a + i * lda + v * 8), decode8(brow + v * 8), acc);
                 }
                 var sum = @reduce(.Add, acc);
-                if (rem != 0) sum += tailDot(a + i * lda, brow, kv * 8, rem);
+                if (rem != 0) sum += tail(a + i * lda, brow, kv * 8, rem);
                 c[i * ldc + j] = sum * b_scales[j];
             }
         }

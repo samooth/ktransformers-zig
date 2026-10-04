@@ -202,6 +202,17 @@ comptime {
     _ = &gemm_mxfp8.MXFP8BufferB.fromMatBF16;
 }
 
+// FP8 E5M2. The E4M3 half of this file is reached through main.zig's C exports,
+// but the E5M2 GEMM has no caller yet, so nothing would pull it in and the
+// kernel would not exist in the .so at all. Referencing it here is what makes it
+// real — and `nm` is the check, not the source: a `pub noinline fn` that nothing
+// references is silently dropped by lazy analysis.
+comptime {
+    _ = &gemm_fp8.GemmKernel224FP8.gemmAvx2E5M2;
+    _ = &gemm_fp8.f32_to_fp8e5m2;
+    _ = &gemm_fp8.fp8e5m2_to_f32;
+}
+
 // Force full semantic analysis of the MLA modules. A bare `pub const`
 // namespace re-export does NOT analyze the module's declarations (lazy
 // analysis); referencing the functions themselves in comptime does.

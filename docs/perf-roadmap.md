@@ -174,7 +174,7 @@ feeding 4 column accumulators — the mirror of the MR=4 tiling that already
 gives m=8 its 2x) should buy ~1.5x. Register budget works out: 4 columns ×
 16 lanes of f32 = 8 ymm, +2 activation +2 weight temporaries = 12 of 16.
 
-### P0.2 — FP8 E4M3/E5M2 · `gemm_224_fp8.zig`
+### P0.2 — FP8 E4M3/E5M2 · `gemm_224_fp8.zig` — **DONE** (E5M2 was the missing half)
 
 **Why:** direct port target — the reference has `fp8-moe.hpp` (12 AVX2
 intrinsics) and `fp8_dequant.hpp` (4) to diff against, so there is no
@@ -189,6 +189,20 @@ accumulate separately per group.
 **Acceptance.** Existing FP8 tests pass; a new vectorized sibling matches
 `gemmFullTileScalar` to f32 rounding on random blocks; the dequant
 round-trip stays byte-exact.
+
+**What actually happened.** E4M3 was done; E5M2 had no encoder, no decoder, no
+LUT, no enum value, no C API and no GEMM, so this entry was half a deliverable
+under a name that read as finished. Both formats now share ONE GEMM body
+(`gemmAvx2With`), instantiated per codec, because a second hand-written copy of
+that loop is the same duplication that let the E4M3 and MXFP8 codecs drift.
+E5M2's differences from E4M3 are all traps: bias 15 not 7, NO infinities (so the
+largest finite value is 57344 and saturation must clip to `0x7B` rather than
+emit the NaN byte that decodes to zero), subnormals down to 2^-16, and the
+mantissa carry still landing in the exponent. Both C API pairs now have tests —
+the E4M3 pair had none, because it was never declared `pub export fn` and no
+suite could name it. `kt_matmul_fp8` remains E4M3-only; an E5M2 GEMM entry point
+is future work for whoever has a caller, and the kernel is emitted and tested
+today via the root.zig comptime reference.
 
 ---
 

@@ -1640,6 +1640,140 @@ test "FP8 E4M3 LUT decode is exact for all 256 encodings" {
     }
 }
 
+/// Scalar FP8 E5M2 GEMM oracle, at file scope because Zig has no nested
+/// functions. Deliberately independent of `gemmAvx2With` and its helpers: it
+/// touches neither, so agreement between the two is evidence about the kernel
+/// rather than a tautology. Accumulates in f64 so a comparison measures the
+/// kernel's f32 summation order rather than the oracle's own rounding, and
+/// folds the per-row scale ONCE after the reduction to match the vector path.
+fn e5m2ScalarOracle(
+    act: [*]const amx.bf16,
+    w: [*]const u8,
+    sc: [*]const f32,
+    c: [*]f32,
+    m: usize,
+    n: usize,
+    k: usize,
+) void {
+    for (0..m) |i| {
+        for (0..n) |j| {
+            var acc: f64 = 0;
+            for (0..k) |t| {
+                acc += @as(f64, amx.bf16_to_f32(act[i * k + t])) *
+                    @as(f64, kt.gemm_fp8.FP8_E5M2_LUT[w[j * k + t]]);
+            }
+            c[i * n + j] = @floatCast(acc * @as(f64, sc[j]));
+        }
+    }
+}
+
+test "FP8 E5M2 AVX2 GEMM == an independent scalar oracle, including ragged k" {
+    const fp8 = kt.gemm_fp8;
+
+    // The oracle here is written out in this file rather than taken from
+    // `gemmFullTileScalar`, because that function is E4M3-specific and adding an
+    // E5M2 twin in production code would be a third near-copy of the same loop.
+    // What is being tested is the kernel, and a triple loop that touches neither
+    // `gemmAvx2With` nor its helpers is an independent statement of the math.
+    //
+    // It folds the per-row scale ONCE after the reduction, matching the vector
+    // path (and the more accurate formulation), and accumulates in f64 so the
+    // comparison measures the kernel rather than the oracle's own rounding.
+    var seed: u64 = 0xE5E5_0001;
+    // Shapes mirror the E4M3 GEMM test: m = 1 (m%MR tail only), 4 (exactly MR),
+    // 5 (one MR group + tail), n = 1 and 2, and k both exact multiples of 8 and
+    // ragged by 1..7.
+    const shapes = [_][3]usize{
+        .{ 1, 1, 8 },
+        .{ 1, 2, 16 },
+        .{ 4, 7, 32 },
+        .{ 5, 1, 33 }, // ragged k
+        .{ 5, 2, 40 }, // ragged k
+        .{ 5, 7, 96 },
+        .{ 1, 7, 97 }, // ragged k
+        .{ 4, 2, 129 },
+        .{ 5, 7, 256 },
+    };
+    for (shapes) |sh| {
+        const m = sh[0];
+        const n = sh[1];
+        const k = sh[2];
+        const act = try testing.allocator.alloc(amx.bf16, m * k);
+        defer testing.allocator.free(act);
+        for (0..m * k) |i| act[i] = amx.f32_to_bf16(rnd(&seed, 512, 2.0));
+
+        const w = try testing.allocator.alloc(fp8.fp8_e5m2, n * k);
+        defer testing.allocator.free(w);
+        // Random bytes with the exponent field kept off 31. In E5M2 the whole
+        // top exponent is NaN (there is no infinity), and a NaN weight poisons
+        // its whole dot product, so leaving it in would make every comparison
+        // below vacuous. The NaN path is pinned separately, and deliberately,
+        // in the next test.
+        for (w) |*q| {
+            seed = seed *% 6364136223846793005 +% 1442695040888963407;
+            const b: u8 = @truncate(seed >> 24);
+            const e = (b >> 2) & 0x1F;
+            const e_safe = if (e == 31) @as(u8, 30) else e;
+            q.* = (b & 0x80) | (e_safe << 2) | (b & 0x03);
+        }
+
+        const sc = try testing.allocator.alloc(f32, n);
+        defer testing.allocator.free(sc);
+        for (sc) |*v| v.* = rnd(&seed, 1024, 0.5) + 0.5;
+
+        const got = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(got);
+        const ref = try testing.allocator.alloc(f32, m * n);
+        defer testing.allocator.free(ref);
+        // Poison both: `gemmAvx2` assigns rather than accumulates, so this also
+        // proves every element of [0,m) x [0,n) is written.
+        @memset(got, std.math.nan(f32));
+        @memset(ref, std.math.nan(f32));
+
+        fp8.GemmKernel224FP8.gemmAvx2E5M2(act.ptr, k, w.ptr, sc.ptr, k, got.ptr, n, m, n, k);
+        e5m2ScalarOracle(act.ptr, w.ptr, sc.ptr, ref.ptr, m, n, k);
+
+        // f32 accumulation in a different order than the oracle's f64, so the
+        // bound is relative to the magnitude of the terms rather than exact.
+        for (0..m * n) |idx| {
+            var mag: f64 = 0;
+            const i = idx / n;
+            const j = idx % n;
+            for (0..k) |t| {
+                mag += @abs(@as(f64, amx.bf16_to_f32(act[i * k + t])) *
+                    @as(f64, fp8.FP8_E5M2_LUT[w[j * k + t]]));
+            }
+            mag *= @abs(@as(f64, sc[j]));
+            try testing.expectApproxEqAbs(
+                @as(f64, ref[idx]),
+                @as(f64, got[idx]),
+                1e-5 * mag + 1e-6,
+            );
+        }
+    }
+}
+
+test "FP8 E5M2: a NaN weight propagates to the output rather than reading as zero" {
+    const fp8 = kt.gemm_fp8;
+    // A decision, pinned so it cannot change by accident. E4M3's decoder maps
+    // its single NaN encoding to 0.0, so an E4M3 weight row containing 0x7F
+    // silently contributes nothing. E5M2's NaN field is the whole top exponent,
+    // and it decodes to NaN, so a corrupted weight poisons its output instead
+    // of vanishing. For weights, "vanish" is the more dangerous failure, and for
+    // activations NaN propagation is what callers expect. Either behaviour is
+    // defensible; silently changing between formats is not.
+    const k = 8;
+    var act: [k]amx.bf16 = undefined;
+    for (&act) |*v| v.* = amx.f32_to_bf16(1.0);
+    var w: [k]fp8.fp8_e5m2 = undefined;
+    for (&w, 0..) |*v, i| v.* = if (i == 3) 0x7F else 0x3C; // 0x7F = NaN, 0x3C = 1.0
+    const sc = [_]f32{1.0};
+    var got: [1]f32 = undefined;
+
+    fp8.GemmKernel224FP8.gemmAvx2E5M2(&act, k, &w, &sc, k, &got, 1, 1, 1, k);
+    try testing.expect(std.math.isNan(got[0]));
+}
+
 test "FP8 AVX2 GEMM == the scalar oracle across shapes, including ragged k" {
     const fp8 = kt.gemm_fp8;
     // Shapes chosen to hit every branch in `gemmAvx2`: m = 1 (the m%MR tail
@@ -2688,7 +2822,6 @@ test "IQ1_M AVX2 GEMM == the scalar oracle, across super-blocks and m tails" {
         }
     }
 }
-
 
 // ============================================================================
 // INT4 GPTQ

@@ -995,148 +995,41 @@ either added or recorded as deliberately out of scope with the reason. The
 `_avxvnni` variant is out of scope: this host has no VNNI and the scalar path
 stays the fallback for it.
 
-**Stream M — FP8 E5M2. CLAIMED (fp8-e5m2) since 2026-10-04.**
+**Stream M — FP8 E5M2. DONE (3 commits). CLAIMED (fp8-e5m2) since 2026-10-04.**
 `src/kernels/amx/gemm_224_fp8.zig`, `src/main.zig`, `include/kt_kernel.h`,
-`src/kernels/moe/llamafile_moe.zig`, and **`tests/kernels/simd_kernels_tests.zig`
-— the SIMD suite is claimed, it is shared with Stream K.** Wait for it or hand
-your test additions over; do not stage it while this claim stands.
+`tests/kernels/simd_kernels_tests.zig` (+ new `fp8_capi_tests.zig`), `build.zig`,
+`docs/api.md`, `docs/perf-roadmap.md`. Claim released.
 
-E5M2 is the last unclaimed piece of roadmap P0.2 and the only FP8 format with
-**no encoder, no decoder, no enum value and no dispatch arm anywhere in the
-tree** — E4M3 was complete, so "FP8 E4M3/E5M2" was half a deliverable. Closes
-with: the codec in the file that already owns E4M3 (one owner per codec — the
-lesson of the E4M3/MXFP8 duplication), exhaustive tests, then the C API and the
-vectorized sibling.
+E5M2 was the last unclaimed piece of roadmap P0.2 and the reason "FP8 E4M3/E5M2"
+was half a deliverable: E4M3 had everything, E5M2 had nothing — no encoder, no
+decoder, no LUT, no enum value, no C API, no GEMM. Three commits: the codec, the
+C API plus the coverage the E4M3 pair never had, and the GEMM sibling.
 
-The format differs from E4M3 in ways that are all easy to get wrong, and the
-E4M3 encoder's bug list is the checklist: bias 15 not 7, **no infinities** (the
-whole exponent-31 field is NaN, so the largest finite value is `0x7B` = 57344,
-not 0x7E), **subnormals down to 2^-16** across four encodings rather than seven
-down to 2^-9, and a 2-bit mantissa whose round-up carry lands in the exponent
-just the same. Nothing here may be inferred from the E4M3 code by analogy.
+Delivered: codec (LUT built by bit placement, exact, comptime, builds on aarch64
+too), `kt_quantize_fp8_e5m2` / `kt_dequantize_fp8_e5m2`, and `gemmAvx2E5M2`.
+ABI 112 -> 114.
 
+The structural decision worth keeping: **both formats share ONE GEMM body**
+(`gemmAvx2With`), instantiated per codec, rather than a second copy of the loop.
+That is the E4M3/MXFP8 lesson applied preemptively — the codec duplication was
+fixed by hand last time, at the cost of four real encoder bugs surviving a
+decoder fix, a GEMM rewrite and a claim cycle.
 
-**DONE (15.7x at m=1, 24.3x at m=4). `gemmAvx2` in `gemm_224_int4.zig`,
-wired through `gemmFullTile` so it is reachable from the exported
-`kt_matmul_int4` with no `root.zig` change. `2b6dbb7`, tests `464252a`, bench
-`4e6e245`.**
+Two real bugs were caught in the new code while writing it, both by writing the
+test before trusting the code:
+- the LUT folded the sign into the value instead of applying it last, so 0x80
+  decoded to +0.0 and re-encoded to 0x00 — negative zero silently lost;
+- the encoder's sticky mask included the round bit, which silently degrades
+  round-to-nearest-even into round-half-up.
+Both mutation-tested: reinstating either bug fails a named test.
 
-| path | m=1 | m=4 |
-|---|---|---|
-| `gemmFullTileScalar` (before) | 35.30 ms / 0.23 GB/s | 145.86 ms / 0.04 GB/s |
-| **`gemmAvx2`** | **2.24 ms / 3.68 GB/s — 15.7x** | **6.00 ms / 1.38 GB/s — 24.3x** |
-| Q8_0 `gemmAvx2`, ~1 B/weight control | 6.32 ms / 2.47 GB/s | 6.14 ms / 2.54 GB/s |
+Also closed: the E4M3 C API pair had **no tests at all**, because it was declared
+`export fn` rather than `pub export fn` and no suite could name it. It is `pub`
+now and covered alongside E5M2.
 
-At n=2048 k=7168, pinned to cpu 9, ReleaseFast, best of 4 runs of 9 reps, both
-paths in the same binary (`bench/int4_bench.zig`). **Load average 57-62 on 16
-threads for every number in that table**, so the absolute ms are roughly 5x
-worse than a quiet host and only the ratios mean anything; the Q8_0 control
-reads 2.47 GB/s here against the 13.19 GB/s Stream F recorded, which is the same
-factor from the other side. Path agreement, L2-normalised: 1.1e-7 at m=1,
-6.6e-8 at m=4.
-
-**Read the ratio with care — the baseline is pathological, and this is the same
-trap Stream K fell into.** `gemmFullTileScalar` is an m-outer triple loop that
-does TWO multiplies per weight (`sum += a * low * scale`) into a serial f32 add
-chain, and it costs ~13 cycles/weight: the K-quant scalar baselines on the same
-shape are 4-5 cycles/weight. So 15-24x overstates what the kernel does against
-a *good* baseline, and the GB/s column is the number to trust. What the ratio
-does establish is the loop order: n-outer/m-inner is the whole difference.
-
-**Instruction count, disassembly (ReleaseFast).** MR=4 inner loop: **43
-instructions per 32 weights (one group) = 0.34 per MAC**, of which 20 are the
-nibble decode (4 x `vpbroadcastd` + `vpsrlvd` + `vpand` + `vcvtdq2ps` + `vfmadd`
-for the weight side) and 16 the activation side (4 x `vpmovsxbd` +
-`vcvtdq2ps` + `vfmadd`), plus 7 loop overhead and 6 for the once-per-group scale
-setup. The scalar path is 7 instructions per weight (two `vmulss`, one
-`vaddss`, an i8 load and widen, a nibble extract and two bf16 scale reads).
-
-**The decode is now 47% of the inner loop, which is the headroom.** A
-decode-free variant would be ~2x, and unlike FP8's table there is no cheap fix
-here: the 5 ops per 8 weights are the arithmetic floor for an f32 result, and
-the two ways past it are both bigger changes than this item — an integer
-`vpmaddubsw` dot (which needs the per-group activation-sum correction, i.e. the
-raw-INT4 trick below) or an AVX-512 `vpmov`/`vpermb` path. Recorded for whoever
-picks it up rather than guessed at.
-
-**`vpshufb` is not used, and for this format that is the correct answer, not a
-shortcut.** The brief asked for "a vpshufb unpack plus an FMA chain". INT4 GPTQ
-is AFFINE in the nibble — `w = (q - 8) * d` — so the value conversion is one
-integer convert and one FMA, and a lookup table only pays for a NON-linear
-codebook. That is the whole reason `pshufb16` exists for MXFP4's E2M1 grid and
-the IQ lookup tables and is unnecessary here. The reference agrees:
-`gptq_sym_dequant_8x4bit` (gptq_int4_dequant.hpp) is `_mm256_srlv_epi32` +
-`_mm256_and_si256` + `_mm256_cvtepi32_ps` + a subtract and a multiply — no
-table, no shuffle, in the file whose whole purpose is dequantization.
-
-What the reference's variable shift DOES buy, on this layout, is the nibble
-interleave: the block is byte-interleaved (byte q holds weight 2q low and 2q+1
-high), so bits 4t..4t+3 of the little-endian u32 over bytes 0..3 are exactly
-weights 0..7. One broadcast + one `vpsrlvd` + one mask replaces interleaving
-the low and high nibble vectors and the lanes come out in weight order.
-Verified: LLVM emits `vpbroadcastd` / `vpsrlvd` / `vpand` / `vcvtdq2ps` /
-`vfmadd`, and the decode matches `(q-8)*d` on 800k random words.
-
-Implication for the roadmap's "share one primitive" item: for AFFINE formats
-(int4, and int8's i8 path) the shareable primitive is a **nibble/sign-extract
-plus an FMA**, not a lookup — a `pshufb` table is the MX/IQ shape and folding it
-into a shared driver would import a dependency those formats do not need.
-
-**Local rather than hosted in `kquant_simd.gemmBF16xQuant`, for the same three
-reasons FP8 was not**: that driver widens A with `widen16`, hardcoded to bf16,
-and INT4 activations are i8, so hosting it means changing the shared driver for
-six K-quants plus two MX kernels; its `Cfg` has no runtime per-row-scale
-parameter; and it asserts `k % QK == 0` while `kt_matmul_int4` accepts arbitrary
-k. `gemm_224_int8.zig` has no vectorized path either (its GEMM outputs i32, not
-f32), so there was nothing to reuse.
-
-**The two named traps, both handled and both asserted in tests.** The per-group
-scale is constant across its 32 weights, so folding it into the weight vector is
-EXACTLY equivalent to applying it at the group boundary, and no accumulator ever
-spans a group unscaled — which is the trap `applyScales` exists for on the AMX
-path, where the INT32 accumulator does span a K-block. The fold is exact, not
-close: `(q-8)*d` needs 12 bits of the 24 an f32 has. The zero point stays a
-separate term in the integer domain, `q*d + (-8*d)` in one FMA; folding it into
-the scale would scale the activations, and subtracting 8 from the i8 activation
-would destroy the real values. Tests: two groups with scales 1 and 2 must give
-672 (a single-scale implementation gives 224 or 448), and code 8 must dequantize
-to exactly 0.
-
-**Ragged k is asserted, not assumed** — `kt_matmul_q{4,5,6,8}_k` and FP8 all
-shipped one. `k = 31` (odd tail, last weight from a LOW nibble), `k = 33`,
-`k = 48`, `k = 129` are in the sweep, plus an isolated test that the tail reads
-the low nibble of the right byte.
-
-**Raw-INT4: recorded as DELIBERATELY not done, with the reason.** The reference
-has three AVX2 INT4 kernels; this covers one. The gap is real and it is not a
-missing trick:
-
-- Raw-INT4 (Kimi native) has **no type id** — `KT_TYPE_I4` is the GPTQ block
-  (`@divExact(n,32)*18` bytes), which is a different layout — and **no in-tree
-  consumer**: `kt_matmul_int4` is the only caller and it takes the GPTQ block.
-  Adding a raw-INT4 kernel therefore means the same coordinated change to
-  `include/kt_kernel.h` that E5M2 needs, and this stream does not own that
-  header. An unexported, unreferenced kernel is exactly the dead code this repo
-  keeps punishing.
-- Its scale layout is also not agreed: `rawint4-moe.hpp` takes a separate
-  `scales[n * k/group_size]` f32 array with a **runtime** `k_group_size`, where
-  GPTQ's scale is inside the block with a fixed group of 32. That is a different
-  function signature, not a flag.
-
-When the ABI lands it is ~40 lines and the primitive is already written:
-`GemmKernel224Int4.nibble8` is `rawint4_dequant_8x4bit_unscaled` with `d = 1`.
-The one design choice to make is the scale: the reference folds it with one FMA
-per GROUP (`total_acc = fma(group_acc, scale, total_acc)`), which needs a
-horizontal reduction per group per output element, versus folding it into the
-weights as done here, which needs none but makes the accumulator non-integer.
-Raw-INT4's activations are bf16, so the "both paths are exact in f32" property
-that makes the INT4 tests bit-exact does NOT carry over, and the oracle has to be
-a dequantize-and-dot rather than an integer computation.
-
-**The `_avxvnni` variant stays out of scope**: this host has no VNNI, and the
-scalar path remains the fallback for it. `src/kernels/amx/gemm_224_int4_avx512.zig`
-remains dead code and stays dead — it is not imported by `root.zig`, and
-deleting it is a separate call.
+`kt_matmul_fp8` stays E4M3-only — an E5M2 GEMM entry point is future work for
+whoever has a caller. The kernel is emitted into the `.so` (via a root.zig
+comptime reference) and tested today.
 
 **Stream K — IQ2_XXS GEMM. DONE. The earlier "weak result" entry was WRONG and
 is corrected below. CLAIMED (iq2xs-avx2) since 2026-10-04.**
