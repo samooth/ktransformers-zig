@@ -354,9 +354,14 @@ pub const GemmKernel224FP8 = struct {
 
     /// Scalar fallback for non-AMX hosts, and the oracle the AVX2 path is
     /// tested against. Kept as the readable statement of the math; see
-    /// `gemmAvx2` below for why it is no longer what runs. `noinline` for the
-    /// same reason as there: it keeps this loop disassemblable next to the
-    /// vectorized one, which is how the two are compared.
+    /// `gemmAvx2` below for why it is no longer what runs.
+    ///
+    /// `noinline` so that where this IS called — the test suite and
+    /// `bench/fp8_bench.zig`, both of which reference it — it keeps a symbol
+    /// and its inner loop stays disassemblable next to the vectorized one.
+    /// Nothing in the library calls it any more, so unlike `gemmAvx2` it does
+    /// NOT appear in the shipped `.so`; `root.zig` has no comptime reference
+    /// for it and `root.zig` is a shared file.
     pub noinline fn gemmFullTileScalar(
         a: [*]const amx.bf16, lda: usize,
         b: [*]const fp8_e4m3, b_scales: [*]const f32, ldb: usize,
