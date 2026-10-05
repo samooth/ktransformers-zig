@@ -97,8 +97,30 @@ jobs:
       # also check for a surviving test process before drawing any conclusion
       # from the log.
 
+      # The suite run and a runner watch share ONE step on purpose: each `run:`
+      # is its own shell, so a monitor backgrounded in a previous step would be
+      # killed when that step ended and could never report. The suite exit code
+      # stays authoritative; the watch only adds the diagnosis.
+      #
+      # The watch exists because a timeout says a job failed and not why. This one
+      # reports "childless across N spaced samples", which is an OBSERVATION and
+      # not a diagnosis: a slow compile is childless too. Its own header says so,
+      # and it never signals.
       - name: "Test suites"
-        run: timeout 2400 zig build test
+        run: |
+          chmod +x tools/watch_childless_runners.sh tools/orphan_tests.sh
+          ( tools/watch_childless_runners.sh --samples 15 --spacing 20 \
+              > runner_watch.log 2>&1; echo $? > runner_watch.rc ) &
+          watch_pid=$!
+          timeout 2400 zig build test
+          suite_rc=$?
+          kill "$watch_pid" 2>/dev/null || true
+          wait "$watch_pid" 2>/dev/null || true
+          echo "--- runner watch (observation, not diagnosis) ---"
+          cat runner_watch.log 2>/dev/null || echo "(no output)"
+          echo "runner_watch exit: $(cat runner_watch.rc 2>/dev/null || echo 'did not finish')"
+          echo "suite exit: $suite_rc"
+          exit "$suite_rc"
       # A suite binary that outlives the build runner IS the failure, even though
       # nothing in the log says so: the runner is killed, the suite keeps a CPU,
       # and an orphan is invisible (a hung run looks like a slow run). One was
