@@ -335,3 +335,4 @@ comptime {
     _ = &gemm_bf16_neon.GemmExpertBF16NEON.VecF32;
     _ = &gemm_bf16_neon.GemmExpertBF16NEON.reduceAdd;
 }
+pub const kimi_k3_config = @import("kimi/kimi_k3_config.zig");
