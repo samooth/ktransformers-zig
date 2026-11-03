@@ -131,3 +131,19 @@ test "latentMoe basic" {
     try testing.expect(std.math.isFinite(out[0]));
     try testing.expect(std.math.isFinite(out[1]));
 }
+
+test "shortConv causal" {
+    // channels=1, k=2 (hist=1), T=3
+    const w = [_]f32{ 0.0, 1.0 }; // w[0]=0 (old), w[1]=1 (cur): y = cur * silu(cur)
+    var state = [_]f32{0.0};
+    const x = [_]f32{ 1.0, 2.0, 3.0 };
+    var y = [_]f32{ 0.0, 0.0, 0.0 };
+    ops.shortConv(&y, &x, &w, &state, 1, 2, 3);
+    // t=0: cur=1 -> 1*silu(1)
+    const silu1 = 1.0 / (1.0 + @exp(-@as(f32, 1.0)));
+    try testing.expectApproxEqAbs(1.0 * silu1, y[0], 1e-5);
+    const sig2 = 1.0 / (1.0 + @exp(-@as(f32, 2.0)));
+    try testing.expectApproxEqAbs(2.0 * sig2, y[1], 1e-5);
+    // state updated to last input
+    try testing.expectApproxEqAbs(3.0, state[0], 1e-5);
+}

@@ -13,6 +13,56 @@
 const std = @import("std");
 
 // ---------------------------------------------------------------------------
+// ShortConv (causal depthwise conv + fused SiLU)
+// ---------------------------------------------------------------------------
+
+/// Causal depthwise convolution with fused SiLU.
+/// w is [channels][k]; state holds (k-1) previous inputs per channel, oldest first,
+/// and is UPDATED IN PLACE. state may be null (treat history as zero).
+/// x/y layout: [T][channels] (row-major by token). w layout: [channels][k].
+pub fn shortConv(
+    y: []f32,
+    x: []const f32,
+    w: []const f32,
+    state: ?[]f32,
+    channels: usize,
+    k: usize,
+    T: usize,
+) void {
+    const hist = k - 1;
+    var buf = [_]f32{0} ** 64; // channels handled per-channel; hist <= 64 for K3 (4-1)
+    // hist is small (3 for K3); guard generically with a heap buffer if needed.
+    for (0..channels) |c| {
+        if (hist > 0) {
+            if (state) |st| {
+                for (0..hist) |j| buf[j] = st[c * hist + j];
+            } else {
+                for (0..hist) |j| buf[j] = 0.0;
+            }
+        }
+        for (0..T) |t| {
+            const cur = x[t * channels + c];
+            var acc: f32 = w[c * k + hist] * cur;
+            for (0..hist) |j| acc += w[c * k + j] * buf[j];
+            // shift history
+            if (hist > 0) {
+                var j: usize = 0;
+                while (j + 1 < hist) : (j += 1) buf[j] = buf[j + 1];
+                buf[hist - 1] = cur;
+            }
+            // SiLU: x * sigmoid(x)
+            const sig: f32 = 1.0 / (1.0 + @exp(-acc));
+            y[t * channels + c] = acc * sig;
+        }
+        if (state) |st| {
+            if (hist > 0) {
+                for (0..hist) |j| st[c * hist + j] = buf[j];
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SiTU-GLU
 // ---------------------------------------------------------------------------
 
