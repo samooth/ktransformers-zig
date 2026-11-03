@@ -39,6 +39,8 @@ const deepseekv3_model = root.deepseekv3_model;
 const kimi_k3_config = root.kimi_k3_config;
 const kimi_k3_kda_bf16 = root.kimi_k3_kda_bf16;
 const kimi_k3_mla_bf16 = root.kimi_k3_mla_bf16;
+const kimi_k3_layer_bf16 = root.kimi_k3_layer_bf16;
+const kimi_k3_ops = root.kimi_k3_ops;
 const qwen3_layer = root.qwen3_layer;
 const qwen3_model = root.qwen3_model;
 
@@ -299,6 +301,8 @@ pub const KT_MLA = opaque {};
 pub const KT_DSV3Layer = opaque {};
 pub const KT_KimiKdaLayer = opaque {};
 pub const KT_KimiMlaLayer = opaque {};
+pub const KT_KimiLayer = opaque {};
+pub const KT_KimiModel = opaque {};
 pub const KT_Gate = opaque {};
 pub const KT_Linear = opaque {};
 pub const KT_MLP = opaque {};
@@ -1684,6 +1688,284 @@ pub export fn kt_kimi_mla_layer_forward(
 pub export fn kt_kimi_mla_layer_free(layer: *KT_KimiMlaLayer) void {
     const l: *KimiMlaBf16Layer = @ptrCast(@alignCast(layer));
     l.allocator.destroy(l);
+}
+
+// ============================================================================
+// Kimi K3 unified layer + model (BF16) — Zig extension
+// ============================================================================
+
+pub const kt_kimi_layer_config_t = extern struct {
+    is_mla: c_int,
+    hidden: usize,
+    rms_eps: f32,
+    kda_heads: usize,
+    kda_head_dim: usize,
+    conv_k: usize,
+    gate_lb: f32,
+    kda_q: *const anyopaque,
+    kda_k: *const anyopaque,
+    kda_v: *const anyopaque,
+    kda_g: *const anyopaque,
+    kda_b: *const anyopaque,
+    kda_f_a: *const anyopaque,
+    kda_f_b: *const anyopaque,
+    kda_o: *const anyopaque,
+    kda_q_conv: *const f32,
+    kda_k_conv: *const f32,
+    kda_v_conv: *const f32,
+    kda_A_log: *const f32,
+    kda_dt_bias: *const f32,
+    kda_o_norm: *const f32,
+    n_heads: usize,
+    q_lora: usize,
+    kv_lora: usize,
+    qk_nope: usize,
+    qk_rope: usize,
+    v_head: usize,
+    mla_q_a: *const anyopaque,
+    mla_q_b: *const anyopaque,
+    mla_kv_a: *const anyopaque,
+    mla_kv_b: *const anyopaque,
+    mla_o: *const anyopaque,
+    mla_g: ?*const anyopaque,
+    mla_q_a_norm: *const f32,
+    mla_kv_a_norm: *const f32,
+    in_norm: *const f32,
+    post_norm: *const f32,
+    attn_res_norm: *const f32,
+    attn_res_proj: *const f32,
+    mlp_res_norm: *const f32,
+    mlp_res_proj: *const f32,
+    is_dense: c_int,
+    dense_inter: usize,
+    dense_gate: *const anyopaque,
+    dense_up: *const anyopaque,
+    dense_down: *const anyopaque,
+};
+
+pub const kt_kimi_model_config_t = extern struct {
+    num_layers: usize,
+    hidden: usize,
+    attn_res_block: usize,
+    rms_eps: f32,
+    layers: *const kt_kimi_layer_config_t,
+    final_norm: *const f32,
+};
+
+const KimiLayerHandle = struct {
+    weights: kimi_k3_layer_bf16.KimiLayerBf16Weights,
+    config: kimi_k3_config.KimiK3Config,
+    allocator: std.mem.Allocator,
+};
+
+fn toKimiLayerWeights(c: kt_kimi_layer_config_t, alloc: std.mem.Allocator) kimi_k3_layer_bf16.KimiLayerBf16Weights {
+    _ = alloc;
+    const is_mla = c.is_mla != 0;
+    var kda_w: ?kimi_k3_kda_bf16.KdaBf16Weights = null;
+    var mla_w: ?kimi_k3_mla_bf16.MlaBf16Weights = null;
+    if (!is_mla) {
+        kda_w = .{
+            .q = @ptrCast(@alignCast(c.kda_q)),
+            .k = @ptrCast(@alignCast(c.kda_k)),
+            .v = @ptrCast(@alignCast(c.kda_v)),
+            .g = @ptrCast(@alignCast(c.kda_g)),
+            .b = @ptrCast(@alignCast(c.kda_b)),
+            .f_a = @ptrCast(@alignCast(c.kda_f_a)),
+            .f_b = @ptrCast(@alignCast(c.kda_f_b)),
+            .o = @ptrCast(@alignCast(c.kda_o)),
+            .q_conv = @ptrCast(c.kda_q_conv),
+            .k_conv = @ptrCast(c.kda_k_conv),
+            .v_conv = @ptrCast(c.kda_v_conv),
+            .A_log = @ptrCast(c.kda_A_log),
+            .dt_bias = @ptrCast(c.kda_dt_bias),
+            .o_norm = @ptrCast(c.kda_o_norm),
+        };
+    } else {
+        mla_w = .{
+            .q_a = @ptrCast(@alignCast(c.mla_q_a)),
+            .q_a_norm = @ptrCast(c.mla_q_a_norm),
+            .q_b = @ptrCast(@alignCast(c.mla_q_b)),
+            .kv_a = @ptrCast(@alignCast(c.mla_kv_a)),
+            .kv_a_norm = @ptrCast(c.mla_kv_a_norm),
+            .kv_b = @ptrCast(@alignCast(c.mla_kv_b)),
+            .o = @ptrCast(@alignCast(c.mla_o)),
+            .g = if (c.mla_g) |p| @ptrCast(@alignCast(p)) else null,
+        };
+    }
+    const Hid = c.hidden;
+    const dense_inter: usize = if (c.is_dense != 0) c.dense_inter else 0;
+    return .{
+        .in_norm = @as([*]const f32, @ptrCast(c.in_norm))[0..Hid],
+        .post_norm = @as([*]const f32, @ptrCast(c.post_norm))[0..Hid],
+        .attn_res_norm = @as([*]const f32, @ptrCast(c.attn_res_norm))[0..Hid],
+        .attn_res_proj = @as([*]const f32, @ptrCast(c.attn_res_proj))[0..Hid],
+        .mlp_res_norm = @as([*]const f32, @ptrCast(c.mlp_res_norm))[0..Hid],
+        .mlp_res_proj = @as([*]const f32, @ptrCast(c.mlp_res_proj))[0..Hid],
+        .is_mla = is_mla,
+        .kda = kda_w,
+        .mla = mla_w,
+        .is_dense = c.is_dense != 0,
+        .dense_inter = dense_inter,
+        .dense_gate = if (c.is_dense != 0) @as([*]const f32, @ptrCast(@alignCast(c.dense_gate)))[0..(dense_inter * Hid)] else @as([*]const f32, @ptrCast(@alignCast(c.dense_gate)))[0..(dense_inter * Hid)],
+        .dense_up = if (c.is_dense != 0) @as([*]const f32, @ptrCast(@alignCast(c.dense_up)))[0..(dense_inter * Hid)] else @as([*]const f32, @ptrCast(@alignCast(c.dense_up)))[0..(dense_inter * Hid)],
+        .dense_down = if (c.is_dense != 0) @as([*]const f32, @ptrCast(@alignCast(c.dense_down)))[0..(Hid * dense_inter)] else @as([*]const f32, @ptrCast(@alignCast(c.dense_down)))[0..(Hid * dense_inter)],
+        .moe = null,
+        .moe_cfg = std.mem.zeroes(kimi_k3_ops.LatentMoeCfg),
+    };
+}
+
+const KimiModelHandle = struct {
+    cfg: kimi_k3_config.KimiK3Config,
+    hidden: usize,
+    attn_res_block: usize,
+    layers: []KimiLayerHandle,
+    final_norm: []const f32,
+    allocator: std.mem.Allocator,
+};
+
+pub export fn kt_kimi_layer_new(config: *const kt_kimi_layer_config_t) *KT_KimiLayer {
+    const allocator = defaultAllocator();
+    const h = allocator.create(KimiLayerHandle) catch @panic("OOM");
+    var cfg = std.mem.zeroes(kimi_k3_config.KimiK3Config);
+    cfg.hidden = config.hidden;
+    cfg.n_layers = 1;
+    cfg.attn_res_block = 1;
+    cfg.rms_eps = config.rms_eps;
+    cfg.kda_heads = config.kda_heads;
+    cfg.kda_head_dim = config.kda_head_dim;
+    cfg.conv_k = config.conv_k;
+    cfg.gate_lb = config.gate_lb;
+    cfg.n_heads = config.n_heads;
+    cfg.q_lora = config.q_lora;
+    cfg.kv_lora = config.kv_lora;
+    cfg.qk_nope = config.qk_nope;
+    cfg.qk_rope = config.qk_rope;
+    cfg.v_head = config.v_head;
+    cfg.situ_b1 = 4.0;
+    cfg.situ_b2 = 25.0;
+    cfg.first_dense = if (config.is_dense != 0) 1 else 0;
+    cfg.dense_inter = config.dense_inter;
+    h.* = .{
+        .weights = toKimiLayerWeights(config.*, allocator),
+        .config = cfg,
+        .allocator = allocator,
+    };
+    return @ptrCast(h);
+}
+
+pub export fn kt_kimi_layer_free(layer: *KT_KimiLayer) void {
+    const h: *KimiLayerHandle = @ptrCast(@alignCast(layer));
+    h.allocator.destroy(h);
+}
+
+pub export fn kt_kimi_layer_forward(
+    layer: *KT_KimiLayer,
+    qlen: usize,
+    input: [*]const f32,
+    output: [*]f32,
+    block_residual: [*]f32,
+    n_blocks: *usize,
+    layer_idx: usize,
+    attn_res_block: usize,
+    n_layers: usize,
+) void {
+    const h: *KimiLayerHandle = @ptrCast(@alignCast(layer));
+    const E = h.weights.in_norm.len;
+    const n = qlen * E;
+    @memcpy(output[0..n], input[0..n]);
+    const maxb = n_layers / attn_res_block + 2;
+    kimi_k3_layer_bf16.layerForward(output[0..n], block_residual[0 .. qlen * maxb * E], n_blocks, &h.weights, &h.config, layer_idx, qlen);
+}
+
+pub export fn kt_kimi_model_new(config: *const kt_kimi_model_config_t) *KT_KimiModel {
+    const allocator = defaultAllocator();
+    const m = allocator.create(KimiModelHandle) catch @panic("OOM");
+    var cfg = std.mem.zeroes(kimi_k3_config.KimiK3Config);
+    cfg.hidden = config.hidden;
+    cfg.n_layers = config.num_layers;
+    cfg.attn_res_block = config.attn_res_block;
+    cfg.rms_eps = config.rms_eps;
+    const layers = allocator.alloc(KimiLayerHandle, config.num_layers) catch @panic("OOM");
+    const layer_configs = @as([*]const kt_kimi_layer_config_t, @ptrCast(config.layers));
+    for (0..config.num_layers) |i| {
+        layers[i] = .{
+            .weights = toKimiLayerWeights(layer_configs[i], allocator),
+            .config = blk: {
+                var c = std.mem.zeroes(kimi_k3_config.KimiK3Config);
+                c.hidden = config.hidden;
+                c.n_layers = config.num_layers;
+                c.attn_res_block = config.attn_res_block;
+                c.rms_eps = config.rms_eps;
+                c.kda_heads = layer_configs[i].kda_heads;
+                c.kda_head_dim = layer_configs[i].kda_head_dim;
+                c.conv_k = layer_configs[i].conv_k;
+                c.gate_lb = layer_configs[i].gate_lb;
+                c.n_heads = layer_configs[i].n_heads;
+                c.q_lora = layer_configs[i].q_lora;
+                c.kv_lora = layer_configs[i].kv_lora;
+                c.qk_nope = layer_configs[i].qk_nope;
+                c.qk_rope = layer_configs[i].qk_rope;
+                c.v_head = layer_configs[i].v_head;
+                c.situ_b1 = 4.0;
+                c.situ_b2 = 25.0;
+                c.first_dense = if (layer_configs[i].is_dense != 0) 1 else 0;
+                c.dense_inter = layer_configs[i].dense_inter;
+                break :blk c;
+            },
+            .allocator = allocator,
+        };
+    }
+    m.* = .{
+        .cfg = cfg,
+        .hidden = config.hidden,
+        .attn_res_block = config.attn_res_block,
+        .layers = layers,
+        .final_norm = @as([*]const f32, @ptrCast(config.final_norm))[0..config.hidden],
+        .allocator = allocator,
+    };
+    return @ptrCast(m);
+}
+
+pub export fn kt_kimi_model_forward(
+    model: *KT_KimiModel,
+    qlen: usize,
+    input: [*]const f32,
+    output: [*]f32,
+) void {
+    const m: *KimiModelHandle = @ptrCast(@alignCast(model));
+    const E = m.hidden;
+    const maxb = m.layers.len / m.attn_res_block + 2;
+    const n = qlen * E;
+    const block_residual = m.allocator.alloc(f32, qlen * maxb * E) catch return;
+    defer m.allocator.free(block_residual);
+    for (block_residual) |*b| b.* = 0.0;
+    const curbuf = m.allocator.alloc(f32, n) catch return;
+    defer m.allocator.free(curbuf);
+    @memcpy(curbuf, input[0..n]);
+    var nb: usize = 0;
+    for (0..m.layers.len) |li| {
+        const dst = m.allocator.alloc(f32, n) catch return;
+        defer m.allocator.free(dst);
+        @memcpy(dst, curbuf);
+        const maxb2 = m.layers.len / m.attn_res_block + 2;
+        kimi_k3_layer_bf16.layerForward(dst, block_residual[0 .. qlen * maxb2 * E], &nb, &m.layers[li].weights, &m.layers[li].config, li, qlen);
+        @memcpy(curbuf, dst);
+    }
+    for (0..qlen) |t| {
+        var ss: f64 = 0.0;
+        for (0..E) |i| {
+            const v = curbuf[t * E + i];
+            ss += @as(f64, v) * @as(f64, v);
+        }
+        const inv: f32 = 1.0 / @sqrt(@as(f32, @floatCast(ss / @as(f64, @floatFromInt(E)))) + m.cfg.rms_eps);
+        for (0..E) |i| output[t * E + i] = m.final_norm[i] * curbuf[t * E + i] * inv;
+    }
+}
+
+pub export fn kt_kimi_model_free(model: *KT_KimiModel) void {
+    const m: *KimiModelHandle = @ptrCast(@alignCast(model));
+    m.allocator.free(m.layers);
+    m.allocator.destroy(m);
 }
 
 // ============================================================================

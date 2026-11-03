@@ -919,4 +919,87 @@ void kt_kimi_mla_layer_free(KT_KimiMlaLayer* layer);
 void kt_kimi_mla_layer_forward(KT_KimiMlaLayer* layer, size_t qlen,
                                const float* input, float* output);
 
+// --- Kimi K3 full layer (KDA or MLA, BF16) -----------------------------------
+typedef struct KT_KimiLayer KT_KimiLayer;
+
+typedef struct {
+    /* 0 = KDA, 1 = MLA */
+    int is_mla;
+    /* shared */
+    size_t hidden;
+    float rms_eps;
+    /* KDA fields (used when is_mla==0) */
+    size_t kda_heads;
+    size_t kda_head_dim;
+    size_t conv_k;
+    float gate_lb;
+    const void* kda_q;
+    const void* kda_k;
+    const void* kda_v;
+    const void* kda_g;
+    const void* kda_b;
+    const void* kda_f_a;
+    const void* kda_f_b;
+    const void* kda_o;
+    const float* kda_q_conv;
+    const float* kda_k_conv;
+    const float* kda_v_conv;
+    const float* kda_A_log;
+    const float* kda_dt_bias;
+    const float* kda_o_norm;
+    /* MLA fields (used when is_mla==1) */
+    size_t n_heads;
+    size_t q_lora;
+    size_t kv_lora;
+    size_t qk_nope;
+    size_t qk_rope;
+    size_t v_head;
+    const void* mla_q_a;
+    const void* mla_q_b;
+    const void* mla_kv_a;
+    const void* mla_kv_b;
+    const void* mla_o;
+    const void* mla_g;
+    const float* mla_q_a_norm;
+    const float* mla_kv_a_norm;
+    /* AttnRes + norms (shared) */
+    const float* in_norm;
+    const float* post_norm;
+    const float* attn_res_norm;
+    const float* attn_res_proj;
+    const float* mlp_res_norm;
+    const float* mlp_res_proj;
+    /* dense MLP (when not MoE) */
+    int is_dense;
+    size_t dense_inter;
+    const void* dense_gate;
+    const void* dense_up;
+    const void* dense_down;
+} kt_kimi_layer_config_t;
+
+KT_KimiLayer* kt_kimi_layer_new(const kt_kimi_layer_config_t* config);
+void kt_kimi_layer_free(KT_KimiLayer* layer);
+void kt_kimi_layer_forward(KT_KimiLayer* layer, size_t qlen,
+                          const float* input, float* output,
+                          float* block_residual, size_t* n_blocks,
+                          int layer_idx, size_t attn_res_block,
+                          size_t n_layers);
+
+// --- Kimi K3 model (BF16) ----------------------------------------------------
+typedef struct KT_KimiModel KT_KimiModel;
+
+typedef struct {
+    size_t num_layers;
+    size_t hidden;
+    size_t attn_res_block;
+    /* array of layer configs (caller-owned, length num_layers) */
+    const kt_kimi_layer_config_t* layers;
+    const float* final_norm;
+} kt_kimi_model_config_t;
+
+KT_KimiModel* kt_kimi_model_new(const kt_kimi_model_config_t* config);
+void kt_kimi_model_free(KT_KimiModel* model);
+void kt_kimi_model_forward(KT_KimiModel* model, size_t qlen,
+                          const float* input, float* output);
+
 #endif // KTRANSFORMERS_C_API_H
