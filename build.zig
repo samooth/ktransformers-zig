@@ -179,6 +179,8 @@ pub fn build(b: *std.Build) void {
     // Suite 7b: GGUF E2E — real on-disk model round-trip
     // (Qwen3.5-0.8B-BF16.gguf; mmap'd, not loaded fully).
     RunTest.run(b, test_step, "tests/kernels/qwen3_gguf_e2e_tests.zig", "src/root.zig", target, optimize);
+    // Suite 7c: Kimi K3 CPU ops (Phase 1)
+    RunTest.run(b, test_step, "tests/kimi/kimi_k3_ops_test.zig", "src/root.zig", target, optimize);
     // Suite 8: NUMA auto-population in kt_worker_pool_new_config (A3 closure)
     RunTest.run(b, test_step, "tests/kernels/numa_pool_tests.zig", "src/main.zig", target, optimize);
     // Suite 5b: custom allocator injection C API (B1)

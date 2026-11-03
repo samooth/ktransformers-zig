@@ -284,6 +284,15 @@ comptime {
     _ = &deepseekv3_model.DeepseekV3ForCausalLM.deinit;
 }
 
+// Force analysis of the Kimi K3 model orchestration module.
+comptime {
+    _ = &kimi_k3_model.kdaLayerFull;
+    _ = &kimi_k3_model.mlaLayerFull;
+    _ = &kimi_k3_model.layerForward;
+    _ = &kimi_k3_model.forward;
+    _ = &kimi_k3_model.ModelWeights;
+}
+
 // Force analysis of the Qwen3 MoE orchestration (MHA engine + decoder
 // layer + model + CausalLM). Same lazy-analysis rule as MLA / DSV3.
 pub const mha = @import("kernels/attn/mha.zig");
@@ -336,3 +345,5 @@ comptime {
     _ = &gemm_bf16_neon.GemmExpertBF16NEON.reduceAdd;
 }
 pub const kimi_k3_config = @import("kimi/kimi_k3_config.zig");
+pub const kimi_k3_ops = @import("kimi/kimi_k3_ops.zig");
+pub const kimi_k3_model = @import("kernels/moe/kimi_k3_model.zig");
