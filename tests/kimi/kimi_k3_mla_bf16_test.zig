@@ -66,10 +66,10 @@ test "mla bf16 layer smoke" {
 
     var w = mla.MlaBf16Weights{
         .q_a = mkBf16(cfg.q_lora * E).ptr,
-        .q_a_norm = mkF32(cfg.q_lora, 1.0),
+        .q_a_norm = mkF32(cfg.q_lora, 1.0).ptr,
         .q_b = mkBf16(H * qh * cfg.q_lora).ptr,
         .kv_a = mkBf16(kvw * E).ptr,
-        .kv_a_norm = mkF32(kv_lora, 1.0),
+        .kv_a_norm = mkF32(kv_lora, 1.0).ptr,
         .kv_b = mkBf16(H * (qn + vh) * kv_lora).ptr,
         .o = mkBf16(E * H * vh).ptr,
         .g = mkBf16(H * vh * E).ptr,

@@ -38,6 +38,7 @@ const deepseekv3_layer = root.deepseekv3_layer;
 const deepseekv3_model = root.deepseekv3_model;
 const kimi_k3_config = root.kimi_k3_config;
 const kimi_k3_kda_bf16 = root.kimi_k3_kda_bf16;
+const kimi_k3_mla_bf16 = root.kimi_k3_mla_bf16;
 const qwen3_layer = root.qwen3_layer;
 const qwen3_model = root.qwen3_model;
 
@@ -297,6 +298,7 @@ pub const KT_MOE = opaque {};
 pub const KT_MLA = opaque {};
 pub const KT_DSV3Layer = opaque {};
 pub const KT_KimiKdaLayer = opaque {};
+pub const KT_KimiMlaLayer = opaque {};
 pub const KT_Gate = opaque {};
 pub const KT_Linear = opaque {};
 pub const KT_MLP = opaque {};
@@ -1598,6 +1600,89 @@ pub export fn kt_kimi_kda_layer_forward(
 
 pub export fn kt_kimi_kda_layer_free(layer: *KT_KimiKdaLayer) void {
     const l: *KimiKdaBf16Layer = @ptrCast(@alignCast(layer));
+    l.allocator.destroy(l);
+}
+
+// ============================================================================
+// Kimi K3 MLA layer (BF16) — Zig extension
+// ============================================================================
+
+pub const kt_kimi_mla_layer_config_t = extern struct {
+    hidden: usize,
+    n_heads: usize,
+    q_lora: usize,
+    kv_lora: usize,
+    qk_nope: usize,
+    qk_rope: usize,
+    v_head: usize,
+    rms_eps: f32,
+    q_a: *const anyopaque,
+    q_b: *const anyopaque,
+    kv_a: *const anyopaque,
+    kv_b: *const anyopaque,
+    o: *const anyopaque,
+    g: ?*const anyopaque,
+    q_a_norm: *const f32,
+    kv_a_norm: *const f32,
+};
+
+const KimiMlaBf16Layer = struct {
+    config: kimi_k3_config.KimiK3Config,
+    weights: kimi_k3_mla_bf16.MlaBf16Weights,
+    allocator: std.mem.Allocator,
+};
+
+fn toKimiMlaConfig(c: kt_kimi_mla_layer_config_t) kimi_k3_config.KimiK3Config {
+    var cfg = std.mem.zeroes(kimi_k3_config.KimiK3Config);
+    cfg.hidden = c.hidden;
+    cfg.n_heads = c.n_heads;
+    cfg.q_lora = c.q_lora;
+    cfg.kv_lora = c.kv_lora;
+    cfg.qk_nope = c.qk_nope;
+    cfg.qk_rope = c.qk_rope;
+    cfg.v_head = c.v_head;
+    cfg.rms_eps = c.rms_eps;
+    return cfg;
+}
+
+fn toKimiMlaWeights(c: kt_kimi_mla_layer_config_t, alloc: std.mem.Allocator) kimi_k3_mla_bf16.MlaBf16Weights {
+    _ = alloc;
+    return .{
+        .q_a = @ptrCast(@alignCast(c.q_a)),
+        .q_a_norm = @ptrCast(c.q_a_norm),
+        .q_b = @ptrCast(@alignCast(c.q_b)),
+        .kv_a = @ptrCast(@alignCast(c.kv_a)),
+        .kv_a_norm = @ptrCast(c.kv_a_norm),
+        .kv_b = @ptrCast(@alignCast(c.kv_b)),
+        .o = @ptrCast(@alignCast(c.o)),
+        .g = if (c.g) |p| @ptrCast(@alignCast(p)) else null,
+    };
+}
+
+pub export fn kt_kimi_mla_layer_new(config: *const kt_kimi_mla_layer_config_t) *KT_KimiMlaLayer {
+    const allocator = defaultAllocator();
+    const layer = allocator.create(KimiMlaBf16Layer) catch @panic("OOM");
+    layer.* = .{
+        .config = toKimiMlaConfig(config.*),
+        .weights = toKimiMlaWeights(config.*, allocator),
+        .allocator = allocator,
+    };
+    return @ptrCast(layer);
+}
+
+pub export fn kt_kimi_mla_layer_forward(
+    layer: *KT_KimiMlaLayer,
+    qlen: usize,
+    input: [*]const f32,
+    output: [*]f32,
+) void {
+    const l: *KimiMlaBf16Layer = @ptrCast(@alignCast(layer));
+    const n = qlen * l.config.hidden;
+    kimi_k3_mla_bf16.mlaLayerFullBf16(output[0..n], input[0..n], &l.weights, &l.config, qlen);
+}
+
+pub export fn kt_kimi_mla_layer_free(layer: *KT_KimiMlaLayer) void {
+    const l: *KimiMlaBf16Layer = @ptrCast(@alignCast(layer));
     l.allocator.destroy(l);
 }
 

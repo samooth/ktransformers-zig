@@ -889,4 +889,34 @@ void kt_kimi_kda_layer_free(KT_KimiKdaLayer* layer);
 void kt_kimi_kda_layer_forward(KT_KimiKdaLayer* layer, size_t qlen,
                                const float* input, float* output);
 
+// --- Kimi K3 MLA layer (BF16) -----------------------------------------------
+typedef struct KT_KimiMlaLayer KT_KimiMlaLayer;
+
+typedef struct {
+    size_t hidden;
+    size_t n_heads;
+    size_t q_lora;
+    size_t kv_lora;
+    size_t qk_nope;
+    size_t qk_rope;
+    size_t v_head;
+    float rms_eps;
+    /* BF16 weight pointers (caller-owned) */
+    const void* q_a;
+    const void* q_b;
+    const void* kv_a;
+    const void* kv_b;
+    const void* o;
+    const void* g; /* may be NULL */
+    /* F32 elementwise (caller-owned) */
+    const float* q_a_norm;
+    const float* kv_a_norm;
+} kt_kimi_mla_layer_config_t;
+
+KT_KimiMlaLayer* kt_kimi_mla_layer_new(const kt_kimi_mla_layer_config_t* config);
+void kt_kimi_mla_layer_free(KT_KimiMlaLayer* layer);
+/* input/output are F32 [qlen, hidden]. */
+void kt_kimi_mla_layer_forward(KT_KimiMlaLayer* layer, size_t qlen,
+                               const float* input, float* output);
+
 #endif // KTRANSFORMERS_C_API_H
