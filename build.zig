@@ -181,6 +181,8 @@ pub fn build(b: *std.Build) void {
     RunTest.run(b, test_step, "tests/kernels/qwen3_gguf_e2e_tests.zig", "src/root.zig", target, optimize);
     // Suite 7c: Kimi K3 CPU ops (Phase 1)
     RunTest.run(b, test_step, "tests/kimi/kimi_k3_ops_test.zig", "src/root.zig", target, optimize);
+    // Suite 7d: Kimi K3 BF16 KDA layer smoke
+    RunTest.run(b, test_step, "tests/kimi/kimi_k3_kda_bf16_test.zig", "src/root.zig", target, optimize);
     // Suite 8: NUMA auto-population in kt_worker_pool_new_config (A3 closure)
     RunTest.run(b, test_step, "tests/kernels/numa_pool_tests.zig", "src/main.zig", target, optimize);
     // Suite 5b: custom allocator injection C API (B1)

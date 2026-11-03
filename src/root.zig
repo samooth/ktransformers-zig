@@ -293,6 +293,12 @@ comptime {
     _ = &kimi_k3_model.ModelWeights;
 }
 
+// Force analysis of the Kimi K3 BF16 KDA layer.
+comptime {
+    _ = &kimi_k3_kda_bf16.kdaLayerFullBf16;
+    _ = &kimi_k3_kda_bf16.KdaBf16Weights;
+}
+
 // Force analysis of the Qwen3 MoE orchestration (MHA engine + decoder
 // layer + model + CausalLM). Same lazy-analysis rule as MLA / DSV3.
 pub const mha = @import("kernels/attn/mha.zig");
@@ -347,3 +353,4 @@ comptime {
 pub const kimi_k3_config = @import("kimi/kimi_k3_config.zig");
 pub const kimi_k3_ops = @import("kimi/kimi_k3_ops.zig");
 pub const kimi_k3_model = @import("kernels/moe/kimi_k3_model.zig");
+pub const kimi_k3_kda_bf16 = @import("kernels/moe/kimi_k3_kda_bf16.zig");
