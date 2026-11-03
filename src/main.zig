@@ -36,6 +36,8 @@ const mla_core = root.mla_core;
 // root re-exports it from kernels/moe/deepseekv3_layer.zig).
 const deepseekv3_layer = root.deepseekv3_layer;
 const deepseekv3_model = root.deepseekv3_model;
+const kimi_k3_config = root.kimi_k3_config;
+const kimi_k3_kda_bf16 = root.kimi_k3_kda_bf16;
 const qwen3_layer = root.qwen3_layer;
 const qwen3_model = root.qwen3_model;
 
@@ -294,6 +296,7 @@ pub const KT_WorkerPool = opaque {};
 pub const KT_MOE = opaque {};
 pub const KT_MLA = opaque {};
 pub const KT_DSV3Layer = opaque {};
+pub const KT_KimiKdaLayer = opaque {};
 pub const KT_Gate = opaque {};
 pub const KT_Linear = opaque {};
 pub const KT_MLP = opaque {};
@@ -1505,6 +1508,97 @@ pub export fn kt_dsv3_layer_forward(
 pub export fn kt_dsv3_layer_free(layer: *KT_DSV3Layer) void {
     const l: *deepseekv3_layer.DeepseekV3DecoderLayer = @ptrCast(@alignCast(layer));
     l.deinit();
+}
+
+// ============================================================================
+// Kimi K3 KDA layer (BF16) — Zig extension
+// ============================================================================
+
+pub const kt_kimi_kda_layer_config_t = extern struct {
+    hidden: usize,
+    kda_heads: usize,
+    kda_head_dim: usize,
+    conv_k: usize,
+    gate_lb: f32,
+    rms_eps: f32,
+    q: *const anyopaque,
+    k: *const anyopaque,
+    v: *const anyopaque,
+    g: *const anyopaque,
+    b: *const anyopaque,
+    f_a: *const anyopaque,
+    f_b: *const anyopaque,
+    o: *const anyopaque,
+    q_conv: *const f32,
+    k_conv: *const f32,
+    v_conv: *const f32,
+    A_log: *const f32,
+    dt_bias: *const f32,
+    o_norm: *const f32,
+};
+
+const KimiKdaBf16Layer = struct {
+    config: kimi_k3_config.KimiK3Config,
+    weights: kimi_k3_kda_bf16.KdaBf16Weights,
+    allocator: std.mem.Allocator,
+};
+
+fn toKimiKdaConfig(c: kt_kimi_kda_layer_config_t) kimi_k3_config.KimiK3Config {
+    var cfg = std.mem.zeroes(kimi_k3_config.KimiK3Config);
+    cfg.hidden = c.hidden;
+    cfg.kda_heads = c.kda_heads;
+    cfg.kda_head_dim = c.kda_head_dim;
+    cfg.conv_k = c.conv_k;
+    cfg.gate_lb = c.gate_lb;
+    cfg.rms_eps = c.rms_eps;
+    return cfg;
+}
+
+fn toKimiKdaWeights(c: kt_kimi_kda_layer_config_t, alloc: std.mem.Allocator) kimi_k3_kda_bf16.KdaBf16Weights {
+    _ = alloc;
+    return .{
+        .q = @ptrCast(@alignCast(c.q)),
+        .k = @ptrCast(@alignCast(c.k)),
+        .v = @ptrCast(@alignCast(c.v)),
+        .g = @ptrCast(@alignCast(c.g)),
+        .b = @ptrCast(@alignCast(c.b)),
+        .f_a = @ptrCast(@alignCast(c.f_a)),
+        .f_b = @ptrCast(@alignCast(c.f_b)),
+        .o = @ptrCast(@alignCast(c.o)),
+        .q_conv = @ptrCast(c.q_conv),
+        .k_conv = @ptrCast(c.k_conv),
+        .v_conv = @ptrCast(c.v_conv),
+        .A_log = @ptrCast(c.A_log),
+        .dt_bias = @ptrCast(c.dt_bias),
+        .o_norm = @ptrCast(c.o_norm),
+    };
+}
+
+pub export fn kt_kimi_kda_layer_new(config: *const kt_kimi_kda_layer_config_t) *KT_KimiKdaLayer {
+    const allocator = defaultAllocator();
+    const layer = allocator.create(KimiKdaBf16Layer) catch @panic("OOM");
+    layer.* = .{
+        .config = toKimiKdaConfig(config.*),
+        .weights = toKimiKdaWeights(config.*, allocator),
+        .allocator = allocator,
+    };
+    return @ptrCast(layer);
+}
+
+pub export fn kt_kimi_kda_layer_forward(
+    layer: *KT_KimiKdaLayer,
+    qlen: usize,
+    input: [*]const f32,
+    output: [*]f32,
+) void {
+    const l: *KimiKdaBf16Layer = @ptrCast(@alignCast(layer));
+    const n = qlen * l.config.hidden;
+    kimi_k3_kda_bf16.kdaLayerFullBf16(output[0..n], input[0..n], &l.weights, &l.config, qlen);
+}
+
+pub export fn kt_kimi_kda_layer_free(layer: *KT_KimiKdaLayer) void {
+    const l: *KimiKdaBf16Layer = @ptrCast(@alignCast(layer));
+    l.allocator.destroy(l);
 }
 
 // ============================================================================

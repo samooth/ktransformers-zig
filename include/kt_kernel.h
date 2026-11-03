@@ -855,4 +855,38 @@ void kt_llama_moe_load_weights(KT_LlamaMoe* moe, int complete_intermediate_size,
 void kt_llama_moe_forward(KT_LlamaMoe* moe, int qlen, int k, const int64_t* expert_ids,
                          const float* weights, const void* input, void* output);
 
+// --- Kimi K3 KDA layer (BF16) -----------------------------------------------
+typedef struct KT_KimiKdaLayer KT_KimiKdaLayer;
+
+typedef struct {
+    size_t hidden;
+    size_t kda_heads;
+    size_t kda_head_dim;
+    size_t conv_k;
+    float gate_lb;
+    float rms_eps;
+    /* BF16 weight pointers (caller-owned) */
+    const void* q;
+    const void* k;
+    const void* v;
+    const void* g;
+    const void* b;
+    const void* f_a;
+    const void* f_b;
+    const void* o;
+    /* F32 elementwise (caller-owned) */
+    const float* q_conv;
+    const float* k_conv;
+    const float* v_conv;
+    const float* A_log;
+    const float* dt_bias;
+    const float* o_norm;
+} kt_kimi_kda_layer_config_t;
+
+KT_KimiKdaLayer* kt_kimi_kda_layer_new(const kt_kimi_kda_layer_config_t* config);
+void kt_kimi_kda_layer_free(KT_KimiKdaLayer* layer);
+/* input/output are F32 [qlen, hidden]. */
+void kt_kimi_kda_layer_forward(KT_KimiKdaLayer* layer, size_t qlen,
+                               const float* input, float* output);
+
 #endif // KTRANSFORMERS_C_API_H
