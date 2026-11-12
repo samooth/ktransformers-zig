@@ -65,19 +65,37 @@ test "kda bf16 layer smoke" {
         .f_a = mkBf16(D * E).ptr,
         .f_b = mkBf16(P * D).ptr,
         .o = mkBf16(E * P).ptr,
-        .q_conv = allocator.alloc(f32, P * K) catch unreachable,
-        .k_conv = allocator.alloc(f32, P * K) catch unreachable,
-        .v_conv = allocator.alloc(f32, P * K) catch unreachable,
-        .A_log = allocator.alloc(f32, H) catch unreachable,
-        .dt_bias = allocator.alloc(f32, P) catch unreachable,
-        .o_norm = allocator.alloc(f32, D) catch unreachable,
+        .q_conv = (blk: {
+            const s = allocator.alloc(f32, P * K) catch unreachable;
+            for (s) |*v| v.* = 0.1;
+            break :blk s.ptr;
+        }),
+        .k_conv = (blk: {
+            const s = allocator.alloc(f32, P * K) catch unreachable;
+            for (s) |*v| v.* = 0.1;
+            break :blk s.ptr;
+        }),
+        .v_conv = (blk: {
+            const s = allocator.alloc(f32, P * K) catch unreachable;
+            for (s) |*v| v.* = 0.1;
+            break :blk s.ptr;
+        }),
+        .A_log = (blk: {
+            const s = allocator.alloc(f32, H) catch unreachable;
+            for (s) |*v| v.* = 0.0;
+            break :blk s.ptr;
+        }),
+        .dt_bias = (blk: {
+            const s = allocator.alloc(f32, P) catch unreachable;
+            for (s) |*v| v.* = 0.0;
+            break :blk s.ptr;
+        }),
+        .o_norm = (blk: {
+            const s = allocator.alloc(f32, D) catch unreachable;
+            for (s) |*v| v.* = 1.0;
+            break :blk s.ptr;
+        }),
     };
-    for (w.q_conv) |*v| v.* = 0.1;
-    for (w.k_conv) |*v| v.* = 0.1;
-    for (w.v_conv) |*v| v.* = 0.1;
-    for (w.A_log) |*v| v.* = 0.0;
-    for (w.dt_bias) |*v| v.* = 0.0;
-    for (w.o_norm) |*v| v.* = 1.0;
 
     const T: usize = 2;
     const x = allocator.alloc(f32, T * E) catch unreachable;

@@ -85,3 +85,119 @@ pub const KimiModelBf16 = struct {
         }
     }
 };
+// ---------------------------------------------------------------------------
+// Incremental decode state (Fase 3)
+// ---------------------------------------------------------------------------
+
+pub const ModelState = struct {
+    allocator: std.mem.Allocator,
+    layers: []layermod.LayerState,
+    n_blocks: usize,
+    block_residual: []f32,
+    maxb: usize,
+    E: usize,
+
+    pub fn deinit(self: *ModelState) void {
+        for (self.layers) |*ls| {
+            if (ls.kda) |kd| {
+                self.allocator.free(kd.S);
+                self.allocator.free(kd.conv);
+            }
+            if (ls.mla) |ml| {
+                self.allocator.free(ml.kv);
+                self.allocator.free(ml.rope);
+            }
+        }
+        self.allocator.free(self.layers);
+        self.allocator.free(self.block_residual);
+    }
+};
+
+pub fn initModelState(
+    model: *KimiModelBf16,
+    cfg: *const cfgmod.KimiK3Config,
+    max_seq: usize,
+    allocator: std.mem.Allocator,
+) ?ModelState {
+    const E = model.hidden;
+    const maxb = model.maxb;
+    const n_layers = model.n_layers;
+
+    var ms = ModelState{
+        .allocator = allocator,
+        .layers = undefined,
+        .n_blocks = 0,
+        .block_residual = undefined,
+        .maxb = maxb,
+        .E = E,
+    };
+
+    ms.layers = allocator.alloc(layermod.LayerState, n_layers) catch return null;
+    for (0..n_layers) |li| {
+        const is_mla = cfgmod.isMla(cfg, li);
+        var ls = layermod.LayerState{ .is_mla = is_mla };
+        if (is_mla) {
+            const H = cfg.n_heads;
+            const qn = cfg.qk_nope;
+            const qr = cfg.qk_rope;
+            const vh = cfg.v_head;
+            const kvd = qn + vh;
+            const kv = allocator.alloc(f32, max_seq * H * kvd) catch return null;
+            for (kv) |*v| v.* = 0.0;
+            const rope = allocator.alloc(f32, max_seq * qr) catch return null;
+            for (rope) |*v| v.* = 0.0;
+            ls.mla = .{ .kv = kv, .rope = rope, .cached = 0, .cap = max_seq };
+        } else {
+            const H = cfg.kda_heads;
+            const D = cfg.kda_head_dim;
+            const P = H * D;
+            const K = cfg.conv_k;
+            const hist = K - 1;
+            const S = allocator.alloc(f32, H * D * D) catch return null;
+            for (S) |*v| v.* = 0.0;
+            const conv_size = 3 * P * hist;
+            const conv = if (conv_size == 0)
+                allocator.alloc(f32, 0) catch return null
+            else blk: {
+                const c = allocator.alloc(f32, conv_size) catch return null;
+                for (c) |*v| v.* = 0.0;
+                break :blk c;
+            };
+            ls.kda = .{ .S = S, .conv = conv };
+        }
+        ms.layers[li] = ls;
+    }
+
+    ms.block_residual = allocator.alloc(f32, maxb * E) catch return null;
+    for (ms.block_residual) |*v| v.* = 0.0;
+
+    return ms;
+}
+
+pub fn forwardInc(
+    model: *KimiModelBf16,
+    cfg: *const cfgmod.KimiK3Config,
+    ms: *ModelState,
+    input: []const f32,
+    output: []f32,
+) void {
+    const E = model.hidden;
+    ms.n_blocks = 0;
+    for (ms.block_residual) |*b| b.* = 0.0;
+
+    // input is the hidden state for a single token (embedding done by caller)
+    @memcpy(output, input);
+
+    for (0..model.n_layers) |li| {
+        layermod.layerForwardInc(output, ms.block_residual, &ms.n_blocks, &model.layers[li], cfg, li, &ms.layers[li]);
+    }
+
+    // final RMSNorm
+    var ss: f64 = 0.0;
+    for (0..E) |i| {
+        const v = output[i];
+        ss += @as(f64, v) * @as(f64, v);
+    }
+    const inv: f32 = 1.0 / @sqrt(@as(f32, @floatCast(ss / @as(f64, @floatFromInt(E)))) + cfg.rms_eps);
+    for (0..E) |i| output[i] = model.final_norm[i] * output[i] * inv;
+}

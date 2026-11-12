@@ -1002,4 +1002,18 @@ void kt_kimi_model_free(KT_KimiModel* model);
 void kt_kimi_model_forward(KT_KimiModel* model, size_t qlen,
                           const float* input, float* output);
 
+// --- Kimi K3 CausalLM (BF16) ------------------------------------------------
+typedef struct KT_KimiCausalLM KT_KimiCausalLM;
+
+typedef struct {
+    kt_kimi_model_config_t model;
+    const void* lm_head;   /* BF16 [vocab, hidden] */
+    size_t vocab_size;
+} kt_kimi_causallm_config_t;
+
+KT_KimiCausalLM* kt_kimi_causallm_new(const kt_kimi_causallm_config_t* config);
+void kt_kimi_causallm_free(KT_KimiCausalLM* clm);
+void kt_kimi_causallm_forward(KT_KimiCausalLM* clm, size_t qlen,
+                             const float* input, float* logits);
+
 #endif // KTRANSFORMERS_C_API_H

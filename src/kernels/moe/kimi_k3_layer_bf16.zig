@@ -63,6 +63,12 @@ fn denseMlpSlice(out: []f32, x: []f32, w_gate: []const f32, w_up: []const f32, w
     matmulF32(out, act, w_down, dense_inter, E);
 }
 
+pub const LayerState = struct {
+    is_mla: bool,
+    kda: ?kda_bf16.KdaLayerState = null,
+    mla: ?mla_bf16.MlaLayerState = null,
+};
+
 pub fn layerForward(
     h: []f32,
     block_residual: []f32,
@@ -160,4 +166,93 @@ pub fn layerForward(
     for (0..T * E) |i| pref[i] += tmp[i];
     @memcpy(h, pref);
     _ = situGlu;
+}
+pub fn layerForwardInc(
+    h: []f32,
+    block_residual: []f32,
+    n_blocks: *usize,
+    w: *const KimiLayerBf16Weights,
+    c: *const cfgmod.KimiK3Config,
+    layer_idx: usize,
+    st: *LayerState,
+) void {
+    const E = c.hidden;
+    const maxb = c.n_layers / c.attn_res_block + 2;
+
+    const pref_heap = std.heap.page_allocator.alloc(f32, E) catch return;
+    defer std.heap.page_allocator.free(pref_heap);
+    @memcpy(pref_heap, h);
+
+    var have_prefix: bool = true;
+
+    if (n_blocks.* > 0) {
+        var src = std.heap.page_allocator.alloc(f32, (maxb + 1) * E) catch return;
+        defer std.heap.page_allocator.free(src);
+        var foldA = std.heap.page_allocator.alloc(f32, E) catch return;
+        defer std.heap.page_allocator.free(foldA);
+        for (0..E) |i| foldA[i] = w.attn_res_norm[i] * w.attn_res_proj[i];
+        for (0..n_blocks.*) |b| {
+            @memcpy(src[b * E ..][0..E], block_residual[b * E ..][0..E]);
+        }
+        @memcpy(src[n_blocks.* * E ..][0..E], pref_heap);
+        ops.attnRes(h, src[0 .. (n_blocks.* + 1) * E], foldA, n_blocks.* + 1, E, c.rms_eps);
+    }
+
+    if (layer_idx % c.attn_res_block == 0) {
+        @memcpy(block_residual[n_blocks.* * E ..][0..E], pref_heap);
+        n_blocks.* += 1;
+        have_prefix = false;
+    }
+
+    const hin = std.heap.page_allocator.alloc(f32, E) catch return;
+    defer std.heap.page_allocator.free(hin);
+    const tmp = std.heap.page_allocator.alloc(f32, E) catch return;
+    defer std.heap.page_allocator.free(tmp);
+    rmsnormF32(hin, h, w.in_norm, E, c.rms_eps);
+
+    if (w.is_mla) {
+        if (w.mla) |mla| {
+            var mla_copy = mla;
+            if (st.mla) |*ms| mla_bf16.mlaLayerIncBf16(tmp, hin, &mla_copy, c, ms);
+        }
+    } else {
+        if (w.kda) |kda| {
+            var kda_copy = kda;
+            if (st.kda) |*ks| kda_bf16.kdaLayerIncBf16(tmp, hin, &kda_copy, c, ks);
+        }
+    }
+
+    if (have_prefix) {
+        for (0..E) |i| pref_heap[i] += tmp[i];
+    } else {
+        @memcpy(pref_heap, tmp);
+        have_prefix = true;
+    }
+
+    {
+        var src = std.heap.page_allocator.alloc(f32, (maxb + 1) * E) catch return;
+        defer std.heap.page_allocator.free(src);
+        var foldM = std.heap.page_allocator.alloc(f32, E) catch return;
+        defer std.heap.page_allocator.free(foldM);
+        for (0..E) |i| foldM[i] = w.mlp_res_norm[i] * w.mlp_res_proj[i];
+        for (0..n_blocks.*) |b| {
+            @memcpy(src[b * E ..][0..E], block_residual[b * E ..][0..E]);
+        }
+        @memcpy(src[n_blocks.* * E ..][0..E], pref_heap);
+        ops.attnRes(h, src[0 .. (n_blocks.* + 1) * E], foldM, n_blocks.* + 1, E, c.rms_eps);
+    }
+
+    rmsnormF32(hin, h, w.post_norm, E, c.rms_eps);
+
+    if (w.is_dense) {
+        denseMlpSlice(tmp, hin, w.dense_gate, w.dense_up, w.dense_down, w.dense_inter, E, c.situ_b1, c.situ_b2);
+    } else {
+        if (w.moe) |moe| {
+            var moe_copy = moe;
+            ops.latentMoe(tmp, hin, &moe_copy, &w.moe_cfg);
+        }
+    }
+
+    for (0..E) |i| pref_heap[i] += tmp[i];
+    @memcpy(h, pref_heap);
 }

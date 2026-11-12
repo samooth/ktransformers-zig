@@ -312,11 +312,11 @@ comptime {
 }
 
 // Force analysis of the Kimi K3 BF16 model.
-comptime {
-    _ = &kimi_k3_model_bf16.KimiModelBf16.init;
-    _ = &kimi_k3_model_bf16.KimiModelBf16.forward;
-    _ = &kimi_k3_model_bf16.KimiModelBf16.deinit;
-}
+// comptime {
+//     _ = &kimi_k3_model_bf16.KimiModelBf16.init;
+//     _ = &kimi_k3_model_bf16.KimiModelBf16.forward;
+//     _ = &kimi_k3_model_bf16.KimiModelBf16.deinit;
+// }
 
 // Force analysis of the Qwen3 MoE orchestration (MHA engine + decoder
 // layer + model + CausalLM). Same lazy-analysis rule as MLA / DSV3.

@@ -7,13 +7,20 @@ const cfgmod = @import("../../kimi/kimi_k3_config.zig");
 
 pub const MlaBf16Weights = struct {
     q_a: [*]const amx.bf16, // [q_lora][E]
-    q_a_norm: []const f32, // [q_lora]
+    q_a_norm: [*]const f32, // [q_lora]
     q_b: [*]const amx.bf16, // [H*qh][q_lora]
     kv_a: [*]const amx.bf16, // [kv_lora+qr][E]
-    kv_a_norm: []const f32, // [kv_lora]
+    kv_a_norm: [*]const f32, // [kv_lora]
     kv_b: [*]const amx.bf16, // [H*kvd][kv_lora]
     o: [*]const amx.bf16, // [E][H*vh]
     g: ?[*]const amx.bf16, // [H*vh][E] or null
+};
+
+pub const MlaLayerState = struct {
+    kv: []f32, // [cap*H*kvd]
+    rope: []f32, // [cap*qr]
+    cached: usize,
+    cap: usize,
 };
 
 fn matmulBf16(y: []f32, x_bf16: [*]const amx.bf16, W: [*]const amx.bf16, in: usize, out: usize) void {
@@ -75,7 +82,7 @@ pub fn mlaLayerFullBf16(
         const xt_bf = xbf[t * E ..].ptr;
         // q
         matmulBf16(ql, xt_bf, w.q_a, E, c.q_lora);
-        rmsnormF32(ql, ql, w.q_a_norm, c.q_lora, c.rms_eps);
+        rmsnormF32(ql, ql, w.q_a_norm[0..c.q_lora], c.q_lora, c.rms_eps);
         const ql_bf = std.heap.page_allocator.alloc(amx.bf16, c.q_lora) catch return;
         defer std.heap.page_allocator.free(ql_bf);
         for (0..c.q_lora) |i| ql_bf[i] = amx.f32_to_bf16(ql[i]);
@@ -83,7 +90,7 @@ pub fn mlaLayerFullBf16(
 
         // kv_a
         matmulBf16(ct, xt_bf, w.kv_a, E, kvw);
-        rmsnormF32(ct[0..kv_lora], ct[0..kv_lora], w.kv_a_norm, kv_lora, c.rms_eps);
+        rmsnormF32(ct[0..kv_lora], ct[0..kv_lora], w.kv_a_norm[0..kv_lora], kv_lora, c.rms_eps);
         for (0..qr) |i| rp[t * qr + i] = ct[kv_lora + i];
         const ct_bf = std.heap.page_allocator.alloc(amx.bf16, kv_lora) catch return;
         defer std.heap.page_allocator.free(ct_bf);
@@ -127,4 +134,97 @@ pub fn mlaLayerFullBf16(
         for (0..H * vh) |i| acc_bf[i] = amx.f32_to_bf16(acc[i]);
         matmulBf16(out[t * E ..][0..E], acc_bf.ptr, w.o, H * vh, E);
     }
+}
+
+pub fn mlaLayerIncBf16(
+    out: []f32,
+    x: []const f32,
+    w: *const MlaBf16Weights,
+    c: *const cfgmod.KimiK3Config,
+    st: *MlaLayerState,
+) void {
+    const E = c.hidden;
+    const H = c.n_heads;
+    const qn = c.qk_nope;
+    const qr = c.qk_rope;
+    const vh = c.v_head;
+    const qh = qn + qr;
+    const kv_lora = c.kv_lora;
+    const kvw = kv_lora + qr;
+    const kvd = qn + vh;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(qh)));
+
+    var xb = std.heap.page_allocator.alloc(amx.bf16, E) catch return;
+    defer std.heap.page_allocator.free(xb);
+    for (0..E) |i| xb[i] = amx.f32_to_bf16(x[i]);
+
+    const ql = std.heap.page_allocator.alloc(f32, c.q_lora) catch return;
+    defer std.heap.page_allocator.free(ql);
+    var ct = std.heap.page_allocator.alloc(f32, kvw) catch return;
+    defer std.heap.page_allocator.free(ct);
+
+    var q = std.heap.page_allocator.alloc(f32, H * qh) catch return;
+    defer std.heap.page_allocator.free(q);
+
+    matmulBf16(ql, xb.ptr, w.q_a, E, c.q_lora);
+    rmsnormF32(ql, ql, w.q_a_norm[0..c.q_lora], c.q_lora, c.rms_eps);
+    const ql_bf = std.heap.page_allocator.alloc(amx.bf16, c.q_lora) catch return;
+    defer std.heap.page_allocator.free(ql_bf);
+    for (0..c.q_lora) |i| ql_bf[i] = amx.f32_to_bf16(ql[i]);
+    matmulBf16(q, ql_bf.ptr, w.q_b, c.q_lora, H * qh);
+
+    matmulBf16(ct, xb.ptr, w.kv_a, E, kvw);
+    rmsnormF32(ct[0..kv_lora], ct[0..kv_lora], w.kv_a_norm[0..kv_lora], kv_lora, c.rms_eps);
+
+    const p = st.cached;
+    for (0..qr) |i| st.rope[p * qr + i] = ct[kv_lora + i];
+
+    const ct_bf = std.heap.page_allocator.alloc(amx.bf16, kv_lora) catch return;
+    defer std.heap.page_allocator.free(ct_bf);
+    for (0..kv_lora) |i| ct_bf[i] = amx.f32_to_bf16(ct[i]);
+    matmulBf16(st.kv[p * H * kvd ..][0 .. H * kvd], ct_bf.ptr, w.kv_b, kv_lora, H * kvd);
+
+    var acc = std.heap.page_allocator.alloc(f32, H * vh) catch return;
+    defer std.heap.page_allocator.free(acc);
+    var sc = std.heap.page_allocator.alloc(f32, p + 1) catch return;
+    defer std.heap.page_allocator.free(sc);
+
+    for (0..H) |h| {
+        const qt = q[h * qh ..][0..qh];
+        var m: f32 = -std.math.inf(f32);
+        for (0..(p + 1)) |s| {
+            const ks = st.kv[s * H * kvd + h * kvd ..][0..kvd];
+            const kr = st.rope[s * qr ..][0..qr];
+            var dd: f64 = 0.0;
+            for (0..qn) |i| dd += @as(f64, qt[i]) * @as(f64, ks[i]);
+            for (0..qr) |i| dd += @as(f64, qt[qn + i]) * @as(f64, kr[i]);
+            sc[s] = @as(f32, @floatCast(dd)) * scale;
+            if (sc[s] > m) m = sc[s];
+        }
+        var zv: f64 = 0.0;
+        for (0..(p + 1)) |s| {
+            sc[s] = @exp(sc[s] - m);
+            zv += @as(f64, sc[s]);
+        }
+        const accp = acc[h * vh ..][0..vh];
+        for (0..vh) |j| accp[j] = 0.0;
+        for (0..(p + 1)) |s| {
+            const pr = sc[s] / @as(f32, @floatCast(zv));
+            const vs = st.kv[s * H * kvd + h * kvd + qn ..][0..vh];
+            for (0..vh) |j| accp[j] += pr * vs[j];
+        }
+    }
+
+    const gbuf = std.heap.page_allocator.alloc(f32, H * vh) catch return;
+    defer std.heap.page_allocator.free(gbuf);
+    if (w.g) |gw| {
+        matmulBf16(gbuf, xb.ptr, gw, E, H * vh);
+        for (0..H * vh) |i| acc[i] *= sigmoidF32(gbuf[i]);
+    }
+    const acc_bf = std.heap.page_allocator.alloc(amx.bf16, H * vh) catch return;
+    defer std.heap.page_allocator.free(acc_bf);
+    for (0..H * vh) |i| acc_bf[i] = amx.f32_to_bf16(acc[i]);
+    matmulBf16(out, acc_bf.ptr, w.o, H * vh, E);
+
+    st.cached += 1;
 }

@@ -303,6 +303,7 @@ pub const KT_KimiKdaLayer = opaque {};
 pub const KT_KimiMlaLayer = opaque {};
 pub const KT_KimiLayer = opaque {};
 pub const KT_KimiModel = opaque {};
+pub const KT_KimiCausalLM = opaque {};
 pub const KT_Gate = opaque {};
 pub const KT_Linear = opaque {};
 pub const KT_MLP = opaque {};
@@ -1966,6 +1967,60 @@ pub export fn kt_kimi_model_free(model: *KT_KimiModel) void {
     const m: *KimiModelHandle = @ptrCast(@alignCast(model));
     m.allocator.free(m.layers);
     m.allocator.destroy(m);
+}
+
+// ============================================================================
+// Kimi K3 CausalLM (BF16) — Zig extension
+// ============================================================================
+
+pub const kt_kimi_causallm_config_t = extern struct {
+    model: kt_kimi_model_config_t,
+    lm_head: *const anyopaque,
+    vocab_size: usize,
+};
+
+const KimiCausalLMHandle = struct {
+    model: *KimiModelHandle,
+    lm_head: [*]const amx.bf16,
+    vocab_size: usize,
+    allocator: std.mem.Allocator,
+};
+
+pub export fn kt_kimi_causallm_new(config: *const kt_kimi_causallm_config_t) *KT_KimiCausalLM {
+    const allocator = defaultAllocator();
+    const clm = allocator.create(KimiCausalLMHandle) catch @panic("OOM");
+    const model = kt_kimi_model_new(&config.model);
+    clm.* = .{
+        .model = @ptrCast(@alignCast(model)),
+        .lm_head = @ptrCast(@alignCast(config.lm_head)),
+        .vocab_size = config.vocab_size,
+        .allocator = allocator,
+    };
+    return @ptrCast(clm);
+}
+
+pub export fn kt_kimi_causallm_forward(
+    clm: *KT_KimiCausalLM,
+    qlen: usize,
+    input: [*]const f32,
+    logits: [*]f32,
+) void {
+    const c: *KimiCausalLMHandle = @ptrCast(@alignCast(clm));
+    const E = c.model.hidden;
+    const n = qlen * E;
+    const final_hidden = c.allocator.alloc(amx.bf16, n) catch return;
+    defer c.allocator.free(final_hidden);
+    const model_out = c.allocator.alloc(f32, n) catch return;
+    defer c.allocator.free(model_out);
+    kt_kimi_model_forward(@ptrCast(c.model), qlen, input, model_out.ptr);
+    for (0..n) |i| final_hidden[i] = amx.f32_to_bf16(model_out[i]);
+    gemm_bf16.gemmExpert(final_hidden.ptr, c.lm_head, logits, qlen, c.vocab_size, E, E, E, c.vocab_size);
+}
+
+pub export fn kt_kimi_causallm_free(clm: *KT_KimiCausalLM) void {
+    const c: *KimiCausalLMHandle = @ptrCast(@alignCast(clm));
+    kt_kimi_model_free(@ptrCast(c.model));
+    c.allocator.destroy(c);
 }
 
 // ============================================================================
