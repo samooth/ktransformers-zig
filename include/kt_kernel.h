@@ -1002,6 +1002,13 @@ void kt_kimi_model_free(KT_KimiModel* model);
 void kt_kimi_model_forward(KT_KimiModel* model, size_t qlen,
                           const float* input, float* output);
 
+// --- Kimi K3 model incremental (BF16) ---------------------------------------
+typedef struct KT_KimiModelState KT_KimiModelState;
+KT_KimiModelState* kt_kimi_model_state_new(KT_KimiModel* model, size_t max_seq);
+void kt_kimi_model_state_free(KT_KimiModelState* state);
+void kt_kimi_model_forward_inc(KT_KimiModel* model, KT_KimiModelState* state,
+                              const float* input, float* output);
+
 // --- Kimi K3 CausalLM (BF16) ------------------------------------------------
 typedef struct KT_KimiCausalLM KT_KimiCausalLM;
 

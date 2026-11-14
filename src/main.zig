@@ -3597,3 +3597,120 @@ pub export fn kt_type_row_bytes(n: usize, type_id: c_int) c_int {
     if (bytes == 0) return 0;
     return @intCast(bytes);
 }
+
+// ============================================================================
+// Kimi K3 model incremental decode (BF16) — C API
+// ============================================================================
+
+pub const KT_KimiModelState = opaque {};
+
+const KimiModelStateHandle = struct {
+    allocator: std.mem.Allocator,
+    hidden: usize,
+    attn_res_block: usize,
+    n_layers: usize,
+    maxb: usize,
+    E: usize,
+    layers_state: []kimi_k3_layer_bf16.LayerState,
+    n_blocks: usize,
+    block_residual: []f32,
+};
+
+pub export fn kt_kimi_model_state_new(model: *KT_KimiModel, max_seq: usize) *KT_KimiModelState {
+    const m: *KimiModelHandle = @ptrCast(@alignCast(model));
+    const allocator = m.allocator;
+    const state = allocator.create(KimiModelStateHandle) catch @panic("OOM");
+    const E = m.hidden;
+    const maxb = m.layers.len / m.attn_res_block + 2;
+    const layers_state = allocator.alloc(kimi_k3_layer_bf16.LayerState, m.layers.len) catch @panic("OOM");
+    for (0..m.layers.len) |i| {
+        const lcfg = &m.layers[i].config;
+        const is_mla = m.layers[i].weights.is_mla;
+        var ls = kimi_k3_layer_bf16.LayerState{ .is_mla = is_mla };
+        if (is_mla) {
+            const H = lcfg.n_heads;
+            const qn = lcfg.qk_nope;
+            const qr = lcfg.qk_rope;
+            const vh = lcfg.v_head;
+            const kvd = qn + vh;
+            const kv = allocator.alloc(f32, max_seq * H * kvd) catch @panic("OOM");
+            for (kv) |*v| v.* = 0.0;
+            const rope = allocator.alloc(f32, max_seq * qr) catch @panic("OOM");
+            for (rope) |*v| v.* = 0.0;
+            ls.mla = .{ .kv = kv, .rope = rope, .cached = 0, .cap = max_seq };
+        } else {
+            const H = lcfg.kda_heads;
+            const D = lcfg.kda_head_dim;
+            const P = H * D;
+            const K = lcfg.conv_k;
+            const hist = K - 1;
+            const S = allocator.alloc(f32, H * D * D) catch @panic("OOM");
+            for (S) |*v| v.* = 0.0;
+            const conv_size = 3 * P * hist;
+            const conv = if (conv_size == 0) allocator.alloc(f32, 0) catch @panic("OOM") else blk: {
+                const c = allocator.alloc(f32, conv_size) catch @panic("OOM");
+                for (c) |*v| v.* = 0.0;
+                break :blk c;
+            };
+            ls.kda = .{ .S = S, .conv = conv };
+        }
+        layers_state[i] = ls;
+    }
+    const block_residual = allocator.alloc(f32, maxb * E) catch @panic("OOM");
+    for (block_residual) |*v| v.* = 0.0;
+    state.* = .{
+        .allocator = allocator,
+        .hidden = E,
+        .attn_res_block = m.attn_res_block,
+        .n_layers = m.layers.len,
+        .maxb = maxb,
+        .E = E,
+        .layers_state = layers_state,
+        .n_blocks = 0,
+        .block_residual = block_residual,
+    };
+    return @ptrCast(state);
+}
+
+pub export fn kt_kimi_model_state_free(state: *KT_KimiModelState) void {
+    const s: *KimiModelStateHandle = @ptrCast(@alignCast(state));
+    const allocator = s.allocator;
+    for (s.layers_state) |*ls| {
+        if (ls.kda) |kd| {
+            allocator.free(kd.S);
+            allocator.free(kd.conv);
+        }
+        if (ls.mla) |ml| {
+            allocator.free(ml.kv);
+            allocator.free(ml.rope);
+        }
+    }
+    allocator.free(s.layers_state);
+    allocator.free(s.block_residual);
+    allocator.destroy(s);
+}
+
+pub export fn kt_kimi_model_forward_inc(
+    model: *KT_KimiModel,
+    state: *KT_KimiModelState,
+    input: [*]const f32,
+    output: [*]f32,
+) void {
+    const m: *KimiModelHandle = @ptrCast(@alignCast(model));
+    const s: *KimiModelStateHandle = @ptrCast(@alignCast(state));
+    const E = m.hidden;
+    s.n_blocks = 0;
+    for (s.block_residual) |*b| b.* = 0.0;
+    @memcpy(output[0..E], input[0..E]);
+    for (0..m.layers.len) |li| {
+        kimi_k3_layer_bf16.layerForwardInc(output[0..E], s.block_residual, &s.n_blocks, &m.layers[li].weights, &m.layers[li].config, li, &s.layers_state[li]);
+    }
+    // final norm
+    var ss: f64 = 0.0;
+    for (0..E) |i| {
+        const v = output[i];
+        ss += @as(f64, v) * @as(f64, v);
+    }
+    const inv: f32 = 1.0 / @sqrt(@as(f32, @floatCast(ss / @as(f64, @floatFromInt(E)))) + m.layers[0].config.rms_eps);
+    for (0..E) |i| output[i] = m.final_norm[i] * output[i] * inv;
+}
