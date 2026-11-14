@@ -181,6 +181,7 @@ pub fn build(b: *std.Build) void {
     RunTest.run(b, test_step, "tests/kernels/qwen3_gguf_e2e_tests.zig", "src/root.zig", target, optimize);
     // Suite 7c: Kimi K3 CPU ops (Phase 1)
     RunTest.run(b, test_step, "tests/kimi/kimi_k3_ops_test.zig", "src/root.zig", target, optimize);
+    RunTest.run(b, test_step, "tests/kimi/kimi_k3_chat_test.zig", "src/root.zig", target, optimize);
     RunTest.run(b, test_step, "tests/kimi/kimi_k3_sampler_test.zig", "src/root.zig", target, optimize);
     // Suite 7d: Kimi K3 BF16 KDA layer smoke
     RunTest.run(b, test_step, "tests/kimi/kimi_k3_kda_bf16_test.zig", "src/root.zig", target, optimize);
