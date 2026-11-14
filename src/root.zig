@@ -370,7 +370,9 @@ comptime {
     _ = &gemm_bf16_neon.GemmExpertBF16NEON.reduceAdd;
 }
 pub const kimi_k3_config = @import("kimi/kimi_k3_config.zig");
+pub const kimi_tiktoken = @import("tokenizer/kimi_tiktoken.zig");
 pub const kimi_k3_ops = @import("kimi/kimi_k3_ops.zig");
+pub const kimi_k3_sampler = @import("kimi/kimi_k3_sampler.zig");
 pub const kimi_k3_model = @import("kernels/moe/kimi_k3_model.zig");
 pub const kimi_k3_kda_bf16 = @import("kernels/moe/kimi_k3_kda_bf16.zig");
 pub const kimi_k3_mla_bf16 = @import("kernels/moe/kimi_k3_mla_bf16.zig");
